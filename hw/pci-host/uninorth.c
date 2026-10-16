@@ -673,14 +673,96 @@ static const MemoryRegionOps unin_ops = {
     .endianness = DEVICE_BIG_ENDIAN,
 };
 
+/*
+ * Keywest I2C controller, the UniNorth's "i2c@f8001000", with nothing on
+ * the bus.  MorphOS's temperature.sensor task probes it every few seconds
+ * (bus 1, address 0x92) and, with the registers unmapped and reading as
+ * zeros, spent ~130 ms per probe polling for interrupts that never came,
+ * with the task's priority stalling mouse input.  Register layout as in
+ * Linux's low_i2c.c: one byte every 0x10, at byte 3 of the word.  The bus
+ * reports idle (SCL and SDA high), an address phase ends at once without an
+ * acknowledge, a stop ends at once, so a probe takes a few register
+ * accesses instead of three timeouts.
+ */
+enum {
+    KW_REG_MODE, KW_REG_CONTROL, KW_REG_STATUS, KW_REG_ISR, KW_REG_IER,
+    KW_REG_ADDR, KW_REG_SUBADDR, KW_REG_DATA, KW_REG_REV,
+    KW_REG_RISETIME, KW_REG_BITTIME,
+};
+#define KW_CTL_XADDR    0x02
+#define KW_CTL_STOP     0x04
+#define KW_CTL_START    0x08
+#define KW_STAT_SDA     0x08
+#define KW_STAT_SCL     0x10
+#define KW_IRQ_ADDR     0x02
+#define KW_IRQ_STOP     0x04
+
+static uint64_t unin_i2c_read(void *opaque, hwaddr addr, unsigned size)
+{
+    UNINState *s = opaque;
+    unsigned reg = addr >> 4;
+
+    if ((addr & 0xf) != 3 || reg >= ARRAY_SIZE(s->i2c_reg)) {
+        return 0;
+    }
+    if (reg == KW_REG_STATUS) {
+        return KW_STAT_SDA | KW_STAT_SCL;        /* idle bus, nobody acks */
+    }
+    return s->i2c_reg[reg];
+}
+
+static void unin_i2c_write(void *opaque, hwaddr addr, uint64_t value,
+                           unsigned size)
+{
+    UNINState *s = opaque;
+    unsigned reg = addr >> 4;
+
+    if ((addr & 0xf) != 3 || reg >= ARRAY_SIZE(s->i2c_reg)) {
+        return;
+    }
+    switch (reg) {
+    case KW_REG_CONTROL:
+        if (value & (KW_CTL_XADDR | KW_CTL_START)) {
+            /* Address sent and not acknowledged: the controller stops the
+             * transfer by itself (Linux's low_i2c.c expects the STOP
+             * interrupt after a NAK without writing CONTROL). */
+            s->i2c_reg[KW_REG_ISR] |= KW_IRQ_ADDR | KW_IRQ_STOP;
+        }
+        if (value & KW_CTL_STOP) {
+            s->i2c_reg[KW_REG_ISR] |= KW_IRQ_STOP;
+        }
+        break;
+    case KW_REG_ISR:
+        s->i2c_reg[KW_REG_ISR] &= ~value;           /* write 1 to clear */
+        break;
+    case KW_REG_STATUS:
+    case KW_REG_REV:
+        break;
+    default:
+        s->i2c_reg[reg] = value;
+    }
+}
+
+static const MemoryRegionOps unin_i2c_ops = {
+    .read = unin_i2c_read,
+    .write = unin_i2c_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 1,
+    },
+};
+
 static void unin_init(Object *obj)
 {
     UNINState *s = UNI_NORTH(obj);
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
     memory_region_init_io(&s->mem, obj, &unin_ops, s, "unin", 0x1000);
+    memory_region_init_io(&s->i2c, obj, &unin_i2c_ops, s, "unin-i2c", 0x100);
 
     sysbus_init_mmio(sbd, &s->mem);
+    sysbus_init_mmio(sbd, &s->i2c);
 }
 
 static void unin_class_init(ObjectClass *klass, void *data)

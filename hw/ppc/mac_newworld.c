@@ -304,6 +304,8 @@ static void ppc_core99_init(MachineState *machine)
     sysbus_realize_and_unref(s, &error_fatal);
     memory_region_add_subregion(get_system_memory(), 0xf8000000,
                                 sysbus_mmio_get_region(s, 0));
+    memory_region_add_subregion(get_system_memory(), 0xf8001000,
+                                sysbus_mmio_get_region(s, 1));
 
     if (PPC_INPUT(env) == PPC_FLAGS_INPUT_970) {
         machine_arch = ARCH_MAC99_U3;

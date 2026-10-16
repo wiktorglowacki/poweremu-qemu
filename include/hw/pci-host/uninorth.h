@@ -77,6 +77,8 @@ struct UNINState {
     SysBusDevice parent_obj;
 
     MemoryRegion mem;
+    MemoryRegion i2c;           /* Keywest I2C controller at +0x1000 */
+    uint8_t i2c_reg[16];
 };
 
 #define TYPE_UNI_NORTH "uni-north"
