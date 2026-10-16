@@ -17,6 +17,7 @@ typedef enum R300Stage {
     R300_STAGE_VS,              /* R300_VS: entry point r300_vs */
     R300_STAGE_FS,              /* R300_FS: r300_fs */
     R300_STAGE_FS_Z,            /* R300_FS_Z: r300_fs_z */
+    R300_STAGE_CS,              /* R300_CS: a compute shader (r300_cs) */
 } R300Stage;
 
 /* The stage's entry point name in MSL ("r300_vs", "r300_fs", "r300_fs_z"). */

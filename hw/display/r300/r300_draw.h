@@ -57,9 +57,11 @@ enum { R300_TEXDIM_2D = 0, R300_TEXDIM_3D = 1, R300_TEXDIM_CUBE = 2 };
 
 typedef struct R300TexDesc {
     bool bound;
+    bool card_bytes;       /* no implicit CPU-view endian conversion */
     uint32_t gpu_addr;          /* TX_OFFSET, low bits cleared */
     uint32_t width, height;
     uint32_t endian;            /* TX_OFFSET[1:0]: the card's dword swap */
+    uint32_t tiling;            /* TX_OFFSET[3:2]: bit 1 micro tiled, bit 0 macro tiled */
     uint32_t pitch_bytes;       /* level 0: bytes per row (per row of blocks for DXT) */
     uint32_t format;            /* TX_FORMAT1 & 0x1F */
     uint32_t kind;              /* R300_TEXK_* */
@@ -91,6 +93,7 @@ void r300_tex_level_dims(const R300TexDesc *td, uint32_t l, uint32_t *w,
 /* Fill the layout fields of td from its size, format, dim and levels;
  * bpp is bytes per texel (per 4x4 block for DXT, flagged by dxt). */
 void r300_tex_layout(R300TexDesc *td, uint32_t bpp, bool dxt, bool pitch_en);
+bool r300_tex_card_swap_valid(const R300TexDesc *td);
 
 /* A TX_BORDER_COLOR dword as the unit's XYZW before the swizzle: packed
  * like a texel of the unit's format (8888 for texels wider than 32 bits;
@@ -105,6 +108,7 @@ typedef struct R300DepthDesc {
     uint32_t pitch;             /* pixels */
     uint32_t bpp;               /* 2 (Z16, Z13E3) or 4 (Z24S8) */
     uint32_t format;            /* ZB_FORMAT.DEPTHFORMAT */
+    uint32_t tiling;            /* ZB_DEPTHPITCH[17:16]: bit 1 micro, bit 0 macro */
 } R300DepthDesc;
 
 /* SU_CULL_MODE */
@@ -131,6 +135,7 @@ typedef struct R300ColorDesc {
     uint32_t format;            /* RB3D_COLORPITCHn format field */
     uint32_t bpp;
     uint32_t view;              /* R300_RTV_* */
+    uint32_t tiling;            /* RB3D_COLORPITCH[17:16]: bit 1 micro, bit 0 macro */
 } R300ColorDesc;
 
 typedef struct R300DrawPacket {
@@ -140,6 +145,7 @@ typedef struct R300DrawPacket {
     uint32_t rt_width, rt_height;
     uint32_t rt_format;         /* RB3D_COLORPITCH0 format field */
     uint32_t rt_bpp;            /* bytes per pixel */
+    uint32_t rt_tiling;         /* RB3D_COLORPITCH0[17:16]: bit 1 micro, bit 0 macro */
     uint32_t rt_view;           /* R300_RTV_* */
     uint32_t scissor[4];        /* x0, y0, x1, y1 (exclusive) */
     /* Colour buffers 1..num_cb-1 (render targets B-D the program writes,
@@ -286,6 +292,9 @@ uint32_t r300_assemble_prov(unsigned prim, uint32_t n, uint32_t *list,
                             uint32_t *cls, R300Prov *prov);
 
 void r300_draw_free(R300DrawPacket *pkt);
+
+/* Conservative pixel bounds, intersected with the hardware scissor. */
+void r300_draw_bounds(const R300DrawPacket *pkt, uint32_t bounds[4]);
 
 /*
  * One face/slice of mip level l of a texture a renderer uploads (kinds

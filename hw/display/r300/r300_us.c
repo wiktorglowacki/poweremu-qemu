@@ -512,6 +512,20 @@ uint32_t r300_us_out_fmt(const R300State *st, unsigned k)
     return k && (f & 0x1F) == 15 ? r300_reg(st, US_OUT_FMT_0) : f;
 }
 
+uint32_t r300_color_endian(const R300State *st, unsigned target)
+{
+    uint32_t pitch = r300_reg(st, RB3D_COLORPITCH0 + 4 * target);
+    uint32_t endian = (pitch >> 19) & 3, bpp;
+    /* shortcut: MorphOS mixes endian-2 glyphs with BGRA 2D pixels;
+     * remove this opt-in exception when the hardware view is established. */
+    if (st->morphos_color_compat && st->card_bytes && endian == 2 &&
+        ((pitch >> 21) & 15) == 6 &&
+        r300_cb_view(6, r300_us_out_fmt(st, target), &bpp) == R300_RTV_RGBA8) {
+        return 0;
+    }
+    return endian;
+}
+
 uint32_t r300_us_num_targets(const R300State *st)
 {
     bool w;
@@ -676,6 +690,10 @@ static const char us_prelude[] =
 "{\n"
 "    return (v >> 24) | ((v >> 8) & 0xff00u) | ((v << 8) & 0xff0000u) | (v << 24);\n"
 "}\n"
+"uint r300_tword(uint v, uint unit)\n"
+"{\n"
+"    return (u.tex_dim[unit].w & 64u) != 0u ? v : r300_bswap32(v);\n"
+"}\n"
 "uint r300_cswap(uint v, uint e)\n"
 "{\n"
 "    switch (e & 3u) {\n"
@@ -822,13 +840,13 @@ static const char us_prelude2[] =
 "        uint x = uint(p.x);\n"
 "        if (fmt == 0x14u || fmt == 0x15u) { odd = x & 1u; x &= ~1u; }\n"
 "        uint off = row0 + x * bpp, el = off >> 2;\n"
-"        uint d = r300_cswap(r300_bswap32(r300_rawld(tx, unit, el, 4u).x), e);\n"
+"        uint d = r300_cswap(r300_tword(r300_rawld(tx, unit, el, 4u).x, unit), e);\n"
 "        w = uvec4(d >> ((off & 3u) * 8u), 0u, 0u, 0u);\n"
 "    } else {\n"
 "        uint el = (row0 + uint(p.x) * bpp) / bpp;\n"
 "        uvec4 r = r300_rawld(tx, unit, el, bpp);\n"
-"        w = uvec4(r300_cswap(r300_bswap32(r.x), e), r300_cswap(r300_bswap32(r.y), e),\n"
-"                  r300_cswap(r300_bswap32(r.z), e), r300_cswap(r300_bswap32(r.w), e));\n"
+"        w = uvec4(r300_cswap(r300_tword(r.x, unit), e), r300_cswap(r300_tword(r.y, unit), e),\n"
+"                  r300_cswap(r300_tword(r.z, unit), e), r300_cswap(r300_tword(r.w, unit), e));\n"
 "    }\n"
 "    return r300_tdecode(fmt, w, odd, yuv);\n"
 "}\n"
@@ -1004,14 +1022,18 @@ static const char us_prelude2[] =
 "    uvec4 a = uvec4(roundEven(clamp(s, 0.0, 1.0) * 255.0)), b = uvec4(roundEven(clamp(d, 0.0, 1.0) * 255.0));\n"
 "    return vec4(r300_rop(a, b, c) & 0xffu) / 255.0;\n"
 "}\n"
-"/* FG_FOG_BLEND.FN: linear, exp, exp2 of the interpolated fog value, or\n"
-"   FG_FOG_FACTOR; the result weights the colour against the fog colour. */\n"
+"/* FG_FOG_BLEND.FN: the interpolated fog value is the AMOUNT of fog (0 at\n"
+"   the near end): Mesa's r300 driver programs linear fog as\n"
+"   scale 1/(end-start), offset -start/(end-start), and MorphOS's TinyGL does\n"
+"   the same; exp and exp2 take Mesa's scale constants 0.0933 and 0.3 times\n"
+"   the density, so the amount is 1 - e^(-v/0.0933) and 1 - e^(-(v/0.3)^2).\n"
+"   FG_FOG_FACTOR is a constant amount. */\n"
 "float r300_fogf(uint fb, float f, float k)\n"
 "{\n"
 "    switch ((fb >> 1) & 3u) {\n"
 "    case 0u: return clamp(f, 0.0, 1.0);\n"
-"    case 1u: return clamp(exp(-f), 0.0, 1.0);\n"
-"    case 2u: return clamp(exp(-f * f), 0.0, 1.0);\n"
+"    case 1u: return clamp(1.0 - exp(-max(f, 0.0) / 0.0933), 0.0, 1.0);\n"
+"    case 2u: return clamp(1.0 - exp(-(f / 0.3) * (f / 0.3)), 0.0, 1.0);\n"
 "    default: return k;\n"
 "    }\n"
 "}\n"
@@ -1135,7 +1157,7 @@ static const char us_prelude_z[] =
 static void us_emit_cb(R300Sb *sb, const R300State *st, unsigned k)
 {
     uint32_t pitch = r300_reg(st, RB3D_COLORPITCH0 + 4 * k);
-    uint32_t cf = (pitch >> 21) & 0xF, e = (pitch >> 19) & 3;
+    uint32_t cf = (pitch >> 21) & 0xF, e = r300_color_endian(st, k);
     uint32_t ofr = r300_us_out_fmt(st, k), of = ofr & 0x1F;
     uint32_t bpp, view = r300_cb_view(cf, of, &bpp);
     bool sg[4];
@@ -1475,7 +1497,7 @@ char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
         "    /* FG: fog, then the alpha test on render target A. */\n"
         "    if ((u.fog_blend & 1u) != 0u) {\n"
         "        float f = r300_fogf(u.fog_blend, aux.x, u.fog_color.w);\n"
-        "        for (int k = 0; k < 4; k++) oc[k].rgb = mix(u.fog_color.rgb, oc[k].rgb, f);\n"
+        "        for (int k = 0; k < 4; k++) oc[k].rgb = mix(oc[k].rgb, u.fog_color.rgb, f);\n"
         "    }\n"
         "    if (!r300_alpha_pass(u.alpha_func, clamp(oc[0].a, 0.0, 1.0))) discard;\n"
         "    bool keep = r300_discard_src(u.cblend, clamp(oc[0], 0.0, 1.0));\n"
@@ -1572,6 +1594,7 @@ char *r300_us_disasm(const R300State *st)
  */
 typedef struct USMemo {
     uint32_t flags, id;
+    bool color_compat;
     R300FSDesc desc;
     unsigned n;
     uint16_t *idx;
@@ -1587,6 +1610,7 @@ static bool us_memo_match(const USMemo *m, const R300State *st,
                           const R300FSDesc *desc, uint32_t flags)
 {
     if (!m->glsl || m->flags != flags ||
+        m->color_compat != (st->morphos_color_compat && st->card_bytes) ||
         memcmp(&m->desc, desc, sizeof(*desc)) != 0) {
         return false;
     }
@@ -1630,6 +1654,7 @@ char *r300_us_glsl_cached(const R300State *st, const R300FSDesc *desc,
     memmove(&us_memo[1], &us_memo[0], (US_MEMO_SLOTS - 1) * sizeof(USMemo));
     USMemo *m = &us_memo[0];
     m->flags = flags;
+    m->color_compat = st->morphos_color_compat && st->card_bytes;
     m->desc = *desc;
     m->n = us_rec.n;
     m->idx = malloc(m->n * sizeof(*m->idx) + 1);

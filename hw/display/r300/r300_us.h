@@ -175,6 +175,7 @@ enum {
     R300_RTV_RGBA32U,
 };
 uint32_t r300_cb_view(uint32_t colorformat, uint32_t outfmt, uint32_t *bpp);
+uint32_t r300_color_endian(const R300State *st, unsigned target);
 
 /* R300 US constants are 24-bit floats (1 sign, 7 exponent, 16 mantissa). */
 float r300_float24(uint32_t v);

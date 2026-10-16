@@ -26,6 +26,7 @@
 #define R300_PVS_UCP_START      1024
 
 #define R300_VAP_PVS_VECTOR_INDX_REG    0x2200
+#define R300_VAP_PVS_UPLOAD_DATA_ALIAS  0x2204
 #define R300_VAP_PVS_UPLOAD_DATA        0x2208
 
 typedef struct R300State {
@@ -36,6 +37,8 @@ typedef struct R300State {
     uint64_t draws;
     uint32_t glsl_flags;    /* r300_us_to_glsl() flags the renderer wants (not a
                                register; the device sets it before each draw) */
+    bool card_bytes;       /* VRAM uses the card's physical byte order */
+    bool morphos_color_compat;
 } R300State;
 
 void r300_state_reset(R300State *st);

@@ -18,7 +18,7 @@
 
 const char *r300_stage_entry(R300Stage stage)
 {
-    static const char *names[] = { "r300_vs", "r300_fs", "r300_fs_z" };
+    static const char *names[] = { "r300_vs", "r300_fs", "r300_fs_z", "r300_cs" };
     return names[stage];
 }
 
@@ -34,7 +34,7 @@ uint32_t *r300_glsl_to_spirv(const char *glsl, R300Stage stage,
                              size_t *nwords, char **err)
 {
     static shaderc_compiler_t compiler;
-    static const char *macro[] = { "R300_VS", "R300_FS", "R300_FS_Z" };
+    static const char *macro[] = { "R300_VS", "R300_FS", "R300_FS_Z", "R300_CS" };
     shaderc_compile_options_t opts;
     shaderc_compilation_result_t res;
     uint32_t *words = NULL;
@@ -57,7 +57,8 @@ uint32_t *r300_glsl_to_spirv(const char *glsl, R300Stage stage,
         shaderc_compile_options_add_macro_definition(opts, "R300_FS", 7, "1", 1);
     }
     res = shaderc_compile_into_spv(compiler, glsl, strlen(glsl),
-                                   stage == R300_STAGE_VS ? shaderc_glsl_vertex_shader
+                                   stage == R300_STAGE_VS ? shaderc_glsl_vertex_shader :
+                                   stage == R300_STAGE_CS ? shaderc_glsl_compute_shader
                                                           : shaderc_glsl_fragment_shader,
                                    r300_stage_entry(stage), "main", opts);
     if (shaderc_result_get_compilation_status(res) != shaderc_compilation_status_success) {

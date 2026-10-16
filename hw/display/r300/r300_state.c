@@ -26,11 +26,19 @@ void r300_state_write(R300State *st, uint32_t addr, uint32_t val)
     }
     st->regs[(addr - R300_REG_BASE) / 4] = val;
 
+    /* Drivers use both the legacy SE and native VAP viewport addresses. */
+    if (addr >= 0x2098 && addr <= 0x20AC) {
+        st->regs[(addr - 0x300 - R300_REG_BASE) / 4] = val;
+    } else if (addr >= 0x1D98 && addr <= 0x1DAC) {
+        st->regs[(addr + 0x300 - R300_REG_BASE) / 4] = val;
+    }
+
     switch (addr) {
     case R300_VAP_PVS_VECTOR_INDX_REG:
         /* Vector index; data writes then fill 4 dwords per vector. */
         st->pvs_upload_dw = (val & 0x7FF) * 4;
         break;
+    case R300_VAP_PVS_UPLOAD_DATA_ALIAS: /* MorphOS uses this upload port. */
     case R300_VAP_PVS_UPLOAD_DATA:
         if (st->pvs_upload_dw < R300_PVS_MEM_VECS * 4) {
             st->pvs_mem[st->pvs_upload_dw] = val;
@@ -67,7 +75,8 @@ void r300_state_dump(const R300State *st, FILE *f)
         uint32_t v = st->regs[i];
         const char *n;
 
-        if (!v || addr == R300_VAP_PVS_UPLOAD_DATA) {
+        if (!v || addr == R300_VAP_PVS_UPLOAD_DATA ||
+            addr == R300_VAP_PVS_UPLOAD_DATA_ALIAS) {
             continue;
         }
         n = r300_reg_name(addr);

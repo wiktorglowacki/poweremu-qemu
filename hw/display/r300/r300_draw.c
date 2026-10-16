@@ -332,7 +332,7 @@ typedef struct Layout {
     uint8_t scal_slot[32], scal_comp[32];
 } Layout;
 
-static void output_layout(const R300State *st, Layout *l)
+static void output_layout(const R300State *st, Layout *l, bool bypass)
 {
     uint32_t f0 = r300_reg(st, VAP_OUTPUT_VTX_FMT_0);
     uint32_t f1 = r300_reg(st, VAP_OUTPUT_VTX_FMT_1);
@@ -342,18 +342,18 @@ static void output_layout(const R300State *st, Layout *l)
     l->nscal = 0;
     l->pos = slot++;                    /* always present */
     if (f0 & (1u << 16)) {
-        l->psize = slot++;              /* point size (x) */
+        l->psize = bypass ? 15 : slot++; /* point size (x) */
     }
     for (int c = 0; c < 4; c++) {
         if (f0 & (1u << (1 + c))) {
-            l->color[c] = slot++;
+            l->color[c] = bypass ? 2 + c : slot++;
         }
     }
     for (int t = 0; t < 8; t++) {
         unsigned n = (f1 >> (3 * t)) & 7;
         l->tex_n[t] = n;
         if (n) {
-            l->tex_slot[t] = slot++;
+            l->tex_slot[t] = bypass ? 6 + t : slot++;
             for (unsigned i = 0; i < n && l->nscal < 32; i++) {
                 l->scal_slot[l->nscal] = l->tex_slot[t];
                 l->scal_comp[l->nscal++] = i;
@@ -493,8 +493,8 @@ static void set_uniforms(const R300State *st, R300DrawPacket *pkt)
     for (int n = 0; n < 4; n++) {
         u->out_sel[n] = (outfmt >> (8 + 2 * n)) & 3;
     }
-    u->rt_swap32 = ((r300_reg(st, RB3D_COLORPITCH0) >> 19) & 3) == 2;
-    u->rt_endian = (r300_reg(st, RB3D_COLORPITCH0) >> 19) & 3;
+    u->rt_endian = r300_color_endian(st, 0);
+    u->rt_swap32 = u->rt_endian == 2;
     u->clip_rule = r300_reg(st, SC_CLIP_RULE) & 0xFFFF;
     for (int i = 0; i < 4; i++) {
         uint32_t tl = r300_reg(st, SC_CLIPRECT_TL_0 + 8 * i);
@@ -555,8 +555,25 @@ void r300_tex_level_dims(const R300TexDesc *td, uint32_t l, uint32_t *w,
 void r300_tex_layout(R300TexDesc *td, uint32_t bpp, bool dxt, bool pitch_en)
 {
     bool pot_rows = td->levels > 1 || td->dim != R300_TEXDIM_2D;
-    uint32_t off = 0;
+    /*
+     * Micro-tiled levels are whole 32-byte tiles (8x4 texels at 8 bpp,
+     * 8x2 at 16, 4x2 at 32, 2x2 at 64): the row pitch is the tile-aligned
+     * width, not 32 bytes, so a 16-texel-wide 8-bit level is two tiles per
+     * band, and the next level follows right after (Foobillard's cloth and
+     * cushion mips were read from the wrong place below 32 texels).
+     */
+    bool micro = (td->tiling & 2) && !dxt;
+    uint32_t tw = 1, th = 1, off = 0;
 
+    if (micro) {
+        switch (bpp) {
+        case 1: tw = 8; th = 4; break;
+        case 2: tw = 8; th = 2; break;
+        case 4: tw = 4; th = 2; break;
+        case 8: tw = 2; th = 2; break;
+        default: tw = 2; th = 1; break;
+        }
+    }
     for (uint32_t l = 0; l < td->levels; l++) {
         uint32_t w, h, d, pitch, rows;
 
@@ -564,7 +581,10 @@ void r300_tex_layout(R300TexDesc *td, uint32_t bpp, bool dxt, bool pitch_en)
         if (pot_rows) {
             h = pot_ceil(h);
         }
-        if (dxt) {
+        if (micro) {
+            pitch = ((w + tw - 1) / tw) * tw * bpp;
+            rows = ((h + th - 1) / th) * th;
+        } else if (dxt) {
             pitch = (((w + 3) / 4) * bpp + 31) & ~31u;
             rows = (h + 3) / 4;
         } else {
@@ -654,6 +674,7 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
         uint32_t fmt = f1 & 0x1F;
 
         memset(t, 0, sizeof(*t));
+        t->card_bytes = st->card_bytes;
         /* swizzle: R 14:12, G 17:15, B 20:18, A 11:9 */
         u->tex_swz[k][0] = (f1 >> 12) & 7;
         u->tex_swz[k][1] = (f1 >> 15) & 7;
@@ -669,14 +690,14 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
             t->kind = R300_TEXK_R8; bpp = 1;
             break;
         case 0x3:                       /* Y8X8: big-endian halfwords */
-            t->kind = R300_TEXK_RG8; bpp = 2; decode = 2;
+            t->kind = R300_TEXK_RG8; bpp = 2; decode = st->card_bytes ? 0 : 2;
             break;
         case 0x1: case 0x6: case 0x7: case 0xA: case 0xB:
             t->kind = R300_TEXK_CONVERT16; bpp = 2;
             break;
         case 0xC:                       /* W8Z8Y8X8 */
             /* VRAM holds the guest CPU's big-endian words (see r300_tex). */
-            t->kind = R300_TEXK_RGBA8; bpp = 4; decode = (off & 3) == 0;
+            t->kind = R300_TEXK_RGBA8; bpp = 4; decode = !st->card_bytes && (off & 3) == 0;
             break;
         /* The card hands the shader DXT1 texels as B,G,R,A and DXT3/5 as
          * A,B,G,R (Tiger's swizzles R=Z,G=Y,B=X and R=W,G=Z,B=Y,A=X);
@@ -697,6 +718,7 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
         t->bound = true;
         t->gpu_addr = off & ~0x1Fu;
         t->endian = off & 3;
+        t->tiling = (off >> 2) & 3;
         t->width = (f0 & 0x7FF) + 1;
         t->height = ((f0 >> 11) & 0x7FF) + 1;
         t->dim = (f1 >> 25) & 3;
@@ -727,6 +749,35 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
         }
         r300_tex_layout(t, bpp, dxt, f0 >> 31);
         t->pitch_bytes = t->lvl_pitch[0];
+        {   /* $R300_TEX_LAYOUT_LOG: each distinct mip-chain layout once */
+            static int on = -1;
+            static uint64_t seen[64];
+            static unsigned nseen;
+            if (on < 0) {
+                on = getenv("R300_TEX_LAYOUT_LOG") != NULL;
+            }
+            if (on && t->levels > 1) {          /* mip chains only */
+                uint64_t key = ((uint64_t)t->width << 40) | ((uint64_t)t->height << 24) |
+                               (t->levels << 16) | (t->tiling << 8) | fmt;
+                unsigned i;
+                for (i = 0; i < nseen && seen[i] != key; i++) {
+                }
+                if (i == nseen && nseen < 64) {
+                    seen[nseen++] = key;
+                    fprintf(stderr, "r300 tex layout: %ux%u fmt %x tiling %u levels %u at %08x:",
+                            t->width, t->height, fmt, t->tiling, t->levels, t->gpu_addr);
+                    for (unsigned l = 0; l < t->levels; l++) {
+                        fprintf(stderr, " L%u+%x/p%u/r%u", l, t->lvl_off[l], t->lvl_pitch[l], t->lvl_rows[l]);
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
+        if (!r300_tex_card_swap_valid(t)) {
+            t->bound = false;
+            pkt->warn |= R300_WARN_TEXFMT;
+            continue;
+        }
         t->format = fmt;
         t->filter0 = r300_reg(st, TX_FILTER0_0 + 4 * k);
         t->filter1 = r300_reg(st, TX_FILTER1_0 + 4 * k);
@@ -750,7 +801,8 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
         u->tex_dim[k][2] = t->pitch_bytes;
         u->tex_dim[k][3] = ((f1 >> 8) & 1) | ((f1 >> 6) & 2) | ((f1 >> 4) & 4) |
                            ((f1 >> 2) & 8) | ((f1 >> 21) & 1 ? R300_TEXF_GAMMA : 0) |
-                           (t->levels > 1 || t->dim != R300_TEXDIM_2D ? R300_TEXF_POT_ROWS : 0);
+                           (t->levels > 1 || t->dim != R300_TEXDIM_2D ? R300_TEXF_POT_ROWS : 0) |
+                           (st->card_bytes ? 64u : 0);
     }
 }
 
@@ -770,6 +822,7 @@ static void set_depth(const R300State *st, R300DrawPacket *pkt)
     z->attach = true;
     z->gpu_addr = r300_reg(st, ZB_DEPTHOFFSET) & ~0x1Fu;
     z->pitch = pitch & 0x3FFC;
+    z->tiling = (pitch >> 16) & 3;
     z->format = fmt;
     z->bpp = fmt == 2 ? 4 : 2;
     if (fmt > 2) {
@@ -786,6 +839,40 @@ static void set_depth(const R300State *st, R300DrawPacket *pkt)
     if (z->bpp == 2) {
         u->poly_offset[0] /= 16.0f;
         u->poly_offset[2] /= 16.0f;
+    }
+}
+
+void r300_draw_bounds(const R300DrawPacket *pkt, uint32_t bounds[4])
+{
+    float lo[2] = { INFINITY, INFINITY }, hi[2] = { -INFINITY, -INFINITY };
+    uint32_t count = pkt->num_verts + pkt->num_line_verts;
+
+    bounds[0] = pkt->scissor[0];
+    bounds[1] = pkt->scissor[1];
+    bounds[2] = fminf(pkt->scissor[2], pkt->rt_width);
+    bounds[3] = fminf(pkt->scissor[3], pkt->rt_height);
+    if (pkt->vs_glsl || !count) {
+        return;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        const float *p = pkt->verts[i].pos;
+        if (!(p[3] > 0)) {
+            return; /* A primitive crossing the eye plane needs clipping first. */
+        }
+        float xy[2] = { (p[0] / p[3] + 1) * pkt->rt_width * 0.5f,
+                        (1 - p[1] / p[3]) * pkt->rt_height * 0.5f };
+        for (int c = 0; c < 2; c++) {
+            if (!isfinite(xy[c])) {
+                return;
+            }
+            lo[c] = fminf(lo[c], xy[c]);
+            hi[c] = fmaxf(hi[c], xy[c]);
+        }
+    }
+    /* Include line coverage, subpixel rounding and multisample positions. */
+    for (int c = 0; c < 2; c++) {
+        bounds[c] = fmaxf(bounds[c], fminf(bounds[c + 2], fmaxf(0, floorf(lo[c]) - 1)));
+        bounds[c + 2] = fminf(bounds[c + 2], fmaxf(bounds[c], ceilf(hi[c]) + 1));
     }
 }
 
@@ -1537,6 +1624,24 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     bool fog = r300_reg(st, FG_FOG_BLEND) & 1;
     float fog_scale = bits_to_float(r300_reg(st, GA_FOG_SCALE));
     float fog_off = bits_to_float(r300_reg(st, GA_FOG_OFFSET));
+    {   /* one line about the first fogged draw's fog state */
+        static bool said;
+        static int verbose = -1;
+        if (verbose < 0) {
+            const char *e = getenv("PPCGPU_VERBOSE");
+            verbose = e && e[0] == '1';
+        }
+        if (fog && !said && verbose) {
+            said = true;
+            fprintf(stderr, "r300 fog: FG_FOG_BLEND %08x GB_SELECT %08x GA_FOG_SCALE %g "
+                    "GA_FOG_OFFSET %g FG_FOG_FACTOR %08x colour %08x %08x %08x "
+                    "VAP_CNTL_STATUS %08x\n", r300_reg(st, FG_FOG_BLEND),
+                    r300_reg(st, GB_SELECT), fog_scale, fog_off,
+                    r300_reg(st, FG_FOG_FACTOR), r300_reg(st, FG_FOG_COLOR_R),
+                    r300_reg(st, FG_FOG_COLOR_R + 4), r300_reg(st, FG_FOG_COLOR_R + 8),
+                    r300_reg(st, VAP_CNTL_STATUS));
+        }
+    }
     R300PVSProgram prog;
     float consts[256][4];
     Build b;
@@ -1546,6 +1651,7 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     /* Colour buffer */
     pkt->rt_gpu_addr = r300_reg(st, RB3D_COLOROFFSET0) & ~0x1Fu;
     pkt->rt_pitch = pitch_reg & 0x3FFE;
+    pkt->rt_tiling = (pitch_reg >> 16) & 3;
     pkt->rt_format = (pitch_reg >> 21) & 0xF;
     pkt->rt_view = r300_cb_view(pkt->rt_format, r300_reg(st, US_OUT_FMT_0),
                                 &pkt->rt_bpp);
@@ -1566,6 +1672,7 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         uint32_t pr = r300_reg(st, RB3D_COLORPITCH0 + 4 * k);
         c->gpu_addr = r300_reg(st, RB3D_COLOROFFSET0 + 4 * k) & ~0x1Fu;
         c->pitch = pr & 0x3FFE;
+        c->tiling = (pr >> 16) & 3;
         c->format = (pr >> 21) & 0xF;
         c->view = r300_cb_view(c->format, r300_us_out_fmt(st, k), &c->bpp);
         if (c->view == R300_RTV_NONE || !c->pitch) {
@@ -1625,7 +1732,8 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         prog.fc_loop[i] = r300_reg(st, VAP_PVS_FLOW_CNTL_LOOP_INDEX_0 + 4 * i);
     }
 
-    output_layout(st, &lay);
+    /* GA bypass uses fixed PSC semantics, not packed PVS outputs. */
+    output_layout(st, &lay, bypass);
     rs_route(st, &route, &desc, &pkt->warn);
 
     /* Rectangle lists: three corners a rectangle, the card completes the
@@ -2073,12 +2181,109 @@ uint64_t r300_hash_tex(const uint8_t *p, size_t n)
     return h ^ n;
 }
 
+bool r300_tex_card_swap_valid(const R300TexDesc *td)
+{
+    if (td->card_bytes && td->endian) {
+        uint32_t mask = td->endian == 1 ? 1 : 3;
+        for (uint32_t l = 0; l < td->levels; l++) {
+            if (!td->lvl_pitch[l] || (td->lvl_pitch[l] & mask) ||
+                (td->lvl_off[l] & mask)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/*
+ * Tiled texture memory (TX_OFFSET bits 3 and 2) read into the linear
+ * layout the conversions below expect.  Micro tiles are 32 bytes holding
+ * th rows of tw texels (8x4 at 8 bpp, 8x2 at 16, 4x2 at 32, 2x2 at 64, 2x1
+ * at 128; a DXT block counts as one texel), row-major inside the tile,
+ * tiles row-major across the surface with a band of th rows spanning the
+ * pitch.  A macro tile is 2 KB: 8x8 micro tiles, or 256 bytes by 8 rows
+ * when only macro tiling is on.  MorphOS's r300.library writes every
+ * texture micro tiled.
+ */
+static uint8_t *r300_tex_untile(const R300TexDesc *td, const uint8_t *src,
+                                uint32_t l, uint32_t w, uint32_t h)
+{
+    uint32_t pitch = td->lvl_pitch[l];
+    bool dxt = td->kind >= R300_TEXK_DXT1;
+    uint32_t bpp = td->kind == R300_TEXK_DXT1 ? 8 : dxt ? 16 :
+                   td->kind == R300_TEXK_RGBA8 ? 4 :
+                   td->kind == R300_TEXK_RG8 || td->kind == R300_TEXK_CONVERT16 ? 2 :
+                   td->kind == R300_TEXK_R8 ? 1 : td->view_bpp;
+    uint32_t cols = dxt ? (w + 3) / 4 : w, rows = dxt ? (h + 3) / 4 : h;
+    uint32_t tw = 32 / bpp, th = 1;
+    bool micro = td->tiling & 2, macro = false;
+
+    switch (bpp) {
+    case 1: tw = 8; th = 4; break;
+    case 2: tw = 8; th = 2; break;
+    case 4: tw = 4; th = 2; break;
+    case 8: tw = 2; th = 2; break;
+    default: tw = 2; th = 1; break;
+    }
+    if (!micro) {
+        tw = 256 / bpp;             /* macro only: 256-byte rows, 8 high */
+        th = 8;
+    }
+    uint64_t band = (uint64_t)pitch * th;
+    uint8_t *lin = malloc((size_t)pitch * rows);
+    for (uint32_t y = 0; y < rows; y++) {
+        for (uint32_t x = 0; x < cols; x++) {
+            uint64_t a;
+            if (micro && macro) {
+                uint32_t tx = x / tw, ty = y / th;
+                a = (uint64_t)(ty / 8) * band * 8 + (uint64_t)(tx / 8) * 2048 +
+                    ((ty % 8) * 8 + (tx % 8)) * 32 +
+                    ((y % th) * tw + (x % tw)) * bpp;
+            } else {
+                a = (uint64_t)(y / th) * band + (uint64_t)(x / tw) * (tw * bpp * th) +
+                    ((y % th) * tw + (x % tw)) * bpp;
+            }
+            memcpy(lin + (size_t)y * pitch + (size_t)x * bpp, src + a, bpp);
+        }
+    }
+    return lin;
+}
+
+static uint8_t *r300_tex_level_bytes_linear(const R300TexDesc *td,
+                                            const uint8_t *src, uint32_t l,
+                                            uint32_t w, uint32_t h,
+                                            uint32_t *bpr);
+
 uint8_t *r300_tex_level_bytes(const R300TexDesc *td, const uint8_t *src,
                                  uint32_t l, uint32_t w, uint32_t h,
                                  uint32_t *bpr)
 {
+    /*
+     * Only micro tiling is a layout in memory here: MorphOS's driver writes
+     * textures micro tiled with its own CPU code.  A bitmap's macro tile
+     * flag names memory this device's 2D and 3D paths keep linear.
+     */
+    if ((td->tiling & 2) && td->kind != R300_TEXK_RAW) {
+        uint8_t *lin = r300_tex_untile(td, src, l, w, h);
+        uint8_t *out = r300_tex_level_bytes_linear(td, lin, l, w, h, bpr);
+        free(lin);
+        return out;
+    }
+    return r300_tex_level_bytes_linear(td, src, l, w, h, bpr);
+}
+
+static uint8_t *r300_tex_level_bytes_linear(const R300TexDesc *td,
+                                            const uint8_t *src, uint32_t l,
+                                            uint32_t w, uint32_t h,
+                                            uint32_t *bpr)
+{
     uint32_t pitch = td->lvl_pitch[l];
     uint8_t *out;
+
+    if (!r300_tex_card_swap_valid(td)) {
+        *bpr = 0;
+        return NULL;
+    }
 
     switch (td->kind) {
     case R300_TEXK_CONVERT16:
@@ -2087,7 +2292,14 @@ uint8_t *r300_tex_level_bytes(const R300TexDesc *td, const uint8_t *src,
         for (uint32_t y = 0; y < h; y++) {
             const uint8_t *row = src + (uint64_t)y * pitch;
             for (uint32_t x = 0; x < w; x++) {
-                uint16_t v = (uint16_t)(row[2 * x] << 8 | row[2 * x + 1]);
+                uint16_t v;
+                if (td->card_bytes) {
+                    unsigned lane = td->endian == 1 ? 1 : td->endian == 2 ? 3 : td->endian == 3 ? 2 : 0;
+                    uint32_t a = y * pitch + 2 * x;
+                    v = src[a ^ lane] | (src[(a + 1) ^ lane] << 8);
+                } else {
+                    v = (uint16_t)(row[2 * x] << 8 | row[2 * x + 1]);
+                }
                 r300_decode16(td->format, v, out + ((size_t)y * w + x) * 4);
             }
         }
@@ -2113,10 +2325,10 @@ uint8_t *r300_tex_level_bytes(const R300TexDesc *td, const uint8_t *src,
         for (size_t i = 0; i < (size_t)bw * bh * bs; i += 4) {
             uint32_t l, v;
             memcpy(&l, out + i, 4);
-            if (td->host_data) {
+            if (td->host_data && !td->card_bytes) {
                 l = __builtin_bswap32(l);
             }
-            v = __builtin_bswap32(l);                       /* the BE value */
+            v = td->card_bytes ? l : __builtin_bswap32(l);                       /* the BE value */
             switch (td->endian & 3) {
             case 1: v = ((v & 0x00ff00ffu) << 8) | ((v >> 8) & 0x00ff00ffu); break;
             case 2: v = __builtin_bswap32(v); break;
@@ -2132,7 +2344,14 @@ uint8_t *r300_tex_level_bytes(const R300TexDesc *td, const uint8_t *src,
         *bpr = w * bpp;
         out = malloc((size_t)w * h * bpp);
         for (uint32_t y = 0; y < h; y++) {
-            memcpy(out + (size_t)y * w * bpp, src + (uint64_t)y * pitch, (size_t)w * bpp);
+            if (td->card_bytes && td->endian) {
+                unsigned lane = td->endian == 1 ? 1 : td->endian == 2 ? 3 : 2;
+                for (uint32_t x = 0; x < w * bpp; x++) {
+                    out[(size_t)y * w * bpp + x] = src[((uint64_t)y * pitch + x) ^ lane];
+                }
+            } else {
+                memcpy(out + (size_t)y * w * bpp, src + (uint64_t)y * pitch, (size_t)w * bpp);
+            }
         }
         return out;
     }

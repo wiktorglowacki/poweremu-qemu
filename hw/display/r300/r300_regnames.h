@@ -49,6 +49,7 @@ static const struct { uint16_t addr; const char *name; } r300_reg_names[] = {
     { 0x21F8, "R300_VAP_PROG_STREAM_CNTL_EXT_6" },
     { 0x21FC, "R300_VAP_PROG_STREAM_CNTL_EXT_7" },
     { 0x2200, "R300_VAP_PVS_VECTOR_INDX_REG" },
+    { 0x2204, "R300_VAP_PVS_UPLOAD_DATA_ALIAS" },
     { 0x2208, "R300_VAP_PVS_UPLOAD_DATA" },
     { 0x2218, "R500_VAP_TEX_TO_COLOR_CNTL" },
     { 0x221C, "R300_VAP_CLIP_CNTL" },
