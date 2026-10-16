@@ -2749,8 +2749,77 @@ static bool do_va_env_helper(DisasContext *ctx, arg_VA *a,
 TRANS_FLAGS(ALTIVEC, VMSUMUHS, do_va_env_helper, gen_helper_VMSUMUHS)
 TRANS_FLAGS(ALTIVEC, VMSUMSHS, do_va_env_helper, gen_helper_VMSUMSHS)
 
-TRANS_FLAGS(ALTIVEC, VMHADDSHS, do_va_env_helper, gen_helper_VMHADDSHS)
-TRANS_FLAGS(ALTIVEC, VMHRADDSHS, do_va_env_helper, gen_helper_VMHRADDSHS)
+/*
+ * vmhraddshs/vmhaddshs: vD = sat16(((vA * vB [+ 0x4000]) >> 15) + vC),
+ * inline where the host has mulhrs_vec (x86 pmulhrsw), which is the
+ * rounded product wrapped to 16 bits.  Unrounded, that is one too high
+ * where bit 14 of the full product (= of the low product) is set.  Only
+ * -32768 * -32768 wraps: it gives 0x8000, which no in-range product
+ * reaches, so in those lanes add 32767 and then 1 more, each saturating.
+ * PPC_NATIVE_VMH=0 keeps the helpers (A/B tests).
+ */
+static const TCGOpcode vmx_vmh_list[] = {
+    INDEX_op_mulhrs_vec, INDEX_op_mul_vec, INDEX_op_shli_vec,
+    INDEX_op_sari_vec, INDEX_op_cmp_vec, INDEX_op_add_vec, INDEX_op_sub_vec,
+    INDEX_op_ssadd_vec, INDEX_op_sssub_vec, 0
+};
+
+static bool vmx_vmh_native(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPC_NATIVE_VMH");
+        on = !(e && e[0] == '0')
+             && tcg_can_emit_vecop_list(vmx_vmh_list, TCG_TYPE_V128, MO_16);
+    }
+    return on;
+}
+
+static bool do_vmhaddshs(DisasContext *ctx, arg_VA *a, bool round)
+{
+    const TCGOpcode *hold_list;
+    TCGv_vec va, vb, p, m, t, r, sat;
+
+    if (!vmx_vmh_native()) {
+        return do_va_env_helper(ctx, a, round ? gen_helper_VMHRADDSHS
+                                              : gen_helper_VMHADDSHS);
+    }
+    REQUIRE_VECTOR(ctx);
+
+    hold_list = tcg_swap_vecop_list(vmx_vmh_list);
+    va = vmx_ld(a->vra);
+    vb = vmx_ld(a->vrb);
+    p = tcg_temp_new_vec(TCG_TYPE_V128);
+    m = tcg_temp_new_vec(TCG_TYPE_V128);
+    t = tcg_temp_new_vec(TCG_TYPE_V128);
+    r = tcg_temp_new_vec(TCG_TYPE_V128);
+    sat = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_mulhrs_vec(MO_16, p, va, vb);
+    if (!round) {
+        tcg_gen_mul_vec(MO_16, t, va, vb);
+        tcg_gen_shli_vec(MO_16, t, t, 1);
+        tcg_gen_sari_vec(MO_16, t, t, 15);          /* -(bit 14) */
+        tcg_gen_add_vec(MO_16, p, p, t);
+    }
+    tcg_gen_cmp_vec(TCG_COND_EQ, MO_16, m, p,
+                    tcg_constant_vec(TCG_TYPE_V128, MO_16, 0x8000));
+    tcg_gen_xor_vec(MO_16, p, p, m);                /* 0x8000 -> 32767 */
+    vb = vmx_ld(a->rc);
+    tcg_gen_ssadd_vec(MO_16, r, p, vb);
+    tcg_gen_add_vec(MO_16, t, p, vb);
+    tcg_gen_xor_vec(MO_16, sat, r, t);
+    tcg_gen_sub_vec(MO_16, t, r, m);                /* + 1 where m */
+    tcg_gen_sssub_vec(MO_16, r, r, m);
+    tcg_gen_xor_vec(MO_16, t, t, r);
+    tcg_gen_or_vec(MO_16, sat, sat, t);
+    vmx_accumulate_sat(sat);
+    vmx_st(a->vrt, r);
+    tcg_swap_vecop_list(hold_list);
+    return true;
+}
+
+TRANS_FLAGS(ALTIVEC, VMHADDSHS, do_vmhaddshs, false)
+TRANS_FLAGS(ALTIVEC, VMHRADDSHS, do_vmhaddshs, true)
 
 GEN_VXFORM_NOA(vclzb, 1, 28)
 GEN_VXFORM_NOA(vclzh, 1, 29)
