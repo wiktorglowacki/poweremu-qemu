@@ -640,6 +640,184 @@ static inline bool vfp_fast_ct(ppc_avr_t *r, ppc_avr_t *b, uint32_t uim,
     vst1q_u32(r->u32, res);
     return true;
 }
+#elif defined(__x86_64__) && defined(__FMA__) && defined(__SSE4_1__)
+/*
+ * The same with SSE4.1 + FMA3, chosen at compile time (-march=native):
+ * a build without them keeps softfloat.  Lane order is memory order,
+ * as the softfloat loops' is.
+ */
+#include <immintrin.h>
+
+enum { VFP_ADD, VFP_SUB, VFP_MIN, VFP_MAX, VFP_MADD, VFP_NMSUB,
+       VFP_RE, VFP_RSQRTE };
+
+/* Every lane normal or zero: no NaN, infinity or denormal. */
+static inline bool vfp_all_zon(__m128 v)
+{
+    __m128i u = _mm_castps_si128(v);
+    __m128i e = _mm_and_si128(u, _mm_set1_epi32(0x7f800000));
+    __m128i special = _mm_cmpeq_epi32(e, _mm_set1_epi32(0x7f800000));
+    __m128i mant_zero = _mm_cmpeq_epi32(
+        _mm_and_si128(u, _mm_set1_epi32(0x007fffff)), _mm_setzero_si128());
+    __m128i denormal = _mm_andnot_si128(mant_zero,
+                                        _mm_cmpeq_epi32(e, _mm_setzero_si128()));
+
+    return _mm_movemask_ps(_mm_castsi128_ps(_mm_or_si128(special, denormal))) == 0;
+}
+
+static inline __m128 vfp_ld(ppc_avr_t *v)
+{
+    return _mm_castsi128_ps(_mm_loadu_si128((const __m128i *)v->u32));
+}
+
+static inline bool vfp_st_checked(ppc_avr_t *r, __m128 x)
+{
+    if (!vfp_all_zon(x)) {
+        return false;
+    }
+    _mm_storeu_si128((__m128i *)r->u32, _mm_castps_si128(x));
+    return true;
+}
+
+/* PPC_NATIVE_VFP=0 keeps the AltiVec float ops on softfloat (A/B tests). */
+static inline bool vfp_on(void)
+{
+    static int on = -1;
+    if (unlikely(on < 0)) {
+        const char *e = getenv("PPC_NATIVE_VFP");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/* r = op(a, b[, c]); false (r untouched) when softfloat must decide. */
+static inline bool vfp_fast(int op, ppc_avr_t *r, ppc_avr_t *a,
+                            ppc_avr_t *b, ppc_avr_t *c)
+{
+    __m128 fa = vfp_ld(a), fb, fc, x;
+
+    if (!vfp_on() || !vfp_all_zon(fa)) {
+        return false;
+    }
+    switch (op) {
+    case VFP_RE:
+        return vfp_st_checked(r, _mm_div_ps(_mm_set1_ps(1.0f), fa));
+    case VFP_RSQRTE:
+        return vfp_st_checked(r, _mm_div_ps(_mm_set1_ps(1.0f),
+                                            _mm_sqrt_ps(fa)));
+    }
+    fb = vfp_ld(b);
+    if (!vfp_all_zon(fb)) {
+        return false;
+    }
+    switch (op) {
+    case VFP_ADD:
+        x = _mm_add_ps(fa, fb);
+        break;
+    case VFP_SUB:
+        x = _mm_sub_ps(fa, fb);
+        break;
+    case VFP_MIN:
+    case VFP_MAX:
+        /*
+         * MINPS/MAXPS return the second operand when both are zero, but
+         * PowerPC (like softfloat) orders -0 below +0.  Inputs that are
+         * equal as floats (which +0 and -0 are) have the bitwise OR as
+         * their min and the AND as their max.
+         */
+        {
+            __m128 eq = _mm_cmpeq_ps(fa, fb);
+            __m128 m = op == VFP_MIN ? _mm_min_ps(fa, fb) : _mm_max_ps(fa, fb);
+            __m128 z = op == VFP_MIN ? _mm_or_ps(fa, fb) : _mm_and_ps(fa, fb);
+
+            x = _mm_blendv_ps(m, z, eq);
+        }
+        break;
+    default:
+        fc = vfp_ld(c);
+        if (!vfp_all_zon(fc)) {
+            return false;
+        }
+        if (op == VFP_MADD) {
+            x = _mm_fmadd_ps(fa, fc, fb);                   /* a * c + b */
+        } else {
+            /* -(a*c - b): negate the rounded result (its zero's sign) */
+            x = _mm_xor_ps(_mm_fmsub_ps(fa, fc, fb), _mm_set1_ps(-0.0f));
+        }
+        break;
+    }
+    return vfp_st_checked(r, x);
+}
+
+/* vcfux/vcfsx: r = (float)b / 2^uim. */
+static inline bool vfp_fast_cf(ppc_avr_t *r, ppc_avr_t *b, uint32_t uim,
+                               bool sign)
+{
+    __m128i u = _mm_loadu_si128((const __m128i *)b->u32);
+    __m128 scale = _mm_castsi128_ps(_mm_set1_epi32((127 - uim) << 23));
+    __m128 x;
+
+    if (!vfp_on()) {
+        return false;
+    }
+    if (sign) {
+        x = _mm_cvtepi32_ps(u);
+    } else {
+        /*
+         * No unsigned conversion before AVX-512: hi * 65536 + lo, with
+         * both halves exact as floats and the fma rounding once.
+         */
+        __m128 hi = _mm_cvtepi32_ps(_mm_srli_epi32(u, 16));
+        __m128 lo = _mm_cvtepi32_ps(_mm_and_si128(u, _mm_set1_epi32(0xffff)));
+
+        x = _mm_fmadd_ps(hi, _mm_set1_ps(65536.0f), lo);
+    }
+    return vfp_st_checked(r, _mm_mul_ps(x, scale));
+}
+
+/* vctuxs/vctsxs: r = saturate(trunc(b * 2^uim)), noting saturation. */
+static inline bool vfp_fast_ct(ppc_avr_t *r, ppc_avr_t *b, uint32_t uim,
+                               bool sign, int *sat)
+{
+    __m128 fb = vfp_ld(b);
+    __m128d scale = _mm_castsi128_pd(
+        _mm_set1_epi64x((int64_t)(1023 + uim) << 52));
+    __m128d lo, hi, min, max, bias, over;
+    __m128i res;
+
+    if (!vfp_on() || !vfp_all_zon(fb)) {
+        return false;
+    }
+    /* Exact in double, as is truncating that to an integer value. */
+    lo = _mm_round_pd(_mm_mul_pd(_mm_cvtps_pd(fb), scale),
+                      _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
+    hi = _mm_round_pd(_mm_mul_pd(_mm_cvtps_pd(_mm_movehl_ps(fb, fb)), scale),
+                      _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
+    if (sign) {
+        min = _mm_set1_pd(-2147483648.0);
+        max = _mm_set1_pd(2147483647.0);
+        bias = _mm_setzero_pd();
+    } else {
+        min = _mm_setzero_pd();
+        max = _mm_set1_pd(4294967295.0);
+        bias = _mm_set1_pd(2147483648.0);
+    }
+    over = _mm_or_pd(_mm_or_pd(_mm_cmplt_pd(lo, min), _mm_cmpgt_pd(lo, max)),
+                     _mm_or_pd(_mm_cmplt_pd(hi, min), _mm_cmpgt_pd(hi, max)));
+    if (_mm_movemask_pd(over)) {
+        *sat = 1;
+    }
+    lo = _mm_min_pd(_mm_max_pd(lo, min), max);
+    hi = _mm_min_pd(_mm_max_pd(hi, min), max);
+    /* Less the bias the clamped values fit int32, so CVTTPD2DQ is exact. */
+    res = _mm_unpacklo_epi64(_mm_cvttpd_epi32(_mm_sub_pd(lo, bias)),
+                             _mm_cvttpd_epi32(_mm_sub_pd(hi, bias)));
+    if (!sign) {
+        res = _mm_xor_si128(res, _mm_set1_epi32(0x80000000));
+    }
+    _mm_storeu_si128((__m128i *)r->u32, res);
+    return true;
+}
 #else
 enum { VFP_ADD, VFP_SUB, VFP_MIN, VFP_MAX, VFP_MADD, VFP_NMSUB,
        VFP_RE, VFP_RSQRTE };
