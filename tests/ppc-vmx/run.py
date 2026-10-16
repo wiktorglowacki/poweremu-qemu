@@ -187,6 +187,8 @@ def main():
         print(f'bench {"lvx/lvx/vperm/stvx x4 (unaligned)":36s} {ut / tbfreq * 1e3:8.1f} ms')
         vt = mon.words(RESULTS + 0x213 * 4, 1)[0]
         print(f'bench {"vmhraddshs x4 dependent":36s} {vt / tbfreq * 1e3:8.1f} ms')
+        st = mon.words(RESULTS + 0x214 * 4, 1)[0]
+        print(f'bench {"sraw/rotlwi x4 dependent":36s} {st / tbfreq * 1e3:8.1f} ms')
         mt, mn = mon.words(RESULTS + 0x20b * 4, 2)
         print(f'bench {"mandelbrot 64x48x256 (fcmpu exits)":36s} {mt / tbfreq * 1e3:8.1f} ms'
               f'  ({mn} iterations)')
@@ -204,9 +206,15 @@ def main():
             what = ('lfs', 'stfs')[p[0]]
             print(f'FAIL {what} in={p[1]:08x}{p[2]:08x} '
                   f'got={p[3]:08x}{p[4]:08x} expected={p[5]:08x}{p[6]:08x}')
+        schecks, sfails, *sp = mon.words(RESULTS + 0x2e0 * 4, 12)
+        if sfails:
+            print(f'FAIL sraw form {sp[0]} rs={sp[1]:08x} rb={sp[2]:08x} xer_in={sp[3]:08x}: '
+                  f'ra/xer/cr0 {sp[4]:08x} {sp[5]:08x} {sp[6]:08x}, '
+                  f'expected {sp[7]:08x} {sp[8]:08x} {sp[9]:08x}')
         print(f'{checks} checks, {fails} failures')
         print(f'{fchecks} lfs/stfs checks, {ffails} failures')
-        sys.exit(1 if fails or ffails else 0)
+        print(f'{schecks} sraw checks, {sfails} failures')
+        sys.exit(1 if fails or ffails or sfails or not schecks else 0)
     finally:
         q.kill()
 

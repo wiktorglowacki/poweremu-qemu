@@ -2336,11 +2336,48 @@ static void gen_slw(DisasContext *ctx)
     }
 }
 
+/* PPC_INLINE_SRAW=0 keeps sraw on the helper (for A/B tests). */
+static bool inline_sraw_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPC_INLINE_SRAW");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
 /* sraw & sraw. */
 static void gen_sraw(DisasContext *ctx)
 {
-    gen_helper_sraw(cpu_gpr[rA(ctx->opcode)], tcg_env,
-                    cpu_gpr[rS(ctx->opcode)], cpu_gpr[rB(ctx->opcode)]);
+    if (inline_sraw_on()) {
+        /*
+         * A 64-bit arithmetic shift of the sign-extended word by rB[58:63]
+         * gives the result for every count (sign fill from 32 up), and
+         * CA = negative and a bit shifted out: (q << n) != s.
+         */
+        TCGv_i64 s = tcg_temp_new_i64();
+        TCGv_i64 n = tcg_temp_new_i64();
+        TCGv_i64 q = tcg_temp_new_i64();
+
+        tcg_gen_ext_tl_i64(s, cpu_gpr[rS(ctx->opcode)]);
+        tcg_gen_ext32s_i64(s, s);
+        tcg_gen_extu_tl_i64(n, cpu_gpr[rB(ctx->opcode)]);
+        tcg_gen_andi_i64(n, n, 0x3f);
+        tcg_gen_sar_i64(q, s, n);
+        tcg_gen_trunc_i64_tl(cpu_gpr[rA(ctx->opcode)], q);
+        tcg_gen_shl_i64(q, q, n);
+        tcg_gen_setcond_i64(TCG_COND_NE, q, q, s);
+        tcg_gen_shri_i64(s, s, 63);
+        tcg_gen_and_i64(q, q, s);
+        tcg_gen_trunc_i64_tl(cpu_ca, q);
+        if (is_isa300(ctx)) {
+            tcg_gen_mov_tl(cpu_ca32, cpu_ca);
+        }
+    } else {
+        gen_helper_sraw(cpu_gpr[rA(ctx->opcode)], tcg_env,
+                        cpu_gpr[rS(ctx->opcode)], cpu_gpr[rB(ctx->opcode)]);
+    }
     if (unlikely(Rc(ctx->opcode) != 0)) {
         gen_set_Rc0(ctx, cpu_gpr[rA(ctx->opcode)]);
     }

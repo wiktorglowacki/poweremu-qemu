@@ -745,6 +745,21 @@ static void bench(void)
     }
     res[0x213] = tb() - t0;
 
+    /* sraw x4, dependent through rS (count 5 keeps it busy) */
+    {
+        uint32_t r = 0x87654321, k = 5;
+        t0 = tb();
+        for (i = 0; i < BENCH_ITERS; i++) {
+            asm volatile("sraw %0,%0,%1\n\trotlwi %0,%0,5\n\t"
+                         "sraw %0,%0,%1\n\trotlwi %0,%0,5\n\t"
+                         "sraw %0,%0,%1\n\trotlwi %0,%0,5\n\t"
+                         "sraw %0,%0,%1\n\trotlwi %0,%0,5"
+                         : "+r"(r) : "r"(k) : "xer");
+        }
+        res[0x214] = tb() - t0;
+        res[0x215] = r;
+    }
+
     /* 0.5f, 1.0f, 0.25f: stays finite and normal. */
     a.w[0] = a.w[1] = a.w[2] = a.w[3] = 0x3f000000;
     b.w[0] = b.w[1] = b.w[2] = b.w[3] = 0x3f800000;
@@ -1239,6 +1254,127 @@ static void fp_diff(uint32_t *seed)
     asm volatile("mtfsfi 7,0");
 }
 
+/*
+ * sraw / sraw. (translate.c gen_sraw, inline unless PPC_INLINE_SRAW=0):
+ * every shift count 0-63 (and rB with garbage above bit 5), edge and
+ * random rS, rA distinct from / equal to rS / equal to rB, XER in with
+ * SO/OV/CA set or clear.  Checks rA, XER (CA) and CR0.  The reference is
+ * the ISA definition in unsigned shifts only; the asm barrier keeps clang
+ * from folding it back into an sraw.  Results at res[0x2e0]: checks,
+ * failures, then the first failure: form, rs, rb, xer_in, ra, xer, cr,
+ * and the expected ra, xer, cr.
+ */
+#define XER_SO 0x80000000u
+#define XER_OV 0x40000000u
+#define XER_CA 0x20000000u
+
+static void ref_sraw(uint32_t rs, uint32_t rb, uint32_t xer_in, uint32_t *ra,
+                     uint32_t *xer, uint32_t *cr0)
+{
+    uint32_t n = rb & 0x3f, neg = rs >> 31, fill = 0, lost, r;
+
+    asm volatile("" : "+r"(neg));
+    if (neg) {
+        fill = ~0u;
+    }
+    if (n < 32) {
+        r = rs >> n;
+        if (n) {
+            r |= fill << (32 - n);
+        }
+        lost = rs & ((1u << n) - 1);
+    } else {
+        r = fill;
+        lost = rs;
+    }
+    *ra = r;
+    *xer = (xer_in & ~XER_CA) | (neg && lost ? XER_CA : 0);
+    *cr0 = (r == 0 ? 0x20000000u : (r >> 31) ? 0x80000000u : 0x40000000u)
+           | (xer_in & XER_SO ? 0x10000000u : 0);
+}
+
+static void hw_sraw(int form, uint32_t rs, uint32_t rb, uint32_t xer_in,
+                    uint32_t *ra, uint32_t *xer, uint32_t *cr0)
+{
+    uint32_t d, x, c;
+
+    switch (form) {
+    case 0:     /* sraw. rA distinct */
+        asm volatile("mtxer %3\n\tsraw. %0,%4,%5\n\tmfxer %1\n\tmfcr %2"
+                     : "=&r"(d), "=&r"(x), "=&r"(c)
+                     : "r"(xer_in), "r"(rs), "r"(rb) : "cr0");
+        break;
+    case 1:     /* sraw. rA = rS */
+        d = rs;
+        asm volatile("mtxer %3\n\tsraw. %0,%0,%4\n\tmfxer %1\n\tmfcr %2"
+                     : "+r"(d), "=&r"(x), "=&r"(c)
+                     : "r"(xer_in), "r"(rb) : "cr0");
+        break;
+    case 2:     /* sraw. rA = rB */
+        d = rb;
+        asm volatile("mtxer %3\n\tsraw. %0,%4,%0\n\tmfxer %1\n\tmfcr %2"
+                     : "+r"(d), "=&r"(x), "=&r"(c)
+                     : "r"(xer_in), "r"(rs) : "cr0");
+        break;
+    default:    /* sraw (no Rc): CR0 keeps the cmpwi result */
+        asm volatile("mtxer %3\n\tcmpwi 0,%4,0\n\tsraw %0,%4,%5\n\t"
+                     "mfxer %1\n\tmfcr %2"
+                     : "=&r"(d), "=&r"(x), "=&r"(c)
+                     : "r"(xer_in), "r"(rs), "r"(rb) : "cr0");
+        break;
+    }
+    *ra = d;
+    *xer = x;
+    *cr0 = c & 0xf0000000u;
+}
+
+static void check_sraw(int form, uint32_t rs, uint32_t rb, uint32_t xer_in)
+{
+    uint32_t ra, xer, cr, era, exer, ecr;
+
+    hw_sraw(form, rs, rb, xer_in, &ra, &xer, &cr);
+    ref_sraw(rs, rb, xer_in, &era, &exer, &ecr);
+    if (form == 3) {    /* cmpwi rs,0 then sraw: CR0 from rs, SO copied */
+        ecr = ((int32_t)rs < 0 ? 0x80000000u : rs ? 0x40000000u : 0x20000000u)
+              | (xer_in & XER_SO ? 0x10000000u : 0);
+    }
+    res[0x2e0]++;
+    if (ra != era || xer != exer || cr != ecr) {
+        if (res[0x2e1]++ == 0) {
+            volatile uint32_t *p = res + 0x2e2;
+            p[0] = form; p[1] = rs; p[2] = rb; p[3] = xer_in;
+            p[4] = ra; p[5] = xer; p[6] = cr;
+            p[7] = era; p[8] = exer; p[9] = ecr;
+        }
+    }
+}
+
+static void scalar_sraw(uint32_t *seed)
+{
+    static const uint32_t edge[] = {
+        0, 1, 2, 3, 0xffffffff, 0xfffffffe, 0x80000000, 0x80000001,
+        0x7fffffff, 0x7ffffffe, 0x55555555, 0xaaaaaaaa, 0xffff0000,
+        0x0000ffff, 0x12345678, 0x87654321,
+    };
+    static const uint32_t xers[] = { 0, XER_CA, XER_SO | XER_OV | XER_CA,
+                                     XER_SO };
+    uint32_t n, i, k;
+
+    for (n = 0; n < 64; n++) {
+        for (i = 0; i < sizeof(edge) / sizeof(edge[0]) + 64 + 200; i++) {
+            uint32_t rs = i < 16 ? edge[i]
+                        : i < 48 ? 1u << (i - 16)
+                        : i < 80 ? ~0u << (i - 48)
+                        : rnd(seed);
+            uint32_t rb = n | (i & 1 ? rnd(seed) & ~0x3fu : 0);
+            for (k = 0; k < 4; k++) {
+                check_sraw(k, rs, rb, xers[(i + k) & 3]);
+            }
+        }
+    }
+    asm volatile("mtxer %0" : : "r"(0));
+}
+
 int main(void)
 {
     uint32_t seed = 0x2545f491;
@@ -1302,6 +1438,7 @@ int main(void)
     res[1] = checks;
     res[2] = fails;
     scalar_ldst(&seed);
+    scalar_sraw(&seed);
     fp_diff(&seed);
     bench();
     res[0] = 0x564d5854; /* 'VMXT' */
