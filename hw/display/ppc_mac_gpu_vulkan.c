@@ -1108,10 +1108,40 @@ static uint64_t vk_img_hash(uint32_t addr, uint32_t w, uint32_t h, uint32_t pitc
     return hv | 1;
 }
 
+static bool vk_tiled_rt_enabled(void);
+
+/*
+ * Rows per band of the tiled VRAM layout vk_tile_copy moves im's texels
+ * through (vk_tile_glsl's tiled()), 1 for a linear one.  A band is
+ * pitch * rows bytes and holds whole tiles, so the bytes of any band-aligned
+ * row range are one contiguous span.
+ */
+static uint32_t vk_tile_band(int cls, uint32_t tiling, uint32_t bpp)
+{
+    uint32_t th = bpp == 1 ? 4 : 2;
+
+    if (!tiling || (cls == IMG_RT && !vk_tiled_rt_enabled())) {
+        return 1;
+    }
+    return tiling == 1 ? 8 : tiling == 2 ? th : th * 8;
+}
+
+/* End of the VRAM bytes an image's texels come from. */
+static uint64_t vk_span_hi(int cls, uint32_t addr, uint32_t w, uint32_t h,
+                           uint32_t pitch, uint32_t bpp, uint32_t tiling)
+{
+    uint32_t band = vk_tile_band(cls, tiling, bpp);
+
+    if (band > 1) {
+        return (uint64_t)addr + (uint64_t)pitch * QEMU_ALIGN_UP(h, band);
+    }
+    return (uint64_t)addr + (uint64_t)pitch * (h - 1) + (uint64_t)w * bpp;
+}
+
 static inline uint64_t vk_img_hi(const VkImg *im)
 {
-    return (uint64_t)im->addr + (uint64_t)im->pitch * (im->height - 1) +
-           (uint64_t)im->width * im->bpp;
+    return vk_span_hi(im->cls, im->addr, im->width, im->height, im->pitch,
+                      im->bpp, im->tiling);
 }
 
 /* ---- image cache ------------------------------------------------------ */
@@ -1371,7 +1401,21 @@ static bool vk_tile_copy(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0
     if ((im->cls == IMG_RT && !vk_tiled_rt_enabled()) || !vk_tile_init()) {
         return false;
     }
-    /* whole words: widen the rectangle to 4-byte columns */
+    /*
+     * The pass addresses whole tiles: a pitch that does not hold whole
+     * tiles (micro: 32 bytes / th; macro: 256 bytes, 2 KB per 8 micro
+     * rows) would reach past vk_img_hi, maybe past VRAM.  Linear instead.
+     */
+    uint32_t th = im->bpp == 1 ? 4 : 2;
+    if (im->pitch % (im->tiling == 1 ? 256 : im->tiling == 2 ? 32 / th : 256 / th)) {
+        return false;
+    }
+    /*
+     * whole words: widen the rectangle to 4-byte columns.  The image copy
+     * stops at the image's width, but the staging rows are w_pad texels
+     * (whole words, as the shader counts them): at an odd width the last
+     * word holds texels past the edge, in the tiles' padding.
+     */
     uint32_t align = 4 / MIN(im->bpp, 4u);
     x0 &= ~(align - 1);
     x1 = MIN(ROUND_UP(x1, align), im->width);
@@ -1379,8 +1423,9 @@ static bool vk_tile_copy(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0
         return true;
     }
     uint32_t w = x1 - x0;
-    uint32_t rows_max = MAX((uint32_t)(((VkDeviceSize)16 << 20) / ((VkDeviceSize)w * im->bpp)), 1u);
-    if (!vk_tile_staging((VkDeviceSize)w * im->bpp * MIN(y1 - y0, rows_max))) {
+    uint32_t w_pad = ROUND_UP(x1, align) - x0;
+    uint32_t rows_max = MAX((uint32_t)(((VkDeviceSize)16 << 20) / ((VkDeviceSize)w_pad * im->bpp)), 1u);
+    if (!vk_tile_staging((VkDeviceSize)w_pad * im->bpp * MIN(y1 - y0, rows_max))) {
         return false;
     }
     if (!V.tile_logged) {
@@ -1392,13 +1437,14 @@ static bool vk_tile_copy(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0
         uint32_t h = MIN(y1 - y, rows_max);
         VkBufferImageCopy r = {
             .bufferOffset = 0,
-            .bufferRowLength = w,
+            .bufferRowLength = w_pad,
             .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
             .imageOffset = { (int32_t)x0, (int32_t)y, 0 },
             .imageExtent = { w, h, 1 },
         };
-        uint32_t pc[9] = { im->addr, im->pitch, x0, y, w, h, im->bpp, im->tiling, to_vram ? 0 : 1 };
-        uint32_t words = w * im->bpp / 4 * h;
+        uint32_t pc[9] = { im->addr, im->pitch, x0, y, w_pad, h, im->bpp, im->tiling,
+                           to_vram ? 0 : 1 };
+        uint32_t words = w_pad * im->bpp / 4 * h;
         if (to_vram) {
             vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, V.tile_buf, 1, &r);
             vk_full_barrier(cb);
@@ -1527,7 +1573,7 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
     int lru = -1;
 
     if (!w || !h || pitch < w * bpp || addr % 4 || addr % bpp || pitch % bpp ||
-        (uint64_t)addr + (uint64_t)pitch * (h - 1) + (uint64_t)w * bpp > V.vram_size ||
+        vk_span_hi(cls, addr, w, h, pitch, bpp, tiling) > V.vram_size ||
         w > V.props.limits.maxImageDimension2D || h > V.props.limits.maxImageDimension2D) {
         return NULL;
     }
@@ -1615,7 +1661,10 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
         im->valid = false;
     }
     if (!im->valid || gen > im->gen) {
-        /* The rows holding pages newer than the image (all, if new). */
+        /* The rows holding pages newer than the image (all, if new), in
+         * whole bands when tiled: a page holds pieces of a band's rows. */
+        uint32_t band = vk_tile_band(cls, tiling, bpp);
+        uint64_t band_b = (uint64_t)pitch * band;
         uint32_t y0 = 0, y1 = h;
         if (im->valid) {
             uint64_t lo_p = UINT64_MAX, hi_p = 0;
@@ -1628,11 +1677,11 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
             V.stat_up_src[V.page_src[hi_p] & 3]++;
             uint64_t blo = MAX(lo_p * VK_PAGE, (uint64_t)addr);
             uint64_t bhi = MIN((hi_p + 1) * VK_PAGE, hi);
-            y0 = (blo - addr) / pitch;
+            y0 = (blo - addr) / band_b * band;
             /* the image's rows, not the draw's: an image found through
              * max_h is taller than h, and a newer page below row h gave
              * y0 > y1 here, a copy of 2^32 rows (host GPU hang, 2026-10-15) */
-            y1 = MIN((uint32_t)((bhi - addr + pitch - 1) / pitch), im->height);
+            y1 = MIN((uint32_t)DIV_ROUND_UP(bhi - addr, band_b) * band, im->height);
         } else {
             V.stat_up_new++;
         }
@@ -1642,7 +1691,9 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
             return im;
         }
         /* Rendering over those rows that VRAM lacks goes there first. */
-        vk_writeback_range(addr + (uint64_t)y0 * pitch, addr + (uint64_t)y1 * pitch);
+        uint64_t rlo = addr + (uint64_t)y0 * pitch;
+        uint64_t rhi = addr + (uint64_t)QEMU_ALIGN_UP(y1, band) * pitch;
+        vk_writeback_range(rlo, rhi);
         VkCommandBuffer cb = vk_batch()->cb;
         VkBufferImageCopy r = vk_region(im, 0, y0, w, y1);
         vk_end_pass();
@@ -1651,7 +1702,7 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
             vkCmdCopyBufferToImage(cb, V.vram_buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
         }
         vk_full_barrier(cb);
-        vk_note_read(addr + (uint64_t)y0 * pitch, addr + (uint64_t)y1 * pitch);
+        vk_note_read(rlo, rhi);
         im->valid = true;
         im->gen = gen;
         im->hash = vk_check() && cls == IMG_TEX && !vk_range_pending(addr, hi) ?
