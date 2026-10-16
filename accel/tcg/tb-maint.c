@@ -996,6 +996,12 @@ static void tb_phys_invalidate__locked(TranslationBlock *tb)
  */
 void tb_phys_invalidate(TranslationBlock *tb, tb_page_addr_t page_addr)
 {
+    /*
+     * Called from helpers while translated code runs (cpu_io_recompile,
+     * tb_check_watchpoint): on macOS arm64 the TB lives in the MAP_JIT
+     * buffer, which is not writable in that state.
+     */
+    qemu_thread_jit_write();
     if (page_addr == -1 && tb_page_addr0(tb) != -1) {
         tb_lock_pages(tb);
         do_tb_phys_invalidate(tb, true);
@@ -1003,6 +1009,7 @@ void tb_phys_invalidate(TranslationBlock *tb, tb_page_addr_t page_addr)
     } else {
         do_tb_phys_invalidate(tb, false);
     }
+    qemu_thread_jit_execute();
 }
 
 /*
