@@ -2123,6 +2123,21 @@ DirtyBitmapSnapshot *memory_region_snapshot_and_clear_dirty(MemoryRegion *mr,
                                                             unsigned client);
 
 /**
+ * memory_region_get_dirty: Check whether any byte of a range is dirty
+ *
+ * Reads the dirty log without clearing it or syncing it from an
+ * accelerator (only TCG writes are seen), so a device can tell cheaply
+ * whether a memory_region_snapshot_and_clear_dirty() would find anything.
+ *
+ * @mr: the memory region being queried.
+ * @addr: the address (relative to the start of the region) being queried.
+ * @size: the size of the range being queried.
+ * @client: the user of the logging information; typically %DIRTY_MEMORY_VGA.
+ */
+bool memory_region_get_dirty(MemoryRegion *mr, hwaddr addr, hwaddr size,
+                             unsigned client);
+
+/**
  * memory_region_snapshot_get_dirty: Check whether a range of bytes is dirty
  *                                   in the specified dirty bitmap snapshot.
  *

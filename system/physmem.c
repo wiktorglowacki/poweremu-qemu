@@ -992,13 +992,7 @@ bool cpu_physical_memory_snapshot_get_dirty(DirtyBitmapSnapshot *snap,
     end = TARGET_PAGE_ALIGN(start + length - snap->start) >> TARGET_PAGE_BITS;
     page = (start - snap->start) >> TARGET_PAGE_BITS;
 
-    while (page < end) {
-        if (test_bit(page, snap->dirty)) {
-            return true;
-        }
-        page++;
-    }
-    return false;
+    return find_next_bit(snap->dirty, end, page) < end;
 }
 
 /* Called from RCU critical section */
