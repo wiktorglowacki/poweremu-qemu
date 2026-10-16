@@ -38,6 +38,7 @@
 #include "qemu/datadir.h"
 #include "system/device_tree.h"
 #include "hw/ppc/vof.h"
+#include "hw/timer/i8254.h"
 
 #include <libfdt.h>
 
@@ -394,6 +395,22 @@ static void pegasos2_machine_reset(MachineState *machine, ResetType type)
 
     pegasos2_pci_config_write(pm, 1, (PCI_DEVFN(12, 6) << 8) |
                               PCI_INTERRUPT_LINE, 2, 0x309);
+
+    /*
+     * Nothing programs the VIA's 8254 when there is no firmware, and on the
+     * real board an unprogrammed 8254 never raises IRQ0.  QEMU's runs from
+     * reset, and MorphOS keeps its 8259s level-triggered with IRQ0 unmasked,
+     * so IRQ0 read as pending for half of every 55 ms period and the guest
+     * spent that time in its interrupt handler (500k external interrupts a
+     * second, half the CPU).  Keep the timer's interrupt off.
+     */
+    {
+        Object *pit = object_resolve_path_type("", TYPE_I8254, NULL);
+
+        if (pit) {
+            qemu_set_irq(qdev_get_gpio_in(DEVICE(pit), 0), 0);
+        }
+    }
 
     /* Device tree and VOF set up */
     vof_init(pm->vof, machine->ram_size, &error_fatal);
