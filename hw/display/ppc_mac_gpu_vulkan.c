@@ -134,6 +134,7 @@ typedef struct VkImg {
     uint32_t dr[VK_MAX_DR][4];
     uint64_t used;
     uint64_t hash;              /* PPCGPU_VK_CHECK: VRAM bytes when loaded, or 0 */
+    bool z;                     /* last bound as a depth buffer */
 } VkImg;
 
 /* Textures rebuilt on the CPU (mips, 3D, cube, 16bpp, DXT, GART copies). */
@@ -291,6 +292,9 @@ static struct {
      * of images whose newest page came from the CPU, a draw, a 2D op */
     uint64_t stat_commits, stat_wb_commit, stat_up_new, stat_up_src[4], stat_up_rt;
     uint8_t *page_src;          /* who last wrote the page: 1 CPU, 2 draw, 3 2D */
+    /* batches waited for, depth write-backs at commit, rebuilt textures:
+     * lookups, hashes, builds */
+    uint64_t stat_batch_waits, stat_wb_z, stat_tf_calls, stat_tf_hashed, stat_tf_built;
 } V;
 
 typedef struct VkWaitItem {
@@ -910,6 +914,7 @@ static VkBatch *vk_batch(void)
             break;
         }
         /* all in flight: wait for the waiter to finish the oldest */
+        V.stat_batch_waits++;
         qemu_mutex_lock(&V.lock);
         uint32_t ws = qatomic_read(&V.worker_seq);
         while (qatomic_read(&V.worker_seq) == ws && !g_queue_is_empty(V.waitq)) {
@@ -1817,6 +1822,7 @@ static uint32_t vk_commit(void (*done)(void *, uint32_t), void *arg)
     uint64_t wb0 = V.stat_writebacks;
     for (int i = 0; i < VK_MAX_IMG; i++) {
         if (V.img[i].live && V.img[i].dirty) {
+            V.stat_wb_z += V.img[i].z && V.img[i].ndr;
             vk_copy_to_vram(&V.img[i]);
         }
     }
@@ -2791,6 +2797,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             vk_warn(1u << 8, "render target B-D unusable");
             return -1;
         }
+        att[k]->z = false;
     }
     uint32_t natt = ncb;
     bool z16 = zd->bpp == 2;
@@ -2803,6 +2810,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         if (att[ncb] && zw == fbw) {
             fmt[ncb] = zf;
             natt++;
+            att[ncb]->z = true;
         } else {
             vk_warn(1u << 9, "depth buffer not usable in place");
             want_z = false;
@@ -3032,13 +3040,18 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     if (V.stat_draws % 20000 == 0) {
         qemu_log("ppc-mac-gpu vulkan: %llu draws, %llu passes, %llu uploads, "
                  "%llu write-backs, %llu flushes; %llu commits, %llu write-backs "
-                 "at commit; uploads: %llu new, %llu cpu, %llu draw, %llu 2d, %llu RT\n",
+                 "at commit; uploads: %llu new, %llu cpu, %llu draw, %llu 2d, %llu RT; "
+                 "%llu batch waits, %llu depth write-backs at commit; rebuilt "
+                 "textures: %llu lookups, %llu hashed, %llu built\n",
                  (unsigned long long)V.stat_draws, (unsigned long long)V.stat_passes,
                  (unsigned long long)V.stat_uploads, (unsigned long long)V.stat_writebacks,
                  (unsigned long long)V.stat_flushes, (unsigned long long)V.stat_commits,
                  (unsigned long long)V.stat_wb_commit, (unsigned long long)V.stat_up_new,
                  (unsigned long long)V.stat_up_src[1], (unsigned long long)V.stat_up_src[2],
-                 (unsigned long long)V.stat_up_src[3], (unsigned long long)V.stat_up_rt);
+                 (unsigned long long)V.stat_up_src[3], (unsigned long long)V.stat_up_rt,
+                 (unsigned long long)V.stat_batch_waits, (unsigned long long)V.stat_wb_z,
+                 (unsigned long long)V.stat_tf_calls, (unsigned long long)V.stat_tf_hashed,
+                 (unsigned long long)V.stat_tf_built);
     }
     return 0;
 }
