@@ -112,10 +112,48 @@ static void vmx_accumulate_sat(TCGv_vec x)
     tcg_gen_st_vec(sat, tcg_env, offsetof(CPUPPCState, vscr_sat));
 }
 
+/* PPC_VLD_VEC=0 writes vD as two 8-byte halves again (for A/B tests). */
+static bool vld_vec_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPC_VLD_VEC");
+        on = !(e && e[0] == '0');
+    }
+    return on && vmx_host_tbl();
+}
+
+/*
+ * vD = hi:lo, written with one 16-byte store.  Two 8-byte stores cannot
+ * forward to the 16-byte load of the next vector op that reads vD (vperm
+ * after lvx/lvsl), which then waits for both stores to retire: about 2 ns
+ * per lvx, more than the permute itself costs (docs/MORPHOS.md).
+ */
+static void set_avr64_pair(int regno, TCGv_i64 hi, TCGv_i64 lo)
+{
+    /* host order (little-endian, as vmx_host_tbl requires): lane 1 = hi */
+    static const uint64_t hi_lane[2] QEMU_ALIGNED(16) = { 0, -1ull };
+    TCGv_vec vlo, vhi;
+
+    if (!vld_vec_on()) {
+        set_avr64(regno, hi, true);
+        set_avr64(regno, lo, false);
+        return;
+    }
+    vlo = tcg_temp_new_vec(TCG_TYPE_V128);
+    vhi = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_dup_i64_vec(MO_64, vlo, lo);
+    tcg_gen_dup_i64_vec(MO_64, vhi, hi);
+    tcg_gen_bitsel_vec(MO_64, vlo, vmx_ld_const((const uint8_t *)hi_lane),
+                       vhi, vlo);
+    vmx_st(regno, vlo);
+}
+
 static bool trans_LVX(DisasContext *ctx, arg_X *a)
 {
     TCGv EA;
     TCGv_i128 avr;
+    TCGv_i64 lo = tcg_temp_new_i64(), hi = tcg_temp_new_i64();
     REQUIRE_INSNS_FLAGS(ctx, ALTIVEC);
     REQUIRE_VECTOR(ctx);
     gen_set_access_type(ctx, ACCESS_INT);
@@ -124,7 +162,8 @@ static bool trans_LVX(DisasContext *ctx, arg_X *a)
     tcg_gen_andi_tl(EA, EA, ~0xf);
     tcg_gen_qemu_ld_i128(avr, EA, ctx->mem_idx,
                          DEF_MEMOP(MO_128 | MO_ATOM_IFALIGN_PAIR));
-    set_avr_full(a->rt, avr);
+    tcg_gen_extr_i128_i64(lo, hi, avr);
+    set_avr64_pair(a->rt, hi, lo);
     return true;
 }
 
@@ -531,13 +570,12 @@ static bool trans_LVSL(DisasContext *ctx, arg_LVSL *a)
      */
     tcg_gen_muli_i64(sh, sh, 0x0101010101010101ULL);
     tcg_gen_addi_i64(result, sh, 0x0001020304050607ull);
-    set_avr64(a->rt, result, true);
     /*
      * Create bytes sh+8:sh+15 of X(from description) and place them in
      * lower doubleword of vD.
      */
-    tcg_gen_addi_i64(result, sh, 0x08090a0b0c0d0e0fULL);
-    set_avr64(a->rt, result, false);
+    tcg_gen_addi_i64(sh, sh, 0x08090a0b0c0d0e0fULL);
+    set_avr64_pair(a->rt, result, sh);
     return true;
 }
 
@@ -568,13 +606,12 @@ static bool trans_LVSR(DisasContext *ctx, arg_LVSR *a)
      */
     tcg_gen_muli_i64(sh, sh, 0x0101010101010101ULL);
     tcg_gen_subfi_i64(result, 0x1011121314151617ULL, sh);
-    set_avr64(a->rt, result, true);
     /*
      * Create bytes (24-sh):(32-sh) of X(from description) and place them in
      * lower doubleword of vD.
      */
-    tcg_gen_subfi_i64(result, 0x18191a1b1c1d1e1fULL, sh);
-    set_avr64(a->rt, result, false);
+    tcg_gen_subfi_i64(sh, 0x18191a1b1c1d1e1fULL, sh);
+    set_avr64_pair(a->rt, result, sh);
     return true;
 }
 

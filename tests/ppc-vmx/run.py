@@ -29,6 +29,7 @@ vpkuhum vpkuwum vpkuhus vpkuwus vpkshus vpkswus vpkshss vpkswss
 vupkhsb vupkhsh vupklsb vupklsh
 vmuleub vmuloub vmulesb vmulosb vmuleuh vmulouh vmulesh vmulosh
 vmsumubm vmsummbm vmsumuhm vmsumshm
+lvsl lvsr lvx ldu16 ldu15
 vaddfp vsubfp vmaxfp vminfp vmaddfp vnmsubfp vrefp vcfsx vcfux vctsxs vctuxs
 """.split()
 BENCH = ['vperm x4', 'vmrghb/vmrglh/vsldoi/vpkuhum',
@@ -182,6 +183,8 @@ def main():
         tbfreq = 25_000_000  # mac99 timebase (TBFREQ)
         for name, t in zip(BENCH, mon.words(RESULTS + 0x800, len(BENCH))):
             print(f'bench {name:36s} {t / tbfreq * 1e3:8.1f} ms')
+        ut = mon.words(RESULTS + 0x212 * 4, 1)[0]
+        print(f'bench {"lvx/lvx/vperm/stvx x4 (unaligned)":36s} {ut / tbfreq * 1e3:8.1f} ms')
         mt, mn = mon.words(RESULTS + 0x20b * 4, 2)
         print(f'bench {"mandelbrot 64x48x256 (fcmpu exits)":36s} {mt / tbfreq * 1e3:8.1f} ms'
               f'  ({mn} iterations)')

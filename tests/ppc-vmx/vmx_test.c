@@ -46,6 +46,7 @@ enum {
     OP_VMULEUB, OP_VMULOUB, OP_VMULESB, OP_VMULOSB,
     OP_VMULEUH, OP_VMULOUH, OP_VMULESH, OP_VMULOSH,
     OP_VMSUMUBM, OP_VMSUMMBM, OP_VMSUMUHM, OP_VMSUMSHM,
+    OP_LVSL, OP_LVSR, OP_LVX, OP_LDU16, OP_LDU15,
     OP_VADDFP, OP_VSUBFP, OP_VMAXFP, OP_VMINFP, OP_VMADDFP, OP_VNMSUBFP,
     OP_VREFP, OP_VCFSX, OP_VCFUX, OP_VCTSXS, OP_VCTUXS,
     NOPS
@@ -507,6 +508,47 @@ static void run_op(int op, V a, V b, V c, int sh, V *got, V *exp,
         }
         break;
     }
+    case OP_LVSL:
+    case OP_LVSR:
+    case OP_LVX:
+    case OP_LDU16:
+    case OP_LDU15: {
+        /*
+         * a:b as 32 bytes of memory, addressed at m + sh.  LDU is the
+         * unaligned load of ffmpeg's AltiVec code: lvx of EA, lvx of EA+16
+         * (or EA+15), lvsl of EA, vperm (lvx/lvsl write vD in one store).
+         */
+        V m[2], t1, t2;
+        const uint8_t *p = m[0].b + sh;
+        uint32_t off = op == OP_LDU15 ? 15 : 16;
+
+        m[0] = a;
+        m[1] = b;
+        if (op == OP_LVSL) {
+            asm volatile("lvsl %0,0,%1" : "=v"(r.v) : "b"(p), "m"(m));
+        } else if (op == OP_LVSR) {
+            asm volatile("lvsr %0,0,%1" : "=v"(r.v) : "b"(p), "m"(m));
+        } else if (op == OP_LVX) {
+            off = sh & 1 ? 16 : 0;
+            asm volatile("lvx %0,%1,%2" : "=v"(r.v) : "r"(off), "b"(p), "m"(m));
+        } else {
+            asm volatile("lvx %1,0,%3\n\tlvx %2,%4,%3\n\tlvsl %0,0,%3\n\t"
+                         "vperm %0,%1,%2,%0"
+                         : "=&v"(r.v), "=&v"(t1.v), "=&v"(t2.v)
+                         : "b"(p), "b"(off), "m"(m));
+        }
+        for (i = 0; i < 16; i++) {
+            j = op == OP_LVSR ? 16 - sh + i : sh + i;
+            if (op == OP_LVSL || op == OP_LVSR) {
+                e.b[i] = j;
+            } else if (op == OP_LVX) {
+                e.b[i] = off ? b.b[i] : a.b[i];
+            } else {
+                e.b[i] = j < 16 ? a.b[j] : b.b[j - 16];
+            }
+        }
+        break;
+    }
     case OP_VMSUMSHM:
         ASM4("vmsumshm", r, a, b, c);
         for (i = 0; i < 4; i++) {
@@ -572,6 +614,29 @@ static void bench(void)
                      : "+v"(a.v) : "v"(b.v));
     }
     res[0x203] = tb() - t0;
+
+    /* ffmpeg's unaligned load with lvsl hoisted (chroma MC loop), x4 */
+    {
+        V buf[8], m;
+        const uint8_t *p = buf[0].b + 3;
+        memset(buf, 0x5a, sizeof(buf));
+        asm volatile("lvsl %0,0,%1" : "=v"(m.v) : "b"(p));
+        t0 = tb();
+        for (i = 0; i < BENCH_ITERS; i++) {
+            asm volatile("addi 9,%0,16\n\tlvx 1,0,%0\n\tlvx 5,0,9\n\t"
+                         "vperm 0,1,5,%1\n\tstvx 0,0,%2\n\t"
+                         "addi 9,%0,32\n\tlvx 1,%3,%0\n\tlvx 5,0,9\n\t"
+                         "vperm 0,1,5,%1\n\tstvx 0,%3,%2\n\t"
+                         "addi 9,%0,48\n\tlvx 1,%4,%0\n\tlvx 5,0,9\n\t"
+                         "vperm 0,1,5,%1\n\tstvx 0,%4,%2\n\t"
+                         "addi 9,%0,64\n\tlvx 1,%5,%0\n\tlvx 5,0,9\n\t"
+                         "vperm 0,1,5,%1\n\tstvx 0,%5,%2"
+                         : : "b"(p), "v"(m.v), "b"(buf[5].b), "b"(16), "b"(32),
+                             "b"(48)
+                         : "r9", "v0", "v1", "v5", "memory");
+        }
+        res[0x212] = tb() - t0;
+    }
 
     /* 0.5f, 1.0f, 0.25f: stays finite and normal. */
     a.w[0] = a.w[1] = a.w[2] = a.w[3] = 0x3f000000;
