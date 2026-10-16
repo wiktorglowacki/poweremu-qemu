@@ -5379,6 +5379,8 @@ static uint32_t gart_blit_pixel(PPCMacGPUState *s, uint32_t pixel, uint32_t bpp)
  * per pixel) took about 8% of the emulated CPU's time during video
  * playback; this translates once per 4 KB page and moves whole runs.
  * The byte swaps match the per-pixel path in ppc_mac_gpu_2d_blit_sep.
+ * Pages come from the host-pointer cache r300_read_raw uses (one table
+ * lookup per page instead of a PTE read and an address_space_read).
  */
 static void gart_blit_rows(PPCMacGPUState *s, AddressSpace *as, bool gart,
                            uint32_t src_offset, uint32_t src_pitch,
@@ -5389,6 +5391,13 @@ static void gart_blit_rows(PPCMacGPUState *s, AddressSpace *as, bool gart,
 {
     size_t row_bytes = (size_t)w * bpp;
 
+    /* Rows back to back on both sides (the overlay's frame copy): one span. */
+    if (src_pitch == row_bytes && dst_pitch == row_bytes && !(row_bytes & 3) &&
+        (uint64_t)dst_offset + (uint64_t)(dst_y + h) * dst_pitch +
+            (uint64_t)dst_x * bpp <= s->vram_size) {
+        row_bytes *= h;
+        h = 1;
+    }
     for (uint32_t row = 0; row < h; row++) {
         uint32_t gpu = src_offset + (src_y + row) * src_pitch + src_x * bpp;
         uint64_t d = (uint64_t)dst_offset + (uint64_t)(dst_y + row) * dst_pitch +
@@ -5399,6 +5408,14 @@ static void gart_blit_rows(PPCMacGPUState *s, AddressSpace *as, bool gart,
         uint8_t *out = vram + d;
 
         for (size_t done = 0; done < row_bytes;) {
+            uint32_t a = gpu + done;
+            uint8_t *hp = r200_agp_page(s, a);
+            if (hp) {
+                size_t n = MIN(0x1000 - (a & 0xFFF), row_bytes - done);
+                memcpy(out + done, hp + (a & 0xFFF), n);
+                done += n;
+                continue;
+            }
             hwaddr phys;
             bool ok = gart ? ppc_mac_gpu_gart_translate(s, gpu + done, &phys)
                            : ppc_mac_gpu_agp_translate(s, gpu + done, &phys);
