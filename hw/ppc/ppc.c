@@ -28,6 +28,7 @@
 #include "hw/ppc/ppc_e500.h"
 #include "qemu/timer.h"
 #include "system/cpus.h"
+#include "system/cpu-timers.h"
 #include "qemu/log.h"
 #include "qemu/main-loop.h"
 #include "qemu/error-report.h"
@@ -497,7 +498,156 @@ void ppce500_set_mpic_proxy(bool enabled)
  */
 static uint64_t ns_to_tb(uint32_t freq, int64_t clock)
 {
-    return muldiv64(clock, freq, NANOSECONDS_PER_SECOND);
+    /*
+     * clock * freq / 1e9 as a fixed-point multiply: the guest reads the
+     * time base in every poll loop (mftb per iteration), and the 128-bit
+     * division behind muldiv64 showed in profiles.  2^64 / 1e9 * freq
+     * rounds down, so the result is at most one tick below the exact
+     * value and never ahead of what the division would give.
+     */
+    static uint32_t cached_freq;
+    static uint64_t mult;
+
+    if (unlikely(freq != cached_freq)) {
+        cached_freq = freq;
+        mult = (uint64_t)(((__uint128_t)freq << 64) / NANOSECONDS_PER_SECOND);
+    }
+    return (uint64_t)(((__uint128_t)(uint64_t)clock * mult) >> 64);
+}
+
+/*
+ * Virtual clock for the guest's own TB and DECR reads (mftb, mfdec).
+ *
+ * Each read used to go through cpu_get_clock(): a seqlock and a vDSO
+ * clock_gettime (16 ns on the Ryzen host, with its ordered rdtsc).  On x86
+ * hosts whose kernel clocksource is the TSC, a read now extrapolates from
+ * a per-thread base pair (TSC, virtual ns) with a plain rdtsc (7 ns) and
+ * an ns-per-tick ratio, and re-reads the real clock once a millisecond,
+ * so the error cannot accumulate.  The ratio is re-measured against
+ * CLOCK_MONOTONIC every 16 ms and so follows NTP slewing; the TSC of a
+ * pair is the midpoint of reads around the clock read, and a pair whose
+ * reads were interrupted is not used.  Measured error at the end of a
+ * window: within about +-50 ns, about one 25 MHz tick.  Monotonic per
+ * thread: a regression smaller than a window holds the last value (the
+ * extrapolation ahead, a short VM pause), a larger one (loadvm) is taken
+ * as is, as before.  Stores and the decrementer timer keep using the real
+ * virtual clock.  PPC_FAST_TB=0 turns it off; PPC_TB_STATS=1 prints the
+ * read rates and the extrapolation error once a second.
+ * ponytail: worth only 0.1-0.3% of the vCPU (MorphOS makes 20k reads/s
+ * idle, 100-200k under load, mostly in wait loops); drop it if it ever
+ * gets in the way.
+ */
+#define FTB_WINDOW_NS   (1 * SCALE_MS)
+#define FTB_CALIB_NS    (16 * SCALE_MS)
+#define FTB_JITTER      512             /* TSC ticks around a clock read */
+
+enum { FTB_TBL, FTB_TBU, FTB_DECR, FTB_RESYNC };
+
+static bool ftb_on;
+static bool ftb_stats;
+static __thread uint64_t ftb_mult;      /* ns per TSC tick, 32.32 */
+static __thread uint64_t ftb_window;    /* FTB_WINDOW_NS in TSC ticks */
+static __thread uint64_t ftb_tsc;       /* base pair */
+static __thread int64_t ftb_ns, ftb_last;
+static __thread uint64_t ftb_cal_tsc;   /* calibration anchor */
+static __thread int64_t ftb_cal_rt;
+static __thread uint64_t ftb_count[4];  /* PPC_TB_STATS */
+static __thread int64_t ftb_count_t0, ftb_err_min, ftb_err_max;
+
+static void ftb_init(void)
+{
+    g_autofree char *cs = NULL;
+    const char *e = getenv("PPC_FAST_TB");
+
+    ftb_stats = getenv("PPC_TB_STATS") && getenv("PPC_TB_STATS")[0] == '1';
+    /* A kernel on the TSC means synchronised, invariant TSCs (x86 only). */
+    ftb_on = !(e && e[0] == '0') && !kvm_enabled() && !icount_enabled() &&
+             replay_mode == REPLAY_MODE_NONE &&
+             g_file_get_contents("/sys/devices/system/clocksource/"
+                                 "clocksource0/current_clocksource",
+                                 &cs, NULL, NULL) &&
+             g_str_has_prefix(cs, "tsc");
+}
+
+static int64_t ftb_resync(uint64_t t1)
+{
+    int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t t2 = cpu_get_host_ticks();
+    int64_t rt = get_clock();
+    uint64_t t3 = cpu_get_host_ticks();
+    uint64_t tsc = t1 + (t2 - t1) / 2, tsc_rt = t2 + (t3 - t2) / 2;
+    bool ok = t2 - t1 < FTB_JITTER;
+
+    if (ftb_stats) {
+        /* How far the extrapolation was off when the window ran out. */
+        uint64_t d = tsc - ftb_tsc;
+
+        if (ok && d < 2 * ftb_window) {
+            int64_t err = ftb_ns + (int64_t)((d * ftb_mult) >> 32) - ns;
+
+            ftb_err_min = MIN(ftb_err_min, err);
+            ftb_err_max = MAX(ftb_err_max, err);
+        }
+        ftb_count[FTB_RESYNC]++;
+    }
+    if (t3 - t2 < FTB_JITTER) {
+        if (!ftb_cal_rt) {
+            ftb_cal_tsc = tsc_rt;
+            ftb_cal_rt = rt;
+        } else if (rt - ftb_cal_rt >= FTB_CALIB_NS) {
+            ftb_mult = ((__uint128_t)(rt - ftb_cal_rt) << 32) /
+                       (tsc_rt - ftb_cal_tsc);
+            ftb_window = ((__uint128_t)FTB_WINDOW_NS << 32) / ftb_mult;
+            ftb_cal_tsc = tsc_rt;
+            ftb_cal_rt = rt;
+        }
+    }
+    if (ok && ftb_window) {
+        ftb_tsc = tsc;
+        ftb_ns = ns;
+    } else {
+        ftb_tsc = t3 - 2 * ftb_window;  /* resync on the next read */
+    }
+    return ns;
+}
+
+static int64_t tb_read_clock(int kind)
+{
+    uint64_t d;
+    int64_t ns;
+
+    if (!ftb_on) {
+        ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    } else {
+        uint64_t tsc = cpu_get_host_ticks();
+
+        d = tsc - ftb_tsc;
+        if (likely(d < ftb_window)) {
+            ns = ftb_ns + ((d * ftb_mult) >> 32);
+        } else {
+            ns = ftb_resync(tsc);
+        }
+        if (ns < ftb_last && ftb_last - ns < FTB_WINDOW_NS) {
+            ns = ftb_last;
+        }
+        ftb_last = ns;
+    }
+    if (unlikely(ftb_stats)) {
+        ftb_count[kind]++;
+        if (ns - ftb_count_t0 >= NANOSECONDS_PER_SECOND) {
+            double s = (ns - ftb_count_t0) / 1e9;
+
+            fprintf(stderr, "ppc-tb: %s tbl %.0f tbu %.0f decr %.0f"
+                    " resync %.0f per s, error %" PRId64 "..%" PRId64 " ns\n",
+                    ftb_on ? "fast" : "slow", ftb_count[0] / s,
+                    ftb_count[1] / s, ftb_count[2] / s, ftb_count[3] / s,
+                    ftb_err_min, ftb_err_max);
+            memset(ftb_count, 0, sizeof(ftb_count));
+            ftb_count_t0 = ns;
+            ftb_err_min = ftb_err_max = 0;
+        }
+    }
+    return ns;
 }
 
 /* virtual clock in TB ticks, not adjusted by TB offset */
@@ -521,7 +671,7 @@ uint64_t cpu_ppc_load_tbl (CPUPPCState *env)
         return env->spr[SPR_TBL];
     }
 
-    tb = cpu_ppc_get_tb(tb_env, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+    tb = cpu_ppc_get_tb(tb_env, tb_read_clock(FTB_TBL),
                         tb_env->tb_offset);
     trace_ppc_tb_load(tb);
 
@@ -533,7 +683,7 @@ static inline uint32_t _cpu_ppc_load_tbu(CPUPPCState *env)
     ppc_tb_t *tb_env = env->tb_env;
     uint64_t tb;
 
-    tb = cpu_ppc_get_tb(tb_env, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+    tb = cpu_ppc_get_tb(tb_env, tb_read_clock(FTB_TBU),
                         tb_env->tb_offset);
     trace_ppc_tb_load(tb);
 
@@ -765,7 +915,7 @@ target_ulong cpu_ppc_load_decr(CPUPPCState *env)
     if (kvm_enabled()) {
         return env->spr[SPR_DECR];
     } else {
-        return _cpu_ppc_load_decr(env, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        return _cpu_ppc_load_decr(env, tb_read_clock(FTB_DECR));
     }
 }
 
@@ -1109,6 +1259,7 @@ void cpu_ppc_tb_init(CPUPPCState *env, uint32_t freq)
 
     tb_env->tb_freq = freq;
     tb_env->decr_freq = freq;
+    ftb_init();
 }
 
 void cpu_ppc_tb_reset(CPUPPCState *env)
