@@ -1359,9 +1359,16 @@ static void notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
 
     /*
      * Set both VGA and migration bits for simplicity and to remove
-     * the notdirty callback faster.
+     * the notdirty callback faster.  A page that holds code stays on this
+     * path for every store (the callback never goes away), so skip the
+     * atomic bitmap updates once the range is already dirty: nothing
+     * clears those bits for guest RAM, and the VGA bit is set together
+     * with the others below, so it stands for the lot.
      */
-    cpu_physical_memory_set_dirty_range(ram_addr, size, DIRTY_CLIENTS_NOCODE);
+    if (!cpu_physical_memory_all_dirty(ram_addr, size, DIRTY_MEMORY_VGA)) {
+        cpu_physical_memory_set_dirty_range(ram_addr, size,
+                                            DIRTY_CLIENTS_NOCODE);
+    }
 
     /* We remove the notdirty callback only if the code has been flushed. */
     if (!cpu_physical_memory_is_clean(ram_addr)) {

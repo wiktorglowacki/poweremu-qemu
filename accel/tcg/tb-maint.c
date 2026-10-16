@@ -188,7 +188,26 @@ struct PageDesc {
     QemuSpin lock;
     /* list of TBs intersecting this ram page */
     uintptr_t first_tb;
+    /*
+     * Which (TARGET_PAGE_SIZE / 32)-byte granules hold bytes of a TB on
+     * this page.  A guest that keeps data next to code (MorphOS does, and
+     * so does its video decoder) writes to such pages constantly; without
+     * this every write took the page collection lock and walked the page's
+     * TBs to find nothing, a fifth of the vCPU during video playback.  The
+     * bits are only cleared once the page has no TB left, so a stale bit
+     * costs a walk, never a missed invalidation.
+     */
+    uint32_t code_bitmap;
 };
+
+#define CODE_GRANULE_BITS (TARGET_PAGE_BITS - 5)
+
+/* The granule bits covering byte offsets [start, last] of a page. */
+static uint32_t code_bitmap_mask(tb_page_addr_t start, tb_page_addr_t last)
+{
+    unsigned lo = start >> CODE_GRANULE_BITS, hi = last >> CODE_GRANULE_BITS;
+    return (uint32_t)(((uint64_t)2 << hi) - ((uint64_t)1 << lo));
+}
 
 void page_table_config_init(void)
 {
@@ -669,6 +688,7 @@ static void tb_remove_all_1(int level, void **lp)
         for (i = 0; i < V_L2_SIZE; ++i) {
             page_lock(&pd[i]);
             pd[i].first_tb = (uintptr_t)NULL;
+            pd[i].code_bitmap = 0;
             page_unlock(&pd[i]);
         }
     } else {
@@ -702,6 +722,19 @@ static void tb_page_add(PageDesc *p, TranslationBlock *tb, unsigned int n)
     tb->page_next[n] = p->first_tb;
     page_already_protected = p->first_tb != 0;
     p->first_tb = (uintptr_t)tb | n;
+    {
+        tb_page_addr_t off = tb_page_addr0(tb) & ~TARGET_PAGE_MASK;
+        tb_page_addr_t start, last;
+
+        if (n == 0) {
+            start = off;
+            last = MIN(off + tb->size - 1, TARGET_PAGE_SIZE - 1);
+        } else {
+            start = 0;
+            last = off + tb->size - 1 - TARGET_PAGE_SIZE;
+        }
+        p->code_bitmap |= code_bitmap_mask(start, last);
+    }
 
     /*
      * If some code is already present, then the pages are already
@@ -738,6 +771,9 @@ static void tb_page_remove(PageDesc *pd, TranslationBlock *tb)
     PAGE_FOR_EACH_TB(unused, unused, pd, tb1, n1) {
         if (tb1 == tb) {
             *pprev = tb1->page_next[n1];
+            if (!pd->first_tb) {
+                pd->code_bitmap = 0;
+            }
             return;
         }
         pprev = &tb1->page_next[n1];
@@ -1226,8 +1262,36 @@ void tb_invalidate_phys_range_fast(ram_addr_t ram_addr,
                                    uintptr_t retaddr)
 {
     struct page_collection *pages;
+    tb_page_addr_t last = ram_addr + size - 1;
 
-    pages = page_collection_lock(ram_addr, ram_addr + size - 1);
+    /* A write beside the code on a page with TBs: nothing to invalidate. */
+    if ((ram_addr >> TARGET_PAGE_BITS) == (last >> TARGET_PAGE_BITS)) {
+        PageDesc *p = page_find(ram_addr >> TARGET_PAGE_BITS);
+        bool hit = false;
+
+        if (p) {
+            uint64_t mask = code_bitmap_mask(ram_addr & ~TARGET_PAGE_MASK,
+                                             last & ~TARGET_PAGE_MASK);
+            /*
+             * Lockless first look: bits are only ever added under the
+             * page lock by the thread that translates, and with a single
+             * round-robin vCPU that is this thread, so a clear bit here
+             * is exact.  (Under MTTCG a concurrent translation of these
+             * bytes would be a race the same store could lose anyway.)
+             */
+            hit = qatomic_read(&p->code_bitmap) & mask;
+            if (hit) {
+                page_lock(p);
+                hit = p->code_bitmap & mask;
+                page_unlock(p);
+            }
+        }
+        if (!hit) {
+            return;
+        }
+    }
+
+    pages = page_collection_lock(ram_addr, last);
     tb_invalidate_phys_page_fast__locked(pages, ram_addr, size, retaddr);
     page_collection_unlock(pages);
 }
