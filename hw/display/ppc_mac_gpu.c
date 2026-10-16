@@ -429,6 +429,9 @@ static struct {
     QemuEvent kick;
     bool started;
     bool stop;
+    bool running;               /* the thread has taken (or is taking) a run */
+    bool steal;                 /* RPTR polls catch an idle ring up */
+    uint32_t steal_max;         /* ... when at most this many dwords wait */
     unsigned epoch;             /* bumped whenever the ring changes hands */
     bool aborted;               /* the replay was taken over mid-segment */
     uint32_t seg_rptr;          /* where the segment being replayed began */
@@ -439,6 +442,31 @@ static struct {
     uint32_t syncs, kicks;
     uint16_t sync_reg[0x10000 / 4];
 } cp;
+
+/* PPCGPU_CP_STATS=1: guest register accesses and ring hand-off times,
+ * printed with the ring rate line once a second. */
+static struct {
+    uint32_t rd[0x10000 / 4], wr[0x10000 / 4];
+    int64_t kick_ns;            /* first kick not yet picked up */
+    uint64_t wake_ns, run_ns, runs, sleeps, wake_max, kick_dw, kicks;
+} cps;
+
+static bool cps_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("PPCGPU_CP_STATS") != NULL;
+    }
+    return on;
+}
+
+static inline void cps_count(uint32_t *a, hwaddr addr)
+{
+    if (unlikely(cps_on()) && addr < 0x10000) {
+        a[addr / 4]++;
+    }
+}
 
 static bool r200_async_enabled(void)
 {
@@ -1855,6 +1883,40 @@ static void ppc_mac_gpu_cp_rate_log(double sec)
              names[2] ? names[2] : "", n ? ")" : "");
     qatomic_set(&cp.kicks, 0);
     cp.syncs = 0;
+    if (cps_on()) {
+        GString *g = g_string_new(NULL);
+        for (int k = 0; k < 8; k++) {
+            uint32_t *best = NULL;
+            for (unsigned i = 0; i < ARRAY_SIZE(cps.rd); i++) {
+                if (!best || cps.rd[i] > *best) {
+                    best = &cps.rd[i];
+                }
+                if (cps.wr[i] > *best) {
+                    best = &cps.wr[i];
+                }
+            }
+            if (!*best) {
+                break;
+            }
+            bool wr = best >= cps.wr && best < cps.wr + ARRAY_SIZE(cps.wr);
+            unsigned r = (best - (wr ? cps.wr : cps.rd)) * 4;
+            g_string_append_printf(g, " %s%s(%03x)=%.0f", wr ? "w:" : "r:",
+                                   ppc_mac_gpu_reg_name(r), r, *best / sec);
+            *best = 0;
+        }
+        qemu_log("ppc-mac-gpu cp: %.0f runs/s, %.0f sleeps/s, %.1f dw/submit, "
+                 "kick->start %.1f us avg %.1f max, run %.1f us avg; regs/s:%s\n",
+                 cps.runs / sec, cps.sleeps / sec,
+                 cps.kicks ? (double)cps.kick_dw / cps.kicks : 0,
+                 cps.runs ? cps.wake_ns / 1e3 / cps.runs : 0,
+                 cps.wake_max / 1e3, cps.runs ? cps.run_ns / 1e3 / cps.runs : 0,
+                 g->str);
+        g_string_free(g, TRUE);
+        memset(cps.rd, 0, sizeof(cps.rd));
+        memset(cps.wr, 0, sizeof(cps.wr));
+        cps.wake_ns = cps.run_ns = cps.runs = cps.sleeps = cps.wake_max = 0;
+        cps.kick_dw = cps.kicks = 0;
+    }
     memset(cp.sync_reg, 0, sizeof(cp.sync_reg));
     /* The five commonest type-3 packets of the period (ring and FIFO). */
     {
@@ -10689,7 +10751,16 @@ static void ppc_mac_gpu_cp_sync(PPCMacGPUState *s, hwaddr why)
 /* The guest wrote CP_RB_WPTR.  May be called without the BQL. */
 static void ppc_mac_gpu_cp_kick(PPCMacGPUState *s, uint32_t wptr)
 {
-    qatomic_set(&s->regs.cp_rb_wptr, wptr);
+    uint32_t old = qatomic_xchg(&s->regs.cp_rb_wptr, wptr);
+
+    cps_count(cps.wr, R200_CP_RB_WPTR);
+    if (unlikely(cps_on())) {
+        cps.kicks++;
+        cps.kick_dw += (wptr - old) & ((2u << (s->regs.cp_rb_cntl & 0x3f)) - 1);
+        if (!cps.kick_ns) {
+            cps.kick_ns = get_clock();
+        }
+    }
     if (cp.started) {
         qatomic_inc(&cp.kicks);
         qemu_event_set(&cp.kick);
@@ -10710,11 +10781,29 @@ static void *ppc_mac_gpu_cp_thread(void *opaque)
         }
         if (qatomic_read(&s->regs.cp_rb_wptr) !=
             qatomic_read(&s->regs.cp_rb_rptr)) {
+            int64_t t0 = cps_on() ? get_clock() : 0;
+            qatomic_set(&cp.running, true);
             bql_lock();
+            if (t0) {
+                int64_t t1 = get_clock(), k = cps.kick_ns;
+                if (k && t1 > k) {
+                    cps.wake_ns += t1 - k;
+                    cps.wake_max = MAX(cps.wake_max, t1 - k);
+                }
+                cps.kick_ns = 0;
+                cps.runs++;
+            }
             cp.yield_at = g_get_monotonic_time() + CP_SLICE_US;
             ppc_mac_gpu_cp_run(s);
+            if (t0) {
+                cps.run_ns += get_clock() - t0;
+            }
             bql_unlock();
+            qatomic_set(&cp.running, false);
             continue;
+        }
+        if (cps_on()) {
+            cps.sleeps++;
         }
         qemu_event_wait(&cp.kick);
     }
@@ -10751,12 +10840,45 @@ static const MemoryRegionOps ppc_mac_gpu_cp_wptr_ops = {
  * works.  Through the generic path every poll took the BQL (contending with
  * the CP thread's slices) and forced a renderer flush; here it is one atomic
  * load.  Engine completion is still answered by RBBM_STATUS/CP_CSQ_STAT.
+ *
+ * A poll that finds work the CP thread has not picked up yet means the
+ * guest is waiting for it: MorphOS submits a few dwords and spins here
+ * until the card is idle, before every CPU access to VRAM (WritePixel,
+ * small pixel arrays).  Waiting for the thread to wake up took ~2 us on
+ * Linux (futex) and ~6 us on macOS (condvar), plus the BQL ping-pong, for
+ * 0.3 us of work, so the poller carries the ring out itself, as any other
+ * register access would.  A run already under way is left alone, so
+ * batches the guest does not wait for still run alongside it.  Only small
+ * pending work is taken (PPCGPU_CP_STEAL_MAX dwords, default 64; a pixel
+ * op is 16-32): a 3D batch pulled onto the vCPU ran in smaller pieces,
+ * 2.4x the render passes and -11% draws in Foobillard.
+ * PPCGPU_CP_STEAL=0: always wait for the thread.
  */
 static uint64_t ppc_mac_gpu_cp_rptr_read(void *opaque, hwaddr addr,
                                          unsigned size)
 {
     PPCMacGPUState *s = opaque;
-    return qatomic_read(&s->regs.cp_rb_rptr);
+    uint32_t rptr = qatomic_read(&s->regs.cp_rb_rptr);
+
+    cps_count(cps.rd, R200_CP_RB_RPTR);
+    uint32_t pending = (qatomic_read(&s->regs.cp_rb_wptr) - rptr) &
+                       ((2u << (s->regs.cp_rb_cntl & 0x3f)) - 1);
+
+    if (cp.steal && pending && pending <= cp.steal_max &&
+        !qatomic_read(&cp.running)) {
+        bool locked = bql_locked();
+
+        if (!locked) {
+            bql_lock();
+        }
+        ppc_mac_gpu_cp_sync(s, R200_CP_RB_RPTR);
+        cps.kick_ns = 0;
+        if (!locked) {
+            bql_unlock();
+        }
+        rptr = qatomic_read(&s->regs.cp_rb_rptr);
+    }
+    return rptr;
 }
 
 static void ppc_mac_gpu_cp_rptr_write(void *opaque, hwaddr addr,
@@ -10791,6 +10913,10 @@ static void ppc_mac_gpu_cp_start(PPCMacGPUState *s)
         return;
     }
     cp.s = s;
+    e = getenv("PPCGPU_CP_STEAL");
+    cp.steal = !(e && e[0] == '0');
+    e = getenv("PPCGPU_CP_STEAL_MAX");
+    cp.steal_max = e ? strtoul(e, NULL, 0) : 64;
     qemu_event_init(&cp.kick, false);
     cp.started = true;
     qemu_thread_create(&cp.thread, "ppc-gpu-cp", ppc_mac_gpu_cp_thread, s,
@@ -13373,6 +13499,7 @@ static uint64_t ppc_mac_gpu_mmio_read_guest(void *opaque, hwaddr addr,
 {
     PPCMacGPUState *s = opaque;
 
+    cps_count(cps.rd, addr & ~3);
     if (addr != R200_CP_RB_RPTR &&
         !(addr >= PPC_MAC_GPU_HWC_BASE && addr < PPC_MAC_GPU_HWC_END)) {
         ppc_mac_gpu_cp_sync(s, addr);
@@ -13386,6 +13513,7 @@ static void ppc_mac_gpu_mmio_write_guest(void *opaque, hwaddr addr,
 {
     PPCMacGPUState *s = opaque;
 
+    cps_count(cps.wr, addr & ~3);
     if (addr != R200_CP_RB_WPTR &&
         !(addr >= PPC_MAC_GPU_HWC_BASE && addr < PPC_MAC_GPU_HWC_END)) {
         ppc_mac_gpu_cp_sync(s, addr);
