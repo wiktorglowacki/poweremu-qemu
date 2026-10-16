@@ -44,6 +44,7 @@
 #include "qemu/atomic.h"
 #include "qemu/bitmap.h"
 #include "qemu/bswap.h"
+#include "qemu/processor.h"
 
 #include <vulkan/vulkan.h>
 
@@ -108,6 +109,7 @@ typedef struct VkBatch {
     uint32_t seq;
     VkCommandBuffer cb;
     VkFence fence;
+    int64_t submitted;          /* g_get_monotonic_time() at vkQueueSubmit */
     GArray *pools;              /* VkDescriptorPool */
     unsigned pool_cur;
     GPtrArray *chunks;          /* VkChunk * used by this batch */
@@ -121,6 +123,7 @@ typedef struct VkImg {
     uint32_t addr, width, height, pitch;    /* the key, with fmt and cls */
     VkFormat fmt;
     uint32_t bpp;
+    uint32_t tiling;            /* VRAM layout: bit 1 micro, bit 0 macro tiled (key) */
     VkImage img;
     VkDeviceMemory mem;
     VkImageView view;
@@ -215,6 +218,11 @@ static struct {
     VkDeviceMemory zpass_mem;
     uint32_t *zpass;
 
+    /* staging for overlapping 2D copies (GPU only, so batches serialise it) */
+    VkBuffer stage_buf;
+    VkDeviceMemory stage_mem;
+    VkDeviceSize stage_size;
+
     /* batches */
     VkBatch batch[VK_NBATCH];
     VkBatch *cur;               /* open batch, or NULL */
@@ -240,7 +248,8 @@ static struct {
     unsigned nrp;
     VkFB fbs[VK_MAX_FB];
     unsigned fb_next;
-    GHashTable *progs;          /* GLSL -> VkProg */
+    GHashTable *progs;
+    GHashTable *progs_by_id;     /* GLSL memo id -> VkProg */          /* GLSL -> VkProg */
     GHashTable *samplers;       /* key -> VkSampler */
     VkImage dummy_img[3];
     VkDeviceMemory dummy_mem[3];
@@ -253,8 +262,35 @@ static struct {
     QemuCond wake, idle;
     GQueue *waitq;              /* VkWaitItem */
     bool thread_started;
+    /* scanout composition (the OV0 overlay) */
+    VkBuffer comp_buf, par_buf;
+    VkDeviceMemory comp_mem, par_mem;
+    void *comp_map, *par_map;
+    size_t comp_size;
+    VkDescriptorSetLayout comp_dsl;
+    VkPipelineLayout comp_pl;
+    VkPipeline comp_pipe;
+    VkDescriptorPool comp_pool;
+    VkDescriptorSet comp_set;
+    VkCommandBuffer comp_cb;
+    VkFence comp_fence;
+    bool comp_failed, comp_logged;
+    /* tiled render targets: a staging buffer and a tile/untile compute pass */
+    VkBuffer tile_buf;
+    VkDeviceMemory tile_mem;
+    VkDeviceSize tile_size;
+    VkDescriptorSetLayout tile_dsl;
+    VkPipelineLayout tile_pl;
+    VkPipeline tile_pipe;
+    VkDescriptorPool tile_pool;
+    VkDescriptorSet tile_set;
+    bool tile_failed, tile_logged;
 
-    uint64_t stat_draws, stat_passes, stat_uploads, stat_writebacks, stat_flushes;
+    uint64_t stat_draws, stat_passes, stat_uploads, stat_writebacks, stat_flushes, stat_2d;
+    /* why: commits, write-backs made at commit, uploads of new images and
+     * of images whose newest page came from the CPU, a draw, a 2D op */
+    uint64_t stat_commits, stat_wb_commit, stat_up_new, stat_up_src[4], stat_up_rt;
+    uint8_t *page_src;          /* who last wrote the page: 1 CPU, 2 draw, 3 2D */
 } V;
 
 typedef struct VkWaitItem {
@@ -539,6 +575,7 @@ static bool vk_ctx_init(void)
     }
     V.free_chunks = g_ptr_array_new();
     V.progs = g_hash_table_new(g_str_hash, g_str_equal);
+    V.progs_by_id = g_hash_table_new(g_direct_hash, g_direct_equal);
     V.samplers = g_hash_table_new(g_direct_hash, g_direct_equal);
 
     qemu_mutex_init(&V.lock);
@@ -712,6 +749,7 @@ void *ppc_mac_gpu_vulkan_alloc_vram(uint64_t vram_size, void **opaque_out)
     V.page_gen = g_new0(uint64_t, V.npages);
     V.page_wseq = g_new0(uint32_t, V.npages);
     V.page_rseq = g_new0(uint32_t, V.npages);
+    V.page_src = g_new0(uint8_t, V.npages);
     V.dirty_bm = bitmap_new(V.npages);
     *opaque_out = &V;
     return map;
@@ -978,6 +1016,7 @@ static void vk_harvest(void)
     V.gen++;
     for (; p < V.npages; p = find_next_bit(V.dirty_bm, V.npages, p + 1)) {
         V.page_gen[p] = V.gen;
+        V.page_src[p] = 1;
         if (vk_check() && vk_page_pending_write(p)) {
             static int n;
             if (n++ < 300) {
@@ -996,6 +1035,44 @@ static uint64_t vk_range_gen(uint64_t lo, uint64_t hi)
         g = MAX(g, V.page_gen[p]);
     }
     return g;
+}
+
+static uint64_t vk_vram_generation(void *opaque, uint64_t lo, uint64_t hi)
+{
+    vk_harvest();
+    hi = MIN(hi, V.vram_size);
+    return lo < hi ? vk_range_gen(lo, hi) : 0;
+}
+
+/*
+ * No harvest here: the caller has just called vk_vram_generation, and a
+ * CPU write since then gets a newer generation at the next harvest, so
+ * it is reported next time instead.
+ */
+static bool vk_vram_changed_since(void *opaque, uint64_t lo, uint64_t hi,
+                                  uint64_t since, uint64_t *first,
+                                  uint64_t *last)
+{
+    uint64_t p0 = 0, p1 = 0;
+
+    hi = MIN(hi, V.vram_size);
+    if (lo >= hi) {
+        return false;
+    }
+    for (uint64_t p = vk_pg(lo); p <= vk_pg(hi - 1) && p < V.npages; p++) {
+        if (V.page_gen[p] > since) {
+            if (!p1) {
+                p0 = p;
+            }
+            p1 = p + 1;
+        }
+    }
+    if (!p1) {
+        return false;
+    }
+    *first = MAX(p0 * VK_PAGE, lo);
+    *last = MIN(p1 * VK_PAGE, hi);
+    return true;
 }
 
 static void vk_note_read(uint64_t lo, uint64_t hi)
@@ -1081,6 +1158,265 @@ static VkBufferImageCopy vk_region(const VkImg *im, uint32_t x0, uint32_t y0,
 }
 
 /* Write the rectangles rendered since the last write-back to VRAM. */
+
+/* ---- tiled surfaces: the card's VRAM layout for tiled colour/depth buffers --- */
+
+/*
+ * A render target whose pitch register has the tile bits set lives in VRAM
+ * in the card's tiled layout, and everything else in the guest (its CPU,
+ * the 2D engine) reads it that way; the image copies here are linear, so
+ * tiled targets go through a compute pass: image -> linear staging ->
+ * tiled VRAM on write-back, and tiled VRAM -> staging -> image on reload.
+ * One thread per 32-bit word.  Layout (R300, as Mesa's r300_texture_desc
+ * and MorphOS's driver have it): micro tiles of 32 bytes (8x4 texels at 1
+ * byte, 8x2 at 2, 4x2 at 4) row-major inside, a band of tile rows per
+ * pitch; macro tiles of 2 KB = 8x8 micro tiles, or 256 bytes by 8 rows
+ * without micro tiling.
+ */
+static const char vk_tile_glsl[] =
+"#version 450\n"
+"layout(local_size_x = 64) in;\n"
+"layout(std430, set = 0, binding = 0) buffer Vram { uint w[]; } vram;\n"
+"layout(std430, set = 0, binding = 1) buffer Stage { uint w[]; } stg;\n"
+"layout(push_constant) uniform P { uint addr, pitch, x0, y0, w, h, bpp, mode, dir; } p;\n"
+"uint tiled(uint x, uint y) {\n"
+"    uint xb = x * p.bpp;\n"
+"    bool micro = (p.mode & 2u) != 0u, macro = (p.mode & 1u) != 0u;\n"
+"    uint tw = (p.bpp == 1u) ? 8u : (p.bpp == 2u) ? 8u : 4u;\n"
+"    uint th = (p.bpp == 1u) ? 4u : 2u;\n"
+"    if (micro && macro) {\n"
+"        uint tx = x / tw, ty = y / th;\n"
+"        return p.addr + (ty / 8u) * p.pitch * th * 8u + (tx / 8u) * 2048u +\n"
+"               ((ty % 8u) * 8u + (tx % 8u)) * 32u + ((y % th) * tw + (x % tw)) * p.bpp;\n"
+"    } else if (micro) {\n"
+"        return p.addr + (y / th) * p.pitch * th + (x / tw) * 32u +\n"
+"               ((y % th) * tw + (x % tw)) * p.bpp;\n"
+"    }\n"
+"    return p.addr + (y / 8u) * p.pitch * 8u + (xb / 256u) * 2048u + (y % 8u) * 256u + (xb % 256u);\n"
+"}\n"
+"void main() {\n"
+"    uint wpr = (p.w * p.bpp) / 4u;\n"
+"    uint i = gl_GlobalInvocationID.x;\n"
+"    if (i >= wpr * p.h) return;\n"
+"    uint row = i / wpr, col = i % wpr;\n"
+"    uint x = p.x0 + (col * 4u) / p.bpp, y = p.y0 + row;\n"
+"    uint t = tiled(x, y) >> 2u;\n"
+"    if (p.dir == 0u) vram.w[t] = stg.w[i]; else stg.w[i] = vram.w[t];\n"
+"}\n";
+
+static bool vk_tile_init(void)
+{
+    if (V.tile_pipe) {
+        return true;
+    }
+    if (V.tile_failed) {
+        return false;
+    }
+    size_t nw;
+    char *err = NULL;
+    uint32_t *spv = r300_glsl_to_spirv(vk_tile_glsl, R300_STAGE_CS, &nw, &err);
+    if (!spv) {
+        qemu_log("ppc-mac-gpu vulkan: tile shader: %s\n", err ? err : "?");
+        free(err);
+        V.tile_failed = true;
+        return false;
+    }
+    VkShaderModuleCreateInfo mci = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = nw * 4,
+        .pCode = spv,
+    };
+    VkShaderModule mod = VK_NULL_HANDLE;
+    VkResult r = vkCreateShaderModule(V.dev, &mci, NULL, &mod);
+    free(spv);
+    VkDescriptorSetLayoutBinding b[2] = {
+        { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
+    };
+    VkDescriptorSetLayoutCreateInfo dli = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 2,
+        .pBindings = b,
+    };
+    VkPushConstantRange pcr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, 36 };
+    VkPipelineLayoutCreateInfo pli = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &V.tile_dsl,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &pcr,
+    };
+    VkComputePipelineCreateInfo cpi = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = mod,
+            .pName = "main",
+        },
+    };
+    if (r == VK_SUCCESS) {
+        r = vkCreateDescriptorSetLayout(V.dev, &dli, NULL, &V.tile_dsl);
+    }
+    if (r == VK_SUCCESS) {
+        r = vkCreatePipelineLayout(V.dev, &pli, NULL, &V.tile_pl);
+    }
+    if (r == VK_SUCCESS) {
+        cpi.layout = V.tile_pl;
+        r = vkCreateComputePipelines(V.dev, VK_NULL_HANDLE, 1, &cpi, NULL, &V.tile_pipe);
+    }
+    if (mod) {
+        vkDestroyShaderModule(V.dev, mod, NULL);
+    }
+    if (r != VK_SUCCESS) {
+        qemu_log("ppc-mac-gpu vulkan: tile pass setup failed (VkResult %d)\n", (int)r);
+        V.tile_failed = true;
+        V.tile_pipe = VK_NULL_HANDLE;
+        return false;
+    }
+    return true;
+}
+
+/* The staging buffer (device local) and the descriptor set over it. */
+static bool vk_tile_staging(VkDeviceSize need)
+{
+    if (V.tile_buf && V.tile_size >= need) {
+        return true;
+    }
+    if (V.tile_buf) {
+        vkDeviceWaitIdle(V.dev);
+        vkDestroyDescriptorPool(V.dev, V.tile_pool, NULL);
+        vkDestroyBuffer(V.dev, V.tile_buf, NULL);
+        vkFreeMemory(V.dev, V.tile_mem, NULL);
+        V.tile_pool = VK_NULL_HANDLE;
+        V.tile_set = VK_NULL_HANDLE;
+        V.tile_buf = VK_NULL_HANDLE;
+    }
+    VkDeviceSize size = MAX(need, (VkDeviceSize)16 << 20);
+    if (!vk_buffer(size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                   VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
+                   &V.tile_buf, &V.tile_mem, NULL)) {
+        V.tile_buf = VK_NULL_HANDLE;
+        V.tile_failed = true;
+        return false;
+    }
+    V.tile_size = size;
+    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 };
+    VkDescriptorPoolCreateInfo pci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1,
+        .poolSizeCount = 1,
+        .pPoolSizes = &ps,
+    };
+    VkDescriptorSetAllocateInfo dai = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &V.tile_dsl,
+    };
+    if (vkCreateDescriptorPool(V.dev, &pci, NULL, &V.tile_pool) != VK_SUCCESS) {
+        V.tile_failed = true;
+        return false;
+    }
+    dai.descriptorPool = V.tile_pool;
+    if (vkAllocateDescriptorSets(V.dev, &dai, &V.tile_set) != VK_SUCCESS) {
+        V.tile_failed = true;
+        return false;
+    }
+    VkDescriptorBufferInfo bi[2] = {
+        { V.vram_buf, 0, VK_WHOLE_SIZE },
+        { V.tile_buf, 0, VK_WHOLE_SIZE },
+    };
+    VkWriteDescriptorSet w[2];
+    for (int i = 0; i < 2; i++) {
+        w[i] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = V.tile_set,
+            .dstBinding = i,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &bi[i],
+        };
+    }
+    vkUpdateDescriptorSets(V.dev, 2, w, 0, NULL);
+    return true;
+}
+
+/*
+ * Move rows [y0, y1) of im between its image and its tiled VRAM bytes,
+ * recorded into cb (outside a render pass).  to_vram: write-back; else
+ * reload.  Returns false if the pass is unavailable (caller falls back to
+ * the linear copy).
+ */
+static bool vk_tiled_rt_enabled(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_TILED_RT");
+        on = e && e[0] == '1';
+    }
+    return on;
+}
+
+static bool vk_tile_copy(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0,
+                         uint32_t x1, uint32_t y1, bool to_vram)
+{
+    /*
+     * Off by default: the 2D engine and the guest's own copies in this
+     * device read these buffers linearly (verified on MorphOS's TinyGL
+     * window: its bitmap carries the tile bit, the copy to the screen is
+     * linear), so VRAM stays linear for everything.  PPCGPU_TILED_RT=1
+     * writes the card's tiled layout instead.
+     */
+    if ((im->cls == IMG_RT && !vk_tiled_rt_enabled()) || !vk_tile_init()) {
+        return false;
+    }
+    /* whole words: widen the rectangle to 4-byte columns */
+    uint32_t align = 4 / MIN(im->bpp, 4u);
+    x0 &= ~(align - 1);
+    x1 = MIN(ROUND_UP(x1, align), im->width);
+    if (x1 <= x0 || y1 <= y0) {
+        return true;
+    }
+    uint32_t w = x1 - x0;
+    uint32_t rows_max = MAX((uint32_t)(((VkDeviceSize)16 << 20) / ((VkDeviceSize)w * im->bpp)), 1u);
+    if (!vk_tile_staging((VkDeviceSize)w * im->bpp * MIN(y1 - y0, rows_max))) {
+        return false;
+    }
+    if (!V.tile_logged) {
+        V.tile_logged = true;
+        qemu_log("ppc-mac-gpu vulkan: tiled render target %06x (%ux%u, %u bpp, mode %u)\n",
+                 im->addr, im->width, im->height, im->bpp, im->tiling);
+    }
+    for (uint32_t y = y0; y < y1; y += rows_max) {
+        uint32_t h = MIN(y1 - y, rows_max);
+        VkBufferImageCopy r = {
+            .bufferOffset = 0,
+            .bufferRowLength = w,
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .imageOffset = { (int32_t)x0, (int32_t)y, 0 },
+            .imageExtent = { w, h, 1 },
+        };
+        uint32_t pc[9] = { im->addr, im->pitch, x0, y, w, h, im->bpp, im->tiling, to_vram ? 0 : 1 };
+        uint32_t words = w * im->bpp / 4 * h;
+        if (to_vram) {
+            vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, V.tile_buf, 1, &r);
+            vk_full_barrier(cb);
+        }
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, V.tile_pipe);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, V.tile_pl, 0, 1,
+                                &V.tile_set, 0, NULL);
+        vkCmdPushConstants(cb, V.tile_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+        vkCmdDispatch(cb, DIV_ROUND_UP(words, 64), 1, 1);
+        vk_full_barrier(cb);
+        if (!to_vram) {
+            vkCmdCopyBufferToImage(cb, V.tile_buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+            vk_full_barrier(cb);
+        }
+    }
+    return true;
+}
+
 static void vk_copy_to_vram(VkImg *im)
 {
     VkCommandBuffer cb = vk_batch()->cb;
@@ -1092,8 +1428,18 @@ static void vk_copy_to_vram(VkImg *im)
     if (im->ndr) {
         vk_end_pass();
         vk_full_barrier(cb);
-        vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, V.vram_buf,
-                               im->ndr, r);
+        bool tiled_done = false;
+        if (im->tiling) {
+            tiled_done = true;
+            for (uint32_t i = 0; i < im->ndr && tiled_done; i++) {
+                tiled_done = vk_tile_copy(cb, im, im->dr[i][0], im->dr[i][1],
+                                          im->dr[i][2], im->dr[i][3], true);
+            }
+        }
+        if (!tiled_done) {
+            vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, V.vram_buf,
+                                   im->ndr, r);
+        }
         vk_full_barrier(cb);
         V.stat_writebacks++;
     }
@@ -1148,13 +1494,34 @@ static void vk_layout_general(VkCommandBuffer cb, VkImage img, uint32_t levels,
 }
 
 /*
+ * PPCGPU_VK_RT_GROW=1 (default 0 since the 2026-10-15 host freezes, cause not yet
+ * found): a render target is one image however
+ * tall the draws into it are.  Its height used to follow each draw's
+ * bottom edge (rounded up to 256 rows), so a window's buffer existed as a
+ * 256-row and a full-height image side by side, and every switch between
+ * short and tall draws wrote one back and reloaded the other: Foobillard
+ * made ~1 such upload per 5 draws, TuxRacer one per 2.
+ */
+static bool vk_rt_grow(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_VK_RT_GROW");
+        on = e && e[0] == '1';
+    }
+    return on;
+}
+
+/*
  * The image for a VRAM range: w x h texels of bpp bytes at addr, rows
  * pitch bytes apart.  Its contents are current: copied from VRAM when a
  * CPU write or another image's rendering made them stale (after writing
- * such rendering back).
+ * such rendering back).  With max_h, an image up to max_h rows tall will
+ * do, and a new one replaces the shorter images of the same buffer.
  */
 static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
-                         uint32_t pitch, VkFormat fmt, uint32_t bpp)
+                         uint32_t pitch, VkFormat fmt, uint32_t bpp,
+                         uint32_t tiling, uint32_t max_h)
 {
     VkImg *im = NULL;
     int lru = -1;
@@ -1167,9 +1534,22 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
     for (int i = 0; i < VK_MAX_IMG; i++) {
         VkImg *c = &V.img[i];
         if (c->live && c->cls == cls && c->addr == addr && c->width == w &&
-            c->height == h && c->pitch == pitch && c->fmt == fmt) {
+            c->pitch == pitch && c->fmt == fmt && c->tiling == tiling &&
+            (c->height == h || (c->height > h && c->height <= max_h)) &&
+            (!im || c->height > im->height)) {
             im = c;
-            break;
+        }
+    }
+    if (!im && max_h) {
+        /* The buffer's shorter images give way to this one (rendering
+         * they hold goes to VRAM first, and this one loads from there). */
+        for (int i = 0; i < VK_MAX_IMG; i++) {
+            VkImg *c = &V.img[i];
+            if (c->live && c->cls == cls && c->addr == addr && c->width == w &&
+                c->pitch == pitch && c->fmt == fmt && c->tiling == tiling &&
+                c->height < h) {
+                vk_img_free(c);
+            }
         }
     }
     if (!im) {
@@ -1214,6 +1594,7 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
         im->pitch = pitch;
         im->fmt = fmt;
         im->bpp = bpp;
+        im->tiling = tiling;
         vk_end_pass();
         vk_layout_general(vk_batch()->cb, im->img, 1, 1);
     }
@@ -1244,10 +1625,21 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
                     hi_p = p;
                 }
             }
+            V.stat_up_src[V.page_src[hi_p] & 3]++;
             uint64_t blo = MAX(lo_p * VK_PAGE, (uint64_t)addr);
             uint64_t bhi = MIN((hi_p + 1) * VK_PAGE, hi);
             y0 = (blo - addr) / pitch;
-            y1 = MIN((uint32_t)((bhi - addr + pitch - 1) / pitch), h);
+            /* the image's rows, not the draw's: an image found through
+             * max_h is taller than h, and a newer page below row h gave
+             * y0 > y1 here, a copy of 2^32 rows (host GPU hang, 2026-10-15) */
+            y1 = MIN((uint32_t)((bhi - addr + pitch - 1) / pitch), im->height);
+        } else {
+            V.stat_up_new++;
+        }
+        if (y1 <= y0 || y1 > im->height) {
+            qemu_log("ppc-mac-gpu vulkan: BUG upload rows %u-%u of %ux%u image skipped\n",
+                     y0, y1, w, im->height);
+            return im;
         }
         /* Rendering over those rows that VRAM lacks goes there first. */
         vk_writeback_range(addr + (uint64_t)y0 * pitch, addr + (uint64_t)y1 * pitch);
@@ -1255,7 +1647,9 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
         VkBufferImageCopy r = vk_region(im, 0, y0, w, y1);
         vk_end_pass();
         vk_full_barrier(cb);
-        vkCmdCopyBufferToImage(cb, V.vram_buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+        if (!(im->tiling && vk_tile_copy(cb, im, 0, y0, w, y1, false))) {
+            vkCmdCopyBufferToImage(cb, V.vram_buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+        }
         vk_full_barrier(cb);
         vk_note_read(addr + (uint64_t)y0 * pitch, addr + (uint64_t)y1 * pitch);
         im->valid = true;
@@ -1263,6 +1657,32 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
         im->hash = vk_check() && cls == IMG_TEX && !vk_range_pending(addr, hi) ?
                    vk_img_hash(addr, w, h, pitch, bpp) : 0;
         V.stat_uploads++;
+        V.stat_up_rt += cls == IMG_RT;
+        {
+            /* PPCGPU_VK_UPLOG=N[@D]: log N uploads from draw D on (debug) */
+            static int left = -2;
+            static uint64_t from;
+            if (left == -2) {
+                const char *e = getenv("PPCGPU_VK_UPLOG");
+                left = e ? atoi(e) : 0;
+                from = e && strchr(e, '@') ? strtoull(strchr(e, '@') + 1, NULL, 10) : 0;
+            }
+            if (left > 0 && V.stat_draws >= from) {
+                left--;
+                qemu_log("vk upload: draw %llu %s img%d %06x %ux%u pitch %u fmt %d "
+                         "rows %u-%u src %d\n", (unsigned long long)V.stat_draws,
+                         cls == IMG_RT ? "RT" : "TEX", (int)(im - V.img), addr, w, h,
+                         pitch, (int)fmt, y0, y1, V.page_src[vk_pg(addr + (uint64_t)y0 * pitch)]);
+                for (int i = 0; i < VK_MAX_IMG; i++) {
+                    VkImg *c = &V.img[i];
+                    if (c != im && c->live && c->addr < hi && addr < vk_img_hi(c)) {
+                        qemu_log("vk upload:   overlaps img%d %s %06x %ux%u pitch %u fmt %d%s\n",
+                                 i, c->cls == IMG_RT ? "RT" : "TEX", c->addr, c->width,
+                                 c->height, c->pitch, (int)c->fmt, c->dirty ? " dirty" : "");
+                    }
+                }
+            }
+        }
     }
     return im;
 }
@@ -1276,7 +1696,6 @@ static void vk_img_written(VkImg *im, uint32_t x0, uint32_t y0,
                            uint32_t x1, uint32_t y1)
 {
     uint32_t s = vk_batch()->seq;
-    bool fresh = im->gen == V.gen;     /* nothing else happened since */
 
     x1 = MIN(x1, im->width);
     y1 = MIN(y1, im->height);
@@ -1312,15 +1731,19 @@ static void vk_img_written(VkImg *im, uint32_t x0, uint32_t y0,
     }
     im->dirty = true;
     im->valid = true;
-    if (grow == 0 && fresh) {
-        return;                         /* those pages are already stamped */
-    }
+    /*
+     * Always stamp, even for a draw inside a rectangle stamped at this
+     * very generation: the display compares page generations against the
+     * one it last copied, so a repeated in-place draw with nothing else
+     * happening in between would never show.
+     */
     uint64_t lo = im->addr + (uint64_t)y0 * im->pitch + (uint64_t)x0 * im->bpp;
     uint64_t hi = im->addr + (uint64_t)(y1 - 1) * im->pitch + (uint64_t)x1 * im->bpp;
     V.gen++;
     for (uint64_t p = vk_pg(lo); p <= vk_pg(hi - 1) && p < V.npages; p++) {
         V.page_gen[p] = V.gen;
         V.page_wseq[p] = s;
+        V.page_src[p] = 2;
     }
     im->gen = V.gen;
 }
@@ -1329,19 +1752,25 @@ static void vk_img_written(VkImg *im, uint32_t x0, uint32_t y0,
 
 static uint32_t vk_commit(void (*done)(void *, uint32_t), void *arg)
 {
+    if (!V.cur) {
+        return 0;
+    }
+    /* Dirty-log synchronization can yield the BQL and let another caller commit. */
+    vk_harvest();
     VkBatch *b = V.cur;
-
     if (!b) {
         return 0;
     }
+    g_assert(b->state == 1);
     vk_end_pass();
-    /* What the device marked dirty for this batch's draws is ours. */
-    vk_harvest();
+    uint64_t wb0 = V.stat_writebacks;
     for (int i = 0; i < VK_MAX_IMG; i++) {
         if (V.img[i].live && V.img[i].dirty) {
             vk_copy_to_vram(&V.img[i]);
         }
     }
+    V.stat_wb_commit += V.stat_writebacks - wb0;
+    V.stat_commits++;
     VkMemoryBarrier mb = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
@@ -1360,6 +1789,7 @@ static uint32_t vk_commit(void (*done)(void *, uint32_t), void *arg)
         vk_fail("vkQueueSubmit failed (VkResult %d)", (int)r);
     }
     b->state = 2;
+    b->submitted = g_get_monotonic_time();
     V.cur = NULL;
     V.chunk = NULL;
 
@@ -1380,11 +1810,11 @@ static uint32_t vk_submit_r200(void *opaque, void (*done)(void *, uint32_t), voi
     return vk_commit(done, arg);
 }
 
-static bool vk_flush_r200(void *opaque)
+/* The newest submitted batch not known to be complete, or NULL. */
+static VkBatch *vk_newest_pending(void)
 {
     VkBatch *newest = NULL;
 
-    vk_commit(NULL, NULL);
     for (int i = 0; i < VK_NBATCH; i++) {
         VkBatch *b = &V.batch[i];
         if (b->state == 2 && !vk_seq_done(b->seq) &&
@@ -1392,14 +1822,88 @@ static bool vk_flush_r200(void *opaque)
             newest = b;
         }
     }
+    return newest;
+}
+
+/*
+ * PPCGPU_VK_SPIN_US (default 200, 0 = off): for this long after a batch
+ * is submitted, waiting for it polls its fence instead of sleeping.  A
+ * small batch completes in tens of microseconds, about what waking from a
+ * blocking fence wait takes.
+ */
+static int64_t vk_spin_us(void)
+{
+    static int64_t us = -1;
+    if (us < 0) {
+        const char *e = getenv("PPCGPU_VK_SPIN_US");
+        us = e ? CLAMP(g_ascii_strtoll(e, NULL, 10), 0, 1000000) : 200;
+    }
+    return us;
+}
+
+/*
+ * Wait up to us microseconds (forever if negative) for b's fence; true if
+ * it signalled.  The spin is capped per batch (from its submission), so a
+ * slow GPU costs one spin and then sleeps; us == 0 is a single poll.
+ */
+static bool vk_fence_wait(VkBatch *b, int64_t us)
+{
+    int64_t now = g_get_monotonic_time();
+    int64_t end = us < 0 ? INT64_MAX : now + us;
+    int64_t spin_end = MIN(b->submitted + vk_spin_us(), end);
+    VkResult r;
+
+    while ((r = vkGetFenceStatus(V.dev, b->fence)) == VK_NOT_READY && now < spin_end) {
+        cpu_relax();
+        now = g_get_monotonic_time();
+    }
+    if (r == VK_NOT_READY && now < end) {
+        r = vkWaitForFences(V.dev, 1, &b->fence, VK_TRUE,
+                            us < 0 ? UINT64_MAX : (uint64_t)(end - now) * 1000);
+    }
+    return r == VK_SUCCESS;
+}
+
+static bool vk_flush_r200(void *opaque)
+{
+    VkBatch *newest;
+
+    vk_commit(NULL, NULL);
+    newest = vk_newest_pending();
     if (!newest) {
         return false;
     }
     /* A barrier opens every batch, so the newest finishing means all did. */
-    vkWaitForFences(V.dev, 1, &newest->fence, VK_TRUE, UINT64_MAX);
+    vk_fence_wait(newest, -1);
     vk_set_done(newest->seq);
     V.stat_flushes++;
     return true;
+}
+
+static bool vk_wait_busy_r200(void *opaque, uint32_t us)
+{
+    VkBatch *newest;
+
+    vk_commit(NULL, NULL);
+    newest = vk_newest_pending();
+    if (!newest) {
+        return false;
+    }
+    if (vk_fence_wait(newest, us)) {
+        /* A barrier opens every batch, so the newest finishing means all did. */
+        vk_set_done(newest->seq);
+        return false;
+    }
+    return true;
+}
+
+/*
+ * Polls the fence itself rather than relying on done_seq alone, which the
+ * waiter thread advances only once the kernel wakes it.
+ */
+static bool vk_busy_r200(void *opaque)
+{
+    return vk_wait_busy_r200(opaque, 0);
 }
 
 static bool vk_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi, bool write_access)
@@ -1420,6 +1924,133 @@ static bool vk_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi, bool writ
         }
     }
     return false;
+}
+
+/* ---- 2D on the GPU ---------------------------------------------------- */
+
+/*
+ * The 2D engine's copies and fills, recorded into the batch behind the
+ * draws they would otherwise have waited for.  They work on the VRAM
+ * buffer: rendering newer than VRAM over the bytes involved is written
+ * back first, and the destination pages get a new generation and this
+ * batch's write stamp, so images over them reload and CPU access waits as
+ * it does for a draw.  The result is in VRAM when the batch completes.
+ */
+static bool vk_stage(VkDeviceSize need)
+{
+    if (V.stage_size >= need) {
+        return true;
+    }
+    if (V.stage_buf) {
+        vk_trash(NULL, TRASH_BUF, (uint64_t)(uintptr_t)V.stage_buf);
+        vk_trash(NULL, TRASH_MEM, (uint64_t)(uintptr_t)V.stage_mem);
+        V.stage_buf = VK_NULL_HANDLE;
+        V.stage_mem = VK_NULL_HANDLE;
+        V.stage_size = 0;
+    }
+    VkDeviceSize size = MAX(need, (VkDeviceSize)(16u << 20));
+    if (!vk_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                   0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                   &V.stage_buf, &V.stage_mem, NULL)) {
+        return false;
+    }
+    V.stage_size = size;
+    return true;
+}
+
+/* [lo, hi) is written by the open batch. */
+static void vk_gpu_wrote(uint64_t lo, uint64_t hi)
+{
+    uint32_t s = vk_batch()->seq;
+
+    V.gen++;
+    for (uint64_t p = vk_pg(lo); p <= vk_pg(hi - 1) && p < V.npages; p++) {
+        V.page_gen[p] = V.gen;
+        V.page_wseq[p] = s;
+        V.page_src[p] = 3;
+    }
+}
+
+/* Start a transfer that writes [lo, hi): outside any pass, after all so far. */
+static VkCommandBuffer vk_transfer_begin(uint64_t lo, uint64_t hi)
+{
+    vk_writeback_range(lo, hi);
+    VkCommandBuffer cb = vk_batch()->cb;
+    vk_end_pass();
+    vk_full_barrier(cb);
+    return cb;
+}
+
+static bool vk_copy_2d_r200(void *opaque, uint64_t src, uint32_t src_pitch,
+                            uint64_t dst, uint32_t dst_pitch,
+                            uint32_t row_bytes, uint32_t h)
+{
+    if (!V.vram || !h || h > 4096 || !row_bytes) {
+        return false;
+    }
+    uint64_t src_hi = src + (uint64_t)(h - 1) * src_pitch + row_bytes;
+    uint64_t dst_hi = dst + (uint64_t)(h - 1) * dst_pitch + row_bytes;
+    if (src_hi > V.vram_size || dst_hi > V.vram_size) {
+        return false;
+    }
+    /* the same buffer's source and destination regions may not overlap */
+    bool overlap = src < dst_hi && dst < src_hi;
+    if (overlap && !vk_stage((VkDeviceSize)row_bytes * h)) {
+        return false;
+    }
+    vk_writeback_range(src, src_hi);
+    VkCommandBuffer cb = vk_transfer_begin(dst, dst_hi);
+    VkBufferCopy *r = g_new(VkBufferCopy, h);
+    if (overlap) {
+        for (uint32_t y = 0; y < h; y++) {
+            r[y] = (VkBufferCopy){ src + (uint64_t)y * src_pitch,
+                                   (uint64_t)y * row_bytes, row_bytes };
+        }
+        vkCmdCopyBuffer(cb, V.vram_buf, V.stage_buf, h, r);
+        vk_full_barrier(cb);
+        for (uint32_t y = 0; y < h; y++) {
+            r[y] = (VkBufferCopy){ (uint64_t)y * row_bytes,
+                                   dst + (uint64_t)y * dst_pitch, row_bytes };
+        }
+        vkCmdCopyBuffer(cb, V.stage_buf, V.vram_buf, h, r);
+    } else {
+        for (uint32_t y = 0; y < h; y++) {
+            r[y] = (VkBufferCopy){ src + (uint64_t)y * src_pitch,
+                                   dst + (uint64_t)y * dst_pitch, row_bytes };
+        }
+        vkCmdCopyBuffer(cb, V.vram_buf, V.vram_buf, h, r);
+    }
+    g_free(r);
+    vk_full_barrier(cb);
+    vk_note_read(src, src_hi);
+    vk_gpu_wrote(dst, dst_hi);
+    V.stat_2d++;
+    return true;
+}
+
+static bool vk_fill_2d_r200(void *opaque, uint64_t dst, uint32_t dst_pitch,
+                            uint32_t row_bytes, uint32_t h, uint32_t pattern)
+{
+    if (!V.vram || !h || h > 4096 || !row_bytes ||
+        dst % 4 || dst_pitch % 4 || row_bytes % 4) {
+        return false;
+    }
+    uint64_t dst_hi = dst + (uint64_t)(h - 1) * dst_pitch + row_bytes;
+    if (dst_hi > V.vram_size) {
+        return false;
+    }
+    VkCommandBuffer cb = vk_transfer_begin(dst, dst_hi);
+    if (row_bytes == dst_pitch) {
+        vkCmdFillBuffer(cb, V.vram_buf, dst, (VkDeviceSize)row_bytes * h, pattern);
+    } else {
+        for (uint32_t y = 0; y < h; y++) {
+            vkCmdFillBuffer(cb, V.vram_buf, dst + (uint64_t)y * dst_pitch, row_bytes, pattern);
+        }
+    }
+    vk_full_barrier(cb);
+    vk_gpu_wrote(dst, dst_hi);
+    V.stat_2d++;
+    return true;
 }
 
 static uint32_t vk_zpass_r300(void *opaque, bool reset, uint32_t value)
@@ -1487,13 +2118,13 @@ static VkRenderPass vk_render_pass(uint32_t n, const VkFormat *fmt)
         {
             .srcSubpass = VK_SUBPASS_EXTERNAL, .dstSubpass = 0,
             .srcStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-            .dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
             .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
         },
         {
             .srcSubpass = 0, .dstSubpass = VK_SUBPASS_EXTERNAL,
-            .srcStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            .srcStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
             .dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
             .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
@@ -1588,17 +2219,39 @@ static VkShaderModule vk_module(VkProg *pg, const char *glsl, R300Stage stage)
     return pg->mod[stage];
 }
 
-static VkPipeline vk_pipeline(const char *glsl, const VkPipeKey *key)
+static VkPipeline vk_pipeline(const char *glsl, uint32_t glsl_id, const VkPipeKey *key)
 {
-    VkProg *pg = g_hash_table_lookup(V.progs, glsl);
+    /* The GLSL memo's ids never repeat, so a hit by id skips hashing the
+     * whole program text on every draw (that was 2-3% of the GPU thread). */
+    VkProg *pg = glsl_id ? g_hash_table_lookup(V.progs_by_id, GUINT_TO_POINTER(glsl_id)) : NULL;
 
+    if (!pg) {
+        pg = g_hash_table_lookup(V.progs, glsl);
+        if (pg && glsl_id) {
+            g_hash_table_insert(V.progs_by_id, GUINT_TO_POINTER(glsl_id), pg);
+        }
+    }
     if (!pg) {
         pg = g_new0(VkProg, 1);
         pg->pipes = g_array_new(FALSE, FALSE, sizeof(VkPipeVar));
         g_hash_table_insert(V.progs, g_strdup(glsl), pg);
+        if (glsl_id) {
+            g_hash_table_insert(V.progs_by_id, GUINT_TO_POINTER(glsl_id), pg);
+        }
         if (g_hash_table_size(V.progs) % 16 == 1) {
             qemu_log("ppc-mac-gpu vulkan: %u fragment programs\n",
                      g_hash_table_size(V.progs));
+        }
+        /* $R300_US_LOG: every new program's GLSL into the log */
+        {
+            static int on = -1;
+            if (on < 0) {
+                on = getenv("R300_US_LOG") != NULL;
+            }
+            if (on) {
+                qemu_log("ppc-mac-gpu vulkan: program %u:\n%s\n",
+                         g_hash_table_size(V.progs), glsl);
+            }
         }
     }
     for (guint i = 0; i < pg->pipes->len; i++) {
@@ -1784,12 +2437,16 @@ static VkFormat vk_tex_format(uint32_t kind)
  */
 static VkImageView vk_texture_full(const R300TexDesc *td)
 {
+    if (!r300_tex_card_swap_valid(td)) {
+        vk_warn(1u << 8, "endian-swapped texture lacks complete swap words");
+        return VK_NULL_HANDLE;
+    }
     const uint8_t *src = td->host_data ? td->host_data : V.vram + td->gpu_addr;
     bool dxt = td->kind >= R300_TEXK_DXT1;
     VkFormat fmt = vk_tex_format(td->kind);
     VkTexKey key = { td->gpu_addr, td->format, td->kind, td->width, td->height,
                      td->depth, td->dim, td->levels, td->pitch_bytes,
-                     td->host_data != NULL ? 1u + (td->endian << 1) : td->endian << 1, r300_hash_tex(src, td->size_bytes) };
+                     (td->host_data != NULL ? 1u : 0u) | (td->endian << 1) | (td->card_bytes ? 8u : 0u) | (td->tiling << 4), r300_hash_tex(src, td->size_bytes) };
     int lru = 0;
 
     if (dxt && !V.bc) {
@@ -1841,6 +2498,17 @@ static VkImageView vk_texture_full(const R300TexDesc *td)
             uint8_t *bytes = r300_tex_level_bytes(td, src + td->lvl_off[l] + f * face,
                                                   l, cw, ch, &bpr);
             size_t len = dxt ? (size_t)bpr * ((ch + 3) / 4) : (size_t)bpr * ch;
+            /* $R300_US_LOG: a look at small textures' converted texels */
+            if (bytes && l == 0 && f == 0 && getenv("R300_US_LOG") && cw * ch <= 1024) {
+                GString *g = g_string_new(NULL);
+                for (uint32_t i = 0; i < MIN(len, (size_t)64); i++) {
+                    g_string_append_printf(g, "%02x%s", bytes[i], (i & 3) == 3 ? " " : "");
+                }
+                qemu_log("ppc-mac-gpu vulkan: texture %06x %ux%u kind %u endian %u tiling %u "
+                         "host %d card %d bytes: %s\n", td->gpu_addr, cw, ch, td->kind,
+                         td->endian, td->tiling, td->host_data != NULL, td->card_bytes, g->str);
+                g_string_free(g, TRUE);
+            }
             VkBuffer sb;
             VkDeviceSize so;
             void *dst = vk_arena(len, &sb, &so);
@@ -1895,9 +2563,10 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                         const R300DrawPacket *pkt)
 {
     uint32_t ncb = MAX(pkt->num_cb, 1u);
-    uint32_t sx0 = pkt->scissor[0], sy0 = pkt->scissor[1];
-    uint32_t sx1 = MIN(pkt->scissor[2], pkt->rt_width);
-    uint32_t sy1 = MIN(pkt->scissor[3], pkt->rt_height);
+    uint32_t bounds[4];
+    r300_draw_bounds(pkt, bounds);
+    uint32_t sx0 = bounds[0], sy0 = bounds[1];
+    uint32_t sx1 = bounds[2], sy1 = bounds[3];
     uint32_t ns = MIN(MAX(pkt->aa_samples, 1u), 6u);
     VkImg *att[VK_MAX_ATT];
     VkFormat fmt[VK_MAX_ATT];
@@ -1926,6 +2595,9 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     }
     /* The framebuffer: sample k of row y is row y * ns + k (see Metal). */
     fbw = ns > 1 ? ns * pkt->rt_pitch : pkt->rt_width;
+    /* Keep image heights stable while avoiding an unused 4096-row tail. */
+    uint32_t fbh = MIN(pkt->rt_height, ROUND_UP(sy1, 256));
+    uint32_t rt_max_h = vk_rt_grow() ? pkt->rt_height : 0;
     for (uint32_t k = 0; k < ncb; k++) {
         uint32_t view = k ? pkt->cb[k].view : pkt->rt_view;
         addr[k] = k ? pkt->cb[k].gpu_addr : pkt->rt_gpu_addr;
@@ -1951,7 +2623,8 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     bool need_flush = false;
     for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
         const R300TexDesc *td = &pkt->tex[t];
-        bool direct = td->levels <= 1 && td->dim == R300_TEXDIM_2D &&
+        bool direct = !(td->card_bytes && td->endian) &&
+                      td->levels <= 1 && td->dim == R300_TEXDIM_2D &&
                       (td->kind == R300_TEXK_RGBA8 || td->kind == R300_TEXK_R8 ||
                        td->kind == R300_TEXK_RG8);
         if (td->bound && !td->host_data && td->kind != R300_TEXK_RAW && !direct &&
@@ -1988,6 +2661,9 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             continue;
         }
         if (raw) {
+            if (td->tiling & 2) {
+                vk_warn(1u << 10, "micro-tiled shader-decoded texture read as linear");
+            }
             if (td->host_data) {
                 u.tex_addr[t][0] = aux_bytes;
                 u.tex_addr[t][1] = 1;
@@ -2000,7 +2676,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             }
             continue;
         }
-        bool direct = !td->host_data && td->levels <= 1 && td->dim == R300_TEXDIM_2D &&
+        bool direct = !(td->card_bytes && td->endian) && !td->host_data && td->levels <= 1 && td->dim == R300_TEXDIM_2D &&
                       (td->kind == R300_TEXK_RGBA8 || td->kind == R300_TEXK_R8 ||
                        td->kind == R300_TEXK_RG8);
         if (direct) {
@@ -2015,7 +2691,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                 h = (V.vram_size - td->gpu_addr - (uint64_t)w * b) / td->pitch_bytes + 1;
             }
             VkImg *im = vk_img_get(IMG_TEX, td->gpu_addr, w, h, td->pitch_bytes,
-                                   vk_tex_format(td->kind), b);
+                                   vk_tex_format(td->kind), b, td->tiling & 2, 0);
             if (im) {
                 view = im->view;
             } else if (!vk_range_pending(td->gpu_addr, (uint64_t)td->gpu_addr + td->size_bytes)) {
@@ -2044,15 +2720,18 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             uint32_t *dw = (uint32_t *)(auxp + u.tex_addr[t][0]);
             memcpy(dw, td->host_data, td->size_bytes);
             /* GART dwords reversed to VRAM's side (r300_tex_raw_bpp) */
-            for (uint32_t i = 0; i < ROUND_UP(td->size_bytes, 4) / 4; i++) {
-                dw[i] = bswap32(dw[i]);
+            if (!td->card_bytes) {
+                for (uint32_t i = 0; i < ROUND_UP(td->size_bytes, 4) / 4; i++) {
+                    dw[i] = bswap32(dw[i]);
+                }
             }
         }
     }
 
     /* Colour buffers and the depth buffer. */
     for (uint32_t k = 0; k < ncb; k++) {
-        att[k] = vk_img_get(IMG_RT, addr[k], fbw, pkt->rt_height, bpr[k], fmt[k], bpp[k]);
+        att[k] = vk_img_get(IMG_RT, addr[k], fbw, fbh, bpr[k], fmt[k], bpp[k],
+                            k ? pkt->cb[k].tiling : pkt->rt_tiling, rt_max_h);
         if (!att[k]) {
             if (k == 0) {
                 vk_warn(1u << 7, "colour buffer unusable");
@@ -2067,8 +2746,9 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     if (want_z) {
         VkFormat zf = z16 ? VK_FORMAT_R16_UINT : VK_FORMAT_R32_UINT;
         uint32_t zw = ns > 1 ? ns * zd->pitch : pkt->rt_width;
-        att[ncb] = vk_img_get(IMG_RT, zd->gpu_addr, zw, pkt->rt_height,
-                              ns * zd->pitch * zd->bpp, zf, zd->bpp);
+        att[ncb] = vk_img_get(IMG_RT, zd->gpu_addr, zw, fbh,
+                              ns * zd->pitch * zd->bpp, zf, zd->bpp, zd->tiling,
+                              rt_max_h);
         if (att[ncb] && zw == fbw) {
             fmt[ncb] = zf;
             natt++;
@@ -2094,6 +2774,12 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         }
     }
     bool pass_z = natt > ncb;
+    /* Images may be taller than this draw needs: the framebuffer is as
+     * tall as the shortest, so a pass kept open for the same images has
+     * the same size whichever draw opened it. */
+    for (uint32_t k = 0; k < natt; k++) {
+        fbh = k ? MIN(fbh, att[k]->height) : att[k]->height;
+    }
 
     VkRenderPass rp = vk_render_pass(natt, fmt);
     if (!rp) {
@@ -2112,7 +2798,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                                          : VK_FRONT_FACE_CLOCKWISE;
     VkPipeline pipe = VK_NULL_HANDLE, lpipe = VK_NULL_HANDLE;
     if (pkt->num_verts) {
-        pipe = vk_pipeline(pkt->glsl, &pk);
+        pipe = vk_pipeline(pkt->glsl, pkt->glsl_id, &pk);
         if (!pipe) {
             return -1;
         }
@@ -2121,7 +2807,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         VkPipeKey lk = pk;
         lk.topo = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
         lk.cull = VK_CULL_MODE_NONE;    /* polygon-mode edges: never culled */
-        lpipe = vk_pipeline(pkt->glsl, &lk);
+        lpipe = vk_pipeline(pkt->glsl, pkt->glsl_id, &lk);
         if (!lpipe) {
             return -1;
         }
@@ -2233,7 +2919,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     }
     if (!same) {
         vk_end_pass();
-        VkFramebuffer fb = vk_framebuffer(rp, natt, att, fbw, pkt->rt_height);
+        VkFramebuffer fb = vk_framebuffer(rp, natt, att, fbw, fbh);
         if (!fb) {
             return -1;
         }
@@ -2241,7 +2927,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
             .renderPass = rp,
             .framebuffer = fb,
-            .renderArea = { { 0, 0 }, { fbw, pkt->rt_height } },
+            .renderArea = { { 0, 0 }, { fbw, fbh } },
         };
         vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
         V.in_pass = true;
@@ -2294,10 +2980,14 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     V.stat_draws++;
     if (V.stat_draws % 20000 == 0) {
         qemu_log("ppc-mac-gpu vulkan: %llu draws, %llu passes, %llu uploads, "
-                 "%llu write-backs, %llu flushes\n",
+                 "%llu write-backs, %llu flushes; %llu commits, %llu write-backs "
+                 "at commit; uploads: %llu new, %llu cpu, %llu draw, %llu 2d, %llu RT\n",
                  (unsigned long long)V.stat_draws, (unsigned long long)V.stat_passes,
                  (unsigned long long)V.stat_uploads, (unsigned long long)V.stat_writebacks,
-                 (unsigned long long)V.stat_flushes);
+                 (unsigned long long)V.stat_flushes, (unsigned long long)V.stat_commits,
+                 (unsigned long long)V.stat_wb_commit, (unsigned long long)V.stat_up_new,
+                 (unsigned long long)V.stat_up_src[1], (unsigned long long)V.stat_up_src[2],
+                 (unsigned long long)V.stat_up_src[3], (unsigned long long)V.stat_up_rt);
     }
     return 0;
 }
@@ -2335,6 +3025,390 @@ static uint32_t vk_get_caps(void *opaque)
     return PPC_MAC_GPU_RENDERER_CAP_3D | PPC_MAC_GPU_RENDERER_CAP_ACCEL;
 }
 
+
+/* ---- scanout composition: the OV0 overlay on the GPU ------------------ */
+
+/*
+ * One thread per output pixel of the overlay window: bilinear sample of
+ * the source (the card filters; the CPU path only picks nearest), the
+ * OV0 colour transform, both colour keys, and the desktop pixel from VRAM
+ * where the keys say so.  VRAM and the output are byte arrays seen as
+ * little-endian words (the host's order).
+ */
+static const char vk_compose_glsl[] =
+"#version 450\n"
+"layout(local_size_x = 16, local_size_y = 16) in;\n"
+"layout(std430, set = 0, binding = 0) readonly buffer Vram { uint w[]; } vram;\n"
+"layout(std430, set = 0, binding = 1) writeonly buffer Outb { uint w[]; } outb;\n"
+"layout(std140, set = 0, binding = 2) uniform P {\n"
+"    uvec4 fb;     /* fb_offset, fb_stride, out_stride, fb_swap */\n"
+"    uvec4 win;    /* x0, y0, x1, y1 clipped, end exclusive */\n"
+"    uvec4 win2;   /* win_x0, win_x1, top, bottom unclipped */\n"
+"    uvec4 fmt;    /* fmt, sx0, sx1, src_h */\n"
+"    uvec4 plane;\n"
+"    uvec4 pitch;\n"
+"    uvec4 key;    /* vkey lo, hi, gkey lo, hi */\n"
+"    uvec4 fn;     /* vfn, gfn, both */\n"
+"    vec4 cy, ccb, ccr, coff;\n"
+"} p;\n"
+"uint ld8(uint off) { return (vram.w[off >> 2u] >> ((off & 3u) * 8u)) & 255u; }\n"
+"uint ld16(uint off) { uint w = vram.w[off >> 2u];"
+"  return ((off & 2u) != 0u) ? (w >> 16u) & 0xffffu : (w & 0xffffu); }\n"
+"uint bswap(uint v) { return ((v & 0xffu) << 24u) | ((v & 0xff00u) << 8u) |"
+"  ((v >> 8u) & 0xff00u) | (v >> 24u); }\n"
+"vec3 rgb_of16(uint v, uint f) {\n"
+"    uint r = (v >> (f == 4u ? 11u : 10u)) & 31u;\n"
+"    uint g = (v >> 5u) & (f == 4u ? 63u : 31u);\n"
+"    uint b = v & 31u;\n"
+"    float gf = (f == 4u) ? float((g << 2u) | (g >> 4u)) : float((g << 3u) | (g >> 2u));\n"
+"    return vec3(float((r << 3u) | (r >> 2u)), gf, float((b << 3u) | (b >> 2u)));\n"
+"}\n"
+"vec3 sample_src(uint ix, uint iy) {\n"
+"    uint f = p.fmt.x;\n"
+"    if (f == 10u) {\n"
+"        float y = float(ld8(p.plane.x + iy * p.pitch.x + ix));\n"
+"        float cb = float(ld8(p.plane.y + (iy >> 1u) * p.pitch.y + (ix >> 1u)));\n"
+"        float cr = float(ld8(p.plane.z + (iy >> 1u) * p.pitch.z + (ix >> 1u)));\n"
+"        return vec3(y, cb, cr);\n"
+"    } else if (f == 11u || f == 12u) {\n"
+"        uint off = p.plane.x + iy * p.pitch.x + (ix & ~1u) * 2u;\n"
+"        uint b0 = ld8(off), b1 = ld8(off + 1u), b2 = ld8(off + 2u), b3 = ld8(off + 3u);\n"
+"        uint yb = ((ix & 1u) * 2u) + ((f == 12u) ? 1u : 0u);\n"
+"        uint yv = (yb == 0u) ? b0 : (yb == 1u) ? b1 : (yb == 2u) ? b2 : b3;\n"
+"        return vec3(float(yv), float((f == 11u) ? b1 : b0), float((f == 11u) ? b3 : b2));\n"
+"    }\n"
+"    return rgb_of16(ld16(p.plane.x + iy * p.pitch.x + ix * 2u), f);\n"
+"}\n"
+"bool in_range(uvec3 c, uint lo, uint hi) {\n"
+"    return c.r >= ((lo >> 16u) & 255u) && c.r <= ((hi >> 16u) & 255u) &&\n"
+"           c.g >= ((lo >> 8u) & 255u) && c.g <= ((hi >> 8u) & 255u) &&\n"
+"           c.b >= (lo & 255u) && c.b <= (hi & 255u);\n"
+"}\n"
+"bool keyfn(uint f, bool eq) { return f == 1u || (f == 2u && eq) || (f == 3u && !eq); }\n"
+"void main() {\n"
+"    uint x = p.win.x + gl_GlobalInvocationID.x;\n"
+"    uint y = p.win.y + gl_GlobalInvocationID.y;\n"
+"    if (x >= p.win.z || y >= p.win.w) return;\n"
+"    float sw = float(p.fmt.z - p.fmt.y + 1u);\n"
+"    float fx = float(p.fmt.y) + (float(x - p.win2.x) + 0.5) * sw / float(p.win2.y - p.win2.x) - 0.5;\n"
+"    float fy = (float(y - p.win2.z) + 0.5) * float(p.fmt.w) / float(p.win2.w - p.win2.z) - 0.5;\n"
+"    fx = clamp(fx, float(p.fmt.y), float(p.fmt.z));\n"
+"    fy = clamp(fy, 0.0, float(p.fmt.w - 1u));\n"
+"    uint ix = uint(fx), iy = uint(fy);\n"
+"    float tx = fx - float(ix), ty = fy - float(iy);\n"
+"    uint ix1 = min(ix + 1u, p.fmt.z), iy1 = min(iy + 1u, p.fmt.w - 1u);\n"
+"    vec3 s = mix(mix(sample_src(ix, iy), sample_src(ix1, iy), tx),\n"
+"                 mix(sample_src(ix, iy1), sample_src(ix1, iy1), tx), ty);\n"
+"    vec3 rgb = (p.fmt.x == 3u || p.fmt.x == 4u) ? s\n"
+"             : p.cy.rgb * s.x + p.ccb.rgb * s.y + p.ccr.rgb * s.z + p.coff.rgb;\n"
+"    uvec3 c = uvec3(clamp(rgb, 0.0, 255.0) + 0.5);\n"
+"    uint video = 0xff000000u | (c.r << 16u) | (c.g << 8u) | c.b;\n"
+"    uint d = vram.w[(p.fb.x + y * p.fb.y + x * 4u) >> 2u];\n"
+"    if (p.fb.w != 0u) d = bswap(d);\n"
+"    uvec3 dc = uvec3((d >> 16u) & 255u, (d >> 8u) & 255u, d & 255u);\n"
+"    bool vpass = keyfn(p.fn.x, in_range(c, p.key.x, p.key.y));\n"
+"    bool gpass = keyfn(p.fn.y, in_range(dc, p.key.z, p.key.w));\n"
+"    bool both = p.fn.z != 0u;\n"
+"    bool pass = (p.fn.y >= 2u && vpass == both) ? gpass : vpass;\n"
+"    outb.w[(y * p.fb.z + x * 4u) >> 2u] = pass ? video : d;\n"
+"}\n";
+
+static void vk_compose_drop_set(void)
+{
+    if (V.comp_pool) {
+        vkDestroyDescriptorPool(V.dev, V.comp_pool, NULL);
+        V.comp_pool = VK_NULL_HANDLE;
+        V.comp_set = VK_NULL_HANDLE;
+    }
+}
+
+static void vk_scanout_free(void *opaque, void *ptr)
+{
+    if (!ptr || ptr != V.comp_map) {
+        return;
+    }
+    if (V.comp_fence) {
+        vkWaitForFences(V.dev, 1, &V.comp_fence, VK_TRUE, UINT64_MAX);
+    }
+    vk_compose_drop_set();
+    vkDestroyBuffer(V.dev, V.comp_buf, NULL);
+    vkFreeMemory(V.dev, V.comp_mem, NULL);
+    V.comp_buf = VK_NULL_HANDLE;
+    V.comp_mem = VK_NULL_HANDLE;
+    V.comp_map = NULL;
+    V.comp_size = 0;
+}
+
+static void *vk_scanout_alloc(void *opaque, size_t size)
+{
+    void *map = NULL;
+
+    if (!V.dev || V.comp_failed) {
+        return NULL;
+    }
+    if (V.comp_map) {
+        vk_scanout_free(opaque, V.comp_map);
+    }
+    /* Host-cached: the CPU copies rows into it and GL uploads from it. */
+    if (!vk_buffer(size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                   VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                   &V.comp_buf, &V.comp_mem, &map)) {
+        V.comp_buf = VK_NULL_HANDLE;
+        V.comp_mem = VK_NULL_HANDLE;
+        return NULL;
+    }
+    memset(map, 0, size);
+    V.comp_map = map;
+    V.comp_size = size;
+    vk_compose_drop_set();
+    return map;
+}
+
+static bool vk_compose_init(void)
+{
+    if (V.comp_pipe) {
+        return true;
+    }
+    if (V.comp_failed) {
+        return false;
+    }
+    size_t nw;
+    char *err = NULL;
+    uint32_t *spv = r300_glsl_to_spirv(vk_compose_glsl, R300_STAGE_CS, &nw, &err);
+    if (!spv) {
+        qemu_log("ppc-mac-gpu vulkan: overlay compose shader: %s\n", err ? err : "?");
+        free(err);
+        V.comp_failed = true;
+        return false;
+    }
+    VkShaderModuleCreateInfo mci = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = nw * 4,
+        .pCode = spv,
+    };
+    VkShaderModule mod = VK_NULL_HANDLE;
+    VkResult r = vkCreateShaderModule(V.dev, &mci, NULL, &mod);
+    free(spv);
+    VkDescriptorSetLayoutBinding b[3] = {
+        { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
+        { 2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
+    };
+    VkDescriptorSetLayoutCreateInfo dli = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 3,
+        .pBindings = b,
+    };
+    VkPipelineLayoutCreateInfo pli = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &V.comp_dsl,
+    };
+    VkComputePipelineCreateInfo cpi = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = mod,
+            .pName = "main",
+        },
+    };
+    VkCommandBufferAllocateInfo cai = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = V.cmdpool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+                              .flags = VK_FENCE_CREATE_SIGNALED_BIT };
+    if (r == VK_SUCCESS) {
+        r = vkCreateDescriptorSetLayout(V.dev, &dli, NULL, &V.comp_dsl);
+    }
+    if (r == VK_SUCCESS) {
+        r = vkCreatePipelineLayout(V.dev, &pli, NULL, &V.comp_pl);
+    }
+    if (r == VK_SUCCESS) {
+        cpi.layout = V.comp_pl;
+        r = vkCreateComputePipelines(V.dev, VK_NULL_HANDLE, 1, &cpi, NULL, &V.comp_pipe);
+    }
+    if (mod) {
+        vkDestroyShaderModule(V.dev, mod, NULL);
+    }
+    if (r == VK_SUCCESS) {
+        r = vkAllocateCommandBuffers(V.dev, &cai, &V.comp_cb);
+    }
+    if (r == VK_SUCCESS) {
+        r = vkCreateFence(V.dev, &fci, NULL, &V.comp_fence);
+    }
+    if (r == VK_SUCCESS &&
+        !vk_buffer(256, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                   0, &V.par_buf, &V.par_mem, &V.par_map)) {
+        r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
+    if (r != VK_SUCCESS) {
+        qemu_log("ppc-mac-gpu vulkan: overlay compose setup failed (VkResult %d)\n", (int)r);
+        V.comp_failed = true;
+        V.comp_pipe = VK_NULL_HANDLE;
+        return false;
+    }
+    return true;
+}
+
+static bool vk_compose_set(void)
+{
+    if (V.comp_set) {
+        return true;
+    }
+    VkDescriptorPoolSize ps[2] = {
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
+    };
+    VkDescriptorPoolCreateInfo pci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1,
+        .poolSizeCount = 2,
+        .pPoolSizes = ps,
+    };
+    if (vkCreateDescriptorPool(V.dev, &pci, NULL, &V.comp_pool) != VK_SUCCESS) {
+        return false;
+    }
+    VkDescriptorSetAllocateInfo dai = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = V.comp_pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &V.comp_dsl,
+    };
+    if (vkAllocateDescriptorSets(V.dev, &dai, &V.comp_set) != VK_SUCCESS) {
+        vk_compose_drop_set();
+        return false;
+    }
+    VkDescriptorBufferInfo bi[3] = {
+        { V.vram_buf, 0, VK_WHOLE_SIZE },
+        { V.comp_buf, 0, VK_WHOLE_SIZE },
+        { V.par_buf, 0, 256 },
+    };
+    VkWriteDescriptorSet w[3];
+    for (int i = 0; i < 3; i++) {
+        w[i] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = V.comp_set,
+            .dstBinding = i,
+            .descriptorCount = 1,
+            .descriptorType = i == 2 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+                                     : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &bi[i],
+        };
+    }
+    vkUpdateDescriptorSets(V.dev, 3, w, 0, NULL);
+    return true;
+}
+
+static bool vk_compose_overlay(void *opaque, const PPCMacGPUOverlayParams *p)
+{
+    {   /* the overlay geometry, once per change, in the -D log */
+        static PPCMacGPUOverlayParams last;
+        if (memcmp(&last, p, offsetof(PPCMacGPUOverlayParams, vkey_lo))) {
+            last = *p;
+            qemu_log("ppc-mac-gpu overlay: fmt %u src cols %u-%u rows %u pitch %u/%u/%u "
+                     "planes %x/%x/%x -> window x %u-%u top %u bottom %u, clipped (%u,%u)-(%u,%u), "
+                     "fb off %x stride %u out %u\n", p->fmt, p->sx0, p->sx1, p->src_h,
+                     p->pitch[0], p->pitch[1], p->pitch[2], p->plane[0], p->plane[1], p->plane[2],
+                     p->win_x0, p->win_x1, p->top, p->bottom, p->x0, p->y0, p->x1, p->y1,
+                     p->fb_offset, p->fb_stride, p->out_stride);
+        }
+    }
+    if (!V.comp_map || !vk_compose_init() || !vk_compose_set()) {
+        return false;
+    }
+    if (p->x1 <= p->x0 || p->y1 <= p->y0 || p->win_x1 <= p->win_x0 ||
+        p->bottom <= p->top || p->sx1 < p->sx0 || !p->src_h ||
+        (uint64_t)(p->y1 - 1) * p->out_stride + (uint64_t)p->x1 * 4 > V.comp_size ||
+        (uint64_t)p->fb_offset + (uint64_t)(p->y1 - 1) * p->fb_stride +
+            (uint64_t)p->x1 * 4 > V.vram_size) {
+        return false;
+    }
+    for (int i = 0; i < (p->fmt == 10 ? 3 : 1); i++) {
+        uint64_t rows = i ? (p->src_h + 1) / 2 : p->src_h;
+        uint64_t cols = (i ? p->sx1 / 2 + 1 : p->sx1 + 1) * (p->fmt == 10 ? 1 : 2);
+        if ((uint64_t)p->plane[i] + (rows - 1) * p->pitch[i] + cols + 4 > V.vram_size) {
+            return false;
+        }
+    }
+    /* the previous pass has long completed (it was waited for) */
+    vkWaitForFences(V.dev, 1, &V.comp_fence, VK_TRUE, UINT64_MAX);
+    vkResetFences(V.dev, 1, &V.comp_fence);
+
+    uint32_t *u = V.par_map;
+    uint32_t words[32] = {
+        p->fb_offset, p->fb_stride, p->out_stride, p->fb_swap,
+        p->x0, p->y0, p->x1, p->y1,
+        p->win_x0, p->win_x1, p->top, p->bottom,
+        p->fmt, p->sx0, p->sx1, p->src_h,
+        p->plane[0], p->plane[1], p->plane[2], 0,
+        p->pitch[0], p->pitch[1], p->pitch[2], 0,
+        p->vkey_lo, p->vkey_hi, p->gkey_lo, p->gkey_hi,
+        p->vfn, p->gfn, p->both, 0,
+    };
+    memcpy(u, words, sizeof(words));
+    float *f = (float *)(u + 32);
+    /* cy, ccb, ccr, coff as vec4 (r, g, b, 0): coef[c*4 + k] */
+    for (int k = 0; k < 4; k++) {
+        for (int c = 0; c < 3; c++) {
+            f[k * 4 + c] = p->coef[c * 4 + k];
+        }
+        f[k * 4 + 3] = 0.0f;
+    }
+
+    VkCommandBufferBeginInfo bi = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    vkBeginCommandBuffer(V.comp_cb, &bi);
+    VkMemoryBarrier in = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+    };
+    vkCmdPipelineBarrier(V.comp_cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &in, 0, NULL, 0, NULL);
+    vkCmdBindPipeline(V.comp_cb, VK_PIPELINE_BIND_POINT_COMPUTE, V.comp_pipe);
+    vkCmdBindDescriptorSets(V.comp_cb, VK_PIPELINE_BIND_POINT_COMPUTE, V.comp_pl, 0, 1,
+                            &V.comp_set, 0, NULL);
+    vkCmdDispatch(V.comp_cb, DIV_ROUND_UP(p->x1 - p->x0, 16),
+                  DIV_ROUND_UP(p->y1 - p->y0, 16), 1);
+    VkMemoryBarrier out = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+    };
+    vkCmdPipelineBarrier(V.comp_cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &out, 0, NULL, 0, NULL);
+    vkEndCommandBuffer(V.comp_cb);
+    VkSubmitInfo si = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &V.comp_cb,
+    };
+    if (vkQueueSubmit(V.queue, 1, &si, V.comp_fence) != VK_SUCCESS) {
+        vk_fail("overlay compose: vkQueueSubmit failed");
+        V.comp_failed = true;
+        return false;
+    }
+    if (vkWaitForFences(V.dev, 1, &V.comp_fence, VK_TRUE, 500 * 1000 * 1000) != VK_SUCCESS) {
+        qemu_log("ppc-mac-gpu vulkan: overlay compose did not finish in 500 ms\n");
+        V.comp_failed = true;
+        return false;
+    }
+    if (!V.comp_logged) {
+        V.comp_logged = true;
+        qemu_log("ppc-mac-gpu vulkan: overlay composed on the GPU (%ux%u window, format %u)\n",
+                 p->x1 - p->x0, p->y1 - p->y0, p->fmt);
+    }
+    return true;
+}
+
 static PPCMacGPURenderer vulkan_renderer = {
     .name             = "vulkan",
     .r300_glsl_flags  = R300_GLSL_VRAM_SSBO,
@@ -2343,8 +3417,17 @@ static PPCMacGPURenderer vulkan_renderer = {
     .draw_r300        = vk_draw_r300,
     .zpass_r300       = vk_zpass_r300,
     .flush_r200       = vk_flush_r200,
+    .busy_r200        = vk_busy_r200,
+    .wait_busy_r200   = vk_wait_busy_r200,
+    .vram_generation  = vk_vram_generation,
+    .vram_changed_since = vk_vram_changed_since,
+    .scanout_alloc    = vk_scanout_alloc,
+    .scanout_free     = vk_scanout_free,
+    .compose_overlay  = vk_compose_overlay,
     .submit_r200      = vk_submit_r200,
     .range_busy_r200  = vk_range_busy_r200,
+    .copy_2d_r200     = vk_copy_2d_r200,
+    .fill_2d_r200     = vk_fill_2d_r200,
     .set_dirty_source = vk_set_dirty_source,
     .get_caps         = vk_get_caps,
 };
