@@ -62,7 +62,7 @@
  * QEMU drops config writes outside the write mask, so the command and GART
  * registers must be marked writable or the guest's programming is lost.
  */
-static void unin_add_agp_capability(PCIDevice *d, Error **errp)
+void unin_add_agp_capability(PCIDevice *d, Error **errp)
 {
     int cap = pci_add_capability(d, PCI_CAP_ID_AGP, UNI_N_AGP_CAP_OFFSET,
                                  12, errp);
@@ -383,15 +383,44 @@ static void unin_main_pci_host_realize(PCIDevice *d, Error **errp)
     }
 }
 
+/*
+ * The AGP host bridge (0xf0000000).  MorphOS's Radeon driver sets up its
+ * DMA ring only through an Apple AGP bridge it finds by PCI ID (UniNorth
+ * 1.5/2/Intrepid2: 0x002D/0x0034/0x0066; U3: 0x004B/0x0059) and then
+ * programs the bridge's GART through the AGP capability; QEMU's bridge
+ * reports 0x0020 and no capability, so the driver never got past the
+ * lookup and fell back to the PIO FIFO for everything.  Opt in with
+ *   -global uni-north-agp.device-id=0x34 -global uni-north-agp.agp-capable=on
+ * (UniNorth 2: little-endian GART entries, phys | 1, the format the GPU
+ * model's AGP translation already decodes).
+ */
+typedef struct UNINAGPPCIHost {
+    PCIDevice parent_obj;
+    bool agp_capable;
+    uint16_t device_id;
+} UNINAGPPCIHost;
+
 static void unin_agp_pci_host_realize(PCIDevice *d, Error **errp)
 {
+    UNINAGPPCIHost *s = (UNINAGPPCIHost *)d;
+
     d->config[PCI_CACHE_LINE_SIZE] = 0x08;
     d->config[PCI_LATENCY_TIMER] = 0x10;
-    /* d->config[PCI_CAPABILITY_LIST] = 0x80; */
+    if (s->device_id) {
+        pci_config_set_device_id(d->config, s->device_id);
+    }
+    if (s->agp_capable) {
+        unin_add_agp_capability(d, errp);
+    }
 }
 
-static void unin_agp_pci_host_config_write(PCIDevice *d, uint32_t addr,
-                                           uint32_t val, int len)
+static const Property unin_agp_pci_host_props[] = {
+    DEFINE_PROP_BOOL("agp-capable", UNINAGPPCIHost, agp_capable, false),
+    DEFINE_PROP_UINT16("device-id", UNINAGPPCIHost, device_id, 0),
+};
+
+void unin_agp_pci_host_config_write(PCIDevice *d, uint32_t addr,
+                                    uint32_t val, int len)
 {
     pci_default_write_config(d, addr, val, len);
 
@@ -493,6 +522,7 @@ static void unin_agp_pci_host_class_init(ObjectClass *klass, void *data)
     k->config_write = unin_agp_pci_host_config_write;
     k->vendor_id = PCI_VENDOR_ID_APPLE;
     k->device_id = PCI_DEVICE_ID_APPLE_UNI_N_AGP;
+    device_class_set_props(dc, unin_agp_pci_host_props);
     k->revision  = 0x00;
     k->class_id  = PCI_CLASS_BRIDGE_HOST;
     /*
@@ -505,7 +535,7 @@ static void unin_agp_pci_host_class_init(ObjectClass *klass, void *data)
 static const TypeInfo unin_agp_pci_host_info = {
     .name = "uni-north-agp",
     .parent = TYPE_PCI_DEVICE,
-    .instance_size = sizeof(PCIDevice),
+    .instance_size = sizeof(UNINAGPPCIHost),
     .class_init = unin_agp_pci_host_class_init,
     .interfaces = (InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },

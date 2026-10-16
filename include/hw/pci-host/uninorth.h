@@ -64,6 +64,15 @@ struct UNINHostState {
 hwaddr uninorth_get_agp_gart_base(void);
 uint32_t uninorth_get_agp_gart_gen(void);
 
+/*
+ * Uni-North AGP capability (0x80) plus GART registers 0x8C-0x98, and the
+ * config_write handler that feeds GART base writes to the getters above.
+ * Shared with the apple-agp-bridge stub (uninorth-agp-stub.c).
+ */
+void unin_add_agp_capability(PCIDevice *d, Error **errp);
+void unin_agp_pci_host_config_write(PCIDevice *d, uint32_t addr,
+                                    uint32_t val, int len);
+
 struct UNINState {
     SysBusDevice parent_obj;
 
