@@ -1575,7 +1575,7 @@ static void tcg_context_init(unsigned max_cpus)
     tcg_target_init(s);
     process_constraint_sets();
 
-#ifdef TCG_TARGET_LDST_CLOBBER
+#ifndef tcg_ldst_keep   /* a variable only where the backend defines TCG_TARGET_LDST_CLOBBER */
     tcg_ldst_keep = g_strcmp0(getenv("PPC_LDST_KEEP"), "0") != 0;
 #endif
 
