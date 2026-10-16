@@ -4046,12 +4046,15 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     }
     s->r3->glsl_flags = s->renderer ? s->renderer->r300_glsl_flags : 0;
     {
-        /* R300_CPU_VS=1: run every vertex program on the interpreter */
+        /* R300_CPU_VS=1 or PPCGPU_VK_GPU_VS=0: run every vertex program on
+         * the interpreter.  AA resolves and the vertex dumps read pkt.verts. */
         static int cpu_vs = -1;
         if (cpu_vs < 0) {
-            cpu_vs = getenv("R300_CPU_VS") != NULL;
+            cpu_vs = getenv("R300_CPU_VS") != NULL ||
+                     g_strcmp0(getenv("PPCGPU_VK_GPU_VS"), "0") == 0 ||
+                     getenv("R300_DRAWLOG_VERTS") != NULL;
         }
-        if (cpu_vs) {
+        if (cpu_vs || s->r3_dump || (r300_reg(s->r3, 0x4E88) & 1)) {
             s->r3->glsl_flags &= ~R300_GLSL_GPU_VS;
         }
     }

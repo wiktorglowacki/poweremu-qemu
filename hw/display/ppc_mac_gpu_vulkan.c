@@ -175,6 +175,7 @@ typedef struct VkPipeKey {
     VkPrimitiveTopology topo;
     VkCullModeFlags cull;
     VkFrontFace front;
+    uint32_t vs_id;             /* GPU vertex program (pkt->vs_id), 0: the pass-through */
 } VkPipeKey;
 typedef struct VkProg {
     VkShaderModule mod[3];      /* R300Stage */
@@ -253,6 +254,7 @@ static struct {
     unsigned fb_next;
     GHashTable *progs;
     GHashTable *progs_by_id;     /* GLSL memo id -> VkProg */          /* GLSL -> VkProg */
+    GHashTable *vs_mods;        /* vs_id -> VkShaderModule (GPU vertex programs) */
     GHashTable *samplers;       /* key -> VkSampler */
     VkImage dummy_img[3];
     VkDeviceMemory dummy_mem[3];
@@ -528,7 +530,7 @@ static bool vk_ctx_init(void)
     VKCHECK(vkCreateCommandPool(V.dev, &cpi, NULL, &V.cmdpool), "vkCreateCommandPool");
 
     /* One descriptor set layout for every R300 program (R300_BIND_*). */
-    VkDescriptorSetLayoutBinding b[6 + VK_MAX_ATT + R300_NUM_TEX_UNITS];
+    VkDescriptorSetLayoutBinding b[7 + VK_MAX_ATT + R300_NUM_TEX_UNITS];
     uint32_t nb = 0;
     const VkShaderStageFlags all = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     b[nb++] = (VkDescriptorSetLayoutBinding){ R300_BIND_UNIFORMS,
@@ -543,6 +545,8 @@ static bool vk_ctx_init(void)
         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, all, NULL };
     b[nb++] = (VkDescriptorSetLayoutBinding){ R300_BIND_AUX,
         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, all, NULL };
+    b[nb++] = (VkDescriptorSetLayoutBinding){ R300_BIND_VSU,
+        VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, NULL };
     for (uint32_t k = 0; k < VK_MAX_ATT; k++) {
         b[nb++] = (VkDescriptorSetLayoutBinding){ R300_BIND_FB0 + k,
             VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
@@ -582,6 +586,7 @@ static bool vk_ctx_init(void)
     V.free_chunks = g_ptr_array_new();
     V.progs = g_hash_table_new(g_str_hash, g_str_equal);
     V.progs_by_id = g_hash_table_new(g_direct_hash, g_direct_equal);
+    V.vs_mods = g_hash_table_new(g_direct_hash, g_direct_equal);
     V.samplers = g_hash_table_new(g_direct_hash, g_direct_equal);
 
     qemu_mutex_init(&V.lock);
@@ -958,6 +963,7 @@ static void *vk_arena(VkDeviceSize len, VkBuffer *buf, VkDeviceSize *off)
             c->size = MAX(len, (VkDeviceSize)VK_ARENA_CHUNK);
             if (!vk_buffer(c->size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                           VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0,
@@ -2301,7 +2307,38 @@ static VkShaderModule vk_module(VkProg *pg, const char *glsl, R300Stage stage)
     return pg->mod[stage];
 }
 
-static VkPipeline vk_pipeline(const char *glsl, uint32_t glsl_id, const VkPipeKey *key)
+/* The GPU vertex program vs_glsl (id vs_id), compiled once. */
+static VkShaderModule vk_vs_module(const char *vs_glsl, uint32_t vs_id)
+{
+    gpointer m;
+    if (g_hash_table_lookup_extended(V.vs_mods, GUINT_TO_POINTER(vs_id), NULL, &m)) {
+        return (VkShaderModule)m;
+    }
+    size_t nw;
+    char *err = NULL;
+    VkShaderModule mod = VK_NULL_HANDLE;
+    uint32_t *spv = r300_glsl_to_spirv(vs_glsl, R300_STAGE_VS, &nw, &err);
+    if (!spv) {
+        qemu_log("ppc-mac-gpu vulkan: GPU vertex program: %s\n%s\n", err, vs_glsl);
+        free(err);
+    } else {
+        VkShaderModuleCreateInfo mci = {
+            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .codeSize = nw * 4,
+            .pCode = spv,
+        };
+        if (vkCreateShaderModule(V.dev, &mci, NULL, &mod) != VK_SUCCESS) {
+            mod = VK_NULL_HANDLE;
+        }
+        free(spv);
+    }
+    /* ponytail: vs ids never repeat, so evicted programs leak a module each */
+    g_hash_table_insert(V.vs_mods, GUINT_TO_POINTER(vs_id), (gpointer)mod);
+    return mod;
+}
+
+static VkPipeline vk_pipeline(const char *glsl, uint32_t glsl_id,
+                              const char *vs_glsl, const VkPipeKey *key)
 {
     /* The GLSL memo's ids never repeat, so a hit by id skips hashing the
      * whole program text on every draw (that was 2-3% of the GPU thread). */
@@ -2342,7 +2379,8 @@ static VkPipeline vk_pipeline(const char *glsl, uint32_t glsl_id, const VkPipeKe
             return pv->pipe;
         }
     }
-    VkShaderModule vs = vk_module(pg, glsl, R300_STAGE_VS);
+    VkShaderModule vs = key->vs_id ? vk_vs_module(vs_glsl, key->vs_id)
+                                   : vk_module(pg, glsl, R300_STAGE_VS);
     VkShaderModule fs = vk_module(pg, glsl, key->z ? R300_STAGE_FS_Z : R300_STAGE_FS);
     if (!vs || !fs) {
         return VK_NULL_HANDLE;
@@ -2919,9 +2957,12 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
               (pkt->cull & R300_CULL_BACK) ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
     pk.front = r300_front_ccw(pkt->cull) ? VK_FRONT_FACE_COUNTER_CLOCKWISE
                                          : VK_FRONT_FACE_CLOCKWISE;
+    /* GPU vertex shading (R300_GLSL_GPU_VS): triangles only, no line pass */
+    bool gpu_vs = pkt->vs_glsl && pkt->vs_id;
+    pk.vs_id = gpu_vs ? pkt->vs_id : 0;
     VkPipeline pipe = VK_NULL_HANDLE, lpipe = VK_NULL_HANDLE;
     if (pkt->num_verts) {
-        pipe = vk_pipeline(pkt->glsl, pkt->glsl_id, &pk);
+        pipe = vk_pipeline(pkt->glsl, pkt->glsl_id, pkt->vs_glsl, &pk);
         if (!pipe) {
             return -1;
         }
@@ -2930,7 +2971,8 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         VkPipeKey lk = pk;
         lk.topo = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
         lk.cull = VK_CULL_MODE_NONE;    /* polygon-mode edges: never culled */
-        lpipe = vk_pipeline(pkt->glsl, pkt->glsl_id, &lk);
+        lk.vs_id = 0;                   /* lines: always CPU-shaded R300Vertex */
+        lpipe = vk_pipeline(pkt->glsl, pkt->glsl_id, NULL, &lk);
         if (!lpipe) {
             return -1;
         }
@@ -2938,16 +2980,32 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
 
     /* Per-draw data: vertices, and each sample's uniforms and shift. */
     uint32_t nv = pkt->num_verts + pkt->num_line_verts;
-    VkBuffer vb, ub;
-    VkDeviceSize vo, uo;
-    void *vp = vk_arena((VkDeviceSize)nv * sizeof(R300Vertex), &vb, &vo);
+    VkBuffer vb, ub, ib = VK_NULL_HANDLE, vub = VK_NULL_HANDLE;
+    VkDeviceSize vo, uo, io = 0, vuo = 0;
+    /* Binding 2: the expanded vertices, or for GPU vertex shading the
+     * decoded inputs (vs_in), with vs_idx as the index buffer and the
+     * vertex program's uniforms at R300_BIND_VSU. */
+    VkDeviceSize vbytes = gpu_vs ? (VkDeviceSize)MAX(pkt->vs_in_vecs, 1u) * 16
+                                 : (VkDeviceSize)nv * sizeof(R300Vertex);
+    void *vp = vk_arena(vbytes, &vb, &vo);
     VkDeviceSize ustride = ROUND_UP(sizeof(R300FSUniforms), V.align);
     VkDeviceSize mstride = V.align;
     uint8_t *up = vk_arena((ustride + mstride) * ns, &ub, &uo);
     if (!vp || !up) {
         return -1;
     }
-    memcpy(vp, pkt->verts, (size_t)nv * sizeof(R300Vertex));
+    if (gpu_vs) {
+        void *ip = vk_arena((VkDeviceSize)pkt->num_verts * 4, &ib, &io);
+        void *vup = vk_arena(sizeof(R300VSUniforms), &vub, &vuo);
+        if (!ip || !vup) {
+            return -1;
+        }
+        memcpy(vp, pkt->vs_in, (size_t)pkt->vs_in_vecs * 16);
+        memcpy(ip, pkt->vs_idx, (size_t)pkt->num_verts * 4);
+        memcpy(vup, pkt->vs_u, sizeof(R300VSUniforms));
+    } else {
+        memcpy(vp, pkt->verts, (size_t)nv * sizeof(R300Vertex));
+    }
     for (uint32_t k = 0; k < ns; k++) {
         R300FSUniforms *uk = (R300FSUniforms *)(up + k * ustride);
         float *ms = (float *)(up + ns * ustride + k * mstride);
@@ -2969,7 +3027,8 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     VkDescriptorSet set = VK_NULL_HANDLE;
     for (;;) {
         if (b->pool_cur == b->pools->len) {
-            VkDescriptorPoolSize ps[4] = {
+            VkDescriptorPoolSize ps[5] = {
+                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SETS_PER_POOL },
                 { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2 * VK_SETS_PER_POOL },
                 { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 * VK_SETS_PER_POOL },
                 { VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, VK_MAX_ATT * VK_SETS_PER_POOL },
@@ -2979,7 +3038,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             VkDescriptorPoolCreateInfo pci = {
                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
                 .maxSets = VK_SETS_PER_POOL,
-                .poolSizeCount = 4,
+                .poolSizeCount = 5,
                 .pPoolSizes = ps,
             };
             VkDescriptorPool pool;
@@ -3002,13 +3061,14 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     VkDescriptorBufferInfo bi[6] = {
         { ub, uo, sizeof(R300FSUniforms) },
         { V.zpass_buf, 0, 16 },
-        { vb, vo, (VkDeviceSize)nv * sizeof(R300Vertex) },
+        { vb, vo, vbytes },
         { ub, uo + ns * ustride, 16 },
         { V.vram_buf, 0, VK_WHOLE_SIZE },
         { auxb, auxo, MAX(aux_bytes, 16u) },
     };
     VkDescriptorImageInfo ai[VK_MAX_ATT];
-    VkWriteDescriptorSet wr[6 + 2];
+    VkWriteDescriptorSet wr[6 + 3];
+    VkDescriptorBufferInfo vbi = { vub, vuo, sizeof(R300VSUniforms) };
     uint32_t nwr = 0;
     static const VkDescriptorType bt[6] = {
         VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -3020,6 +3080,12 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             .dstSet = set, .dstBinding = i, .descriptorCount = 1,
             .descriptorType = bt[i], .pBufferInfo = &bi[i] };
+    }
+    if (gpu_vs) {
+        wr[nwr++] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = set, .dstBinding = R300_BIND_VSU, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &vbi };
     }
     for (uint32_t k = 0; k < natt; k++) {
         ai[k] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, att[k]->view, VK_IMAGE_LAYOUT_GENERAL };
@@ -3087,7 +3153,12 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
             vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.layout, 0, 1,
                                     &set, 2, dyn);
-            vkCmdDraw(cb, pkt->num_verts, 1, 0, 0);
+            if (gpu_vs) {
+                vkCmdBindIndexBuffer(cb, ib, io, VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(cb, pkt->num_verts, 1, 0, 0, 0);
+            } else {
+                vkCmdDraw(cb, pkt->num_verts, 1, 0, 0);
+            }
         }
         if (pkt->num_line_verts) {
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, lpipe);
@@ -3539,7 +3610,7 @@ static bool vk_compose_overlay(void *opaque, const PPCMacGPUOverlayParams *p)
 
 static PPCMacGPURenderer vulkan_renderer = {
     .name             = "vulkan",
-    .r300_glsl_flags  = R300_GLSL_VRAM_SSBO,
+    .r300_glsl_flags  = R300_GLSL_VRAM_SSBO | R300_GLSL_GPU_VS,
     .init             = vk_init,
     .fini             = vk_fini,
     .draw_r300        = vk_draw_r300,
