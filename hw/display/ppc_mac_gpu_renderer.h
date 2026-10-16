@@ -244,6 +244,26 @@ typedef struct R200DrawPacket {
     uint32_t num_indices;
 } R200DrawPacket;
 
+/*
+ * The OV0 video overlay as the scanout composer needs it: VRAM offsets of
+ * the frame and the source planes, the window and source rectangles, the
+ * two colour keys and the YCbCr->RGB coefficients (per channel: Y, Cb, Cr
+ * factors and an offset, in 8-bit units).
+ */
+typedef struct PPCMacGPUOverlayParams {
+    uint32_t fb_offset, fb_stride, out_stride;
+    bool fb_swap;                   /* VRAM pixels need bswap32 for the host */
+    uint32_t x0, y0, x1, y1;        /* window clipped to the frame, end exclusive */
+    uint32_t win_x0, win_x1, top, bottom;   /* unclipped window (scale) */
+    uint32_t fmt;                   /* OV0 format: 3 1555, 4 565, 10 planar 4:2:0, 11 YUYV, 12 UYVY */
+    uint32_t plane[3], pitch[3];
+    uint32_t sx0, sx1, src_h;       /* source columns (inclusive) and rows */
+    uint32_t vkey_lo, vkey_hi, gkey_lo, gkey_hi;
+    uint32_t vfn, gfn;
+    bool both;
+    float coef[12];
+} PPCMacGPUOverlayParams;
+
 typedef struct PPCMacGPURenderer {
     const char *name;           /* e.g. "software", "metal", "vulkan" */
 
@@ -369,6 +389,31 @@ typedef struct PPCMacGPURenderer {
      */
     bool (*flush_r200)(void *opaque);   /* true if work was pending */
 
+    /* Commit queued drawing and report whether the GPU is still busy. */
+    bool (*busy_r200)(void *opaque);
+
+    /*
+     * The same, but first give the GPU up to us microseconds to finish: a
+     * guest draining the command FIFO polls instead of blocking, and
+     * each poll is a register access.
+     */
+    bool (*wait_busy_r200)(void *opaque, uint32_t us);
+
+    /* Harvest CPU writes and return the CPU/GPU generation of [lo, hi). */
+    uint64_t (*vram_generation)(void *opaque, uint64_t lo, uint64_t hi);
+
+    /*
+     * Which bytes of [lo, hi) may have changed since generation since (a
+     * value vram_generation returned): the pages written after it, by the
+     * GPU or by the CPU as of the last harvest, span [*first, *last).
+     * Returns false if none was.  Lets the scanout copy only those rows,
+     * since with such a backend the device no longer owns the dirty log.
+     * Optional — may be NULL.
+     */
+    bool (*vram_changed_since)(void *opaque, uint64_t lo, uint64_t hi,
+                               uint64_t since, uint64_t *first,
+                               uint64_t *last);
+
     /*
      * Commit batched draw_r200 work without waiting.  Returns a nonzero
      * sequence number and later calls done(arg, seq) — from a backend
@@ -390,6 +435,21 @@ typedef struct PPCMacGPURenderer {
      */
     bool (*range_busy_r200)(void *opaque, uint64_t lo, uint64_t hi,
                             bool write_access);
+
+    /*
+     * 2D engine work on the GPU, in order with the draws, for when the
+     * CPU would otherwise wait for rendering in flight: copy h rows of
+     * row_bytes from VRAM byte address src (rows src_pitch apart) to dst
+     * (dst_pitch), or fill h rows at dst with the 32-bit pattern as the
+     * CPU path stores it (little-endian).  Return false if the backend
+     * cannot; the caller then flushes and uses the CPU.  The result is in
+     * VRAM when the batch completes; its pages count as GPU-written.
+     */
+    bool (*copy_2d_r200)(void *opaque, uint64_t src, uint32_t src_pitch,
+                         uint64_t dst, uint32_t dst_pitch,
+                         uint32_t row_bytes, uint32_t h);
+    bool (*fill_2d_r200)(void *opaque, uint64_t dst, uint32_t dst_pitch,
+                         uint32_t row_bytes, uint32_t h, uint32_t pattern);
 
     void (*fill_notify_r200)(void *opaque, uint32_t offset, uint32_t pitch,
                              uint32_t x, uint32_t y, uint32_t w, uint32_t h,
@@ -460,6 +520,18 @@ typedef struct PPCMacGPURenderer {
      */
     void (*flush_drag_paste)(void *opaque, uint8_t *vram);
 
+
+    /*
+     * Scanout composition on the GPU (optional).  scanout_alloc returns
+     * host-visible memory for the display surface (the device copies rows
+     * into it as it does into malloc'd memory; NULL means use malloc);
+     * compose_overlay converts, filters, scales and keys the OV0 overlay
+     * from VRAM into that buffer's window rectangle and returns false when
+     * it cannot, in which case the caller composes on the CPU.
+     */
+    void *(*scanout_alloc)(void *opaque, size_t size);
+    void (*scanout_free)(void *opaque, void *p);
+    bool (*compose_overlay)(void *opaque, const PPCMacGPUOverlayParams *p);
 } PPCMacGPURenderer;
 
 /* Renderer capability flags */

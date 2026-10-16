@@ -49,6 +49,24 @@
 #include "hw/display/ppc_mac_gpu_vp.h"
 #include "trace.h"
 
+/*
+ * Mode, timing and stride notes went to stderr on every mode switch; they
+ * are now in the -D log unless PPCGPU_VERBOSE=1 wants them on the console.
+ */
+static bool ppc_gpu_verbose(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_VERBOSE");
+        on = e && e[0] == '1';
+    }
+    return on;
+}
+#define mode_log(...) do { \
+        if (ppc_gpu_verbose()) { fprintf(stderr, __VA_ARGS__); } \
+        else { qemu_log(__VA_ARGS__); } \
+    } while (0)
+
 /* UniNorth AGP bridge GART base — defined in hw/pci-host/uninorth.c */
 hwaddr uninorth_get_agp_gart_base(void);
 uint32_t uninorth_get_agp_gart_gen(void);
@@ -233,8 +251,49 @@ static void blit_region_record(uint32_t src_offset, uint32_t src_pitch,
  * VM runs (`: > /tmp/gpu_seq.log`) to start a clean capture.
  */
 static FILE *g_seq_log;
+
+/* PPCGPU_LAZY_WAIT=0: wait for the GPU on every in-stream WAIT_UNTIL (A/B). */
+static bool r200_lazy_wait_until(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_LAZY_WAIT");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/* PPCGPU_TIMELINE=1: microsecond-stamped frame timeline in /tmp/gpu_timeline.log */
+static void G_GNUC_PRINTF(1, 2) tl_log(const char *fmt, ...)
+{
+    static int enabled = -1;
+    static FILE *fp;
+
+    if (enabled < 0) {
+        const char *e = getenv("PPCGPU_TIMELINE");
+        enabled = e && e[0] == '1';
+    }
+    if (!enabled) {
+        return;
+    }
+    if (!fp) {
+        fp = fopen("/tmp/gpu_timeline.log", "w");
+        if (!fp) {
+            return;
+        }
+        setvbuf(fp, NULL, _IOFBF, 1 << 20);
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(fp, "%lld ", (long long)g_get_monotonic_time());
+    vfprintf(fp, fmt, ap);
+    va_end(ap);
+    fputc('\n', fp);
+}
 static uint64_t g_seq;
 static int g_in_pm4;            /* > 0 while executing PM4 packets */
+static uint32_t pm4_op_hist[256]; /* type-3 opcodes since the last ring rate line */
 
 static bool r200_direct_enabled(void);
 
@@ -245,8 +304,10 @@ static uint64_t r200_flush_why[0x10000 / 4 + 8];
 static uint64_t r200_flush_total;
 static struct {
     uint64_t presents, draws, ops2d, flushes, flush_us, flips;
+    uint64_t update_us;      /* time inside the display update (BQL held) */
     uint64_t gpu_vs;         /* R300 draws whose vertex program ran on the GPU */
     uint64_t co_copies, co_partials, co_skips, co_defers;  /* scanout path */
+    uint64_t co_rows;        /* scanout rows copied */
     int64_t since;
 } r200_rate;
 
@@ -542,6 +603,8 @@ static void r200_flush_at(PPCMacGPUState *s, uint32_t why)
         if (did) {
             r200_rate.flushes++;
             r200_rate.flush_us += g_get_monotonic_time() - t0;
+            tl_log("flush why=%x us=%lld", why,
+                   (long long)(g_get_monotonic_time() - t0));
         }
         if (did) {
             r200_flush_why[MIN(why, (uint32_t)ARRAY_SIZE(r200_flush_why) - 1)]++;
@@ -590,6 +653,17 @@ static void r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
 {
     if (write_access && tag <= 5) {
         r200_rate.ops2d++;
+        tl_log("2d");
+        /* Diagnostic: the VRAM writes the 2D engine makes while the video
+         * overlay is on (where a player's frames go on each path). */
+        if (s->regs.ov0_active[(R200_OV0_SCALE_CNTL - 0x400) / 4] & BIT(30)) {
+            static unsigned ov_writes_logged;
+            if (ov_writes_logged < 60) {
+                ov_writes_logged++;
+                qemu_log("ppc-mac-gpu 2d-ov: tag %u [0x%08" PRIx64 ", 0x%08" PRIx64
+                         ") %s\n", tag, lo, hi, g_in_pm4 ? "pm4" : "mmio");
+            }
+        }
         if (lo < (uint64_t)s->regs.crtc_offset + (uint64_t)s->disp.stride * s->disp.height &&
             hi > s->regs.crtc_offset) {
             r200_rate.presents++;          /* 2D write into the scanout */
@@ -638,6 +712,17 @@ static void r200_pattern_fill(uint8_t *dst, uint64_t len, uint32_t v,
 /* -1 until asked; reset to -1 when the trace property changes it, so a log
  * can be turned on in a machine that is already running. */
 static int g_seq_log_enabled = -1;
+/* The traces asked on every MMIO access: getenv() is an environ scan with a
+ * strncmp per entry, too dear for the CSQ_STAT polling loop (~10k reads/s). */
+static int g_stall_trace = -1, g_poll_trace = -1, g_fence_trace = -1;
+
+static inline bool trace_flag(int *flag, const char *name)
+{
+    if (unlikely(*flag < 0)) {
+        *flag = getenv(name) != NULL;
+    }
+    return *flag;
+}
 
 
 /* ========================================================================
@@ -1112,6 +1197,7 @@ static const char *ppc_mac_gpu_reg_name(hwaddr addr)
     case R200_MC_FB_LOCATION:      return "MC_FB_LOCATION";
     case R200_MC_AGP_LOCATION:     return "MC_AGP_LOCATION";
     case R200_MC_STATUS:           return "MC_STATUS";
+    case R200_MEM_SDRAM_MODE_REG:  return "MEM_SDRAM_MODE_REG";
     case R200_CONFIG_APER_0_BASE:  return "CONFIG_APER_0_BASE";
     case R200_CONFIG_APER_SIZE:    return "CONFIG_APER_SIZE";
     case R200_CONFIG_MEMSIZE:      return "CONFIG_MEMSIZE";
@@ -1164,6 +1250,7 @@ static const char *ppc_mac_gpu_reg_name(hwaddr addr)
     case R200_CP_IB_BASE:          return "CP_IB_BASE";
     case R200_CP_IB_BUFSZ:         return "CP_IB_BUFSZ";
     case R200_CP_CSQ_CNTL:         return "CP_CSQ_CNTL";
+    case R300_CP_CSQ_AVAIL:        return "CP_CSQ_AVAIL";
     case R200_CP_STAT:             return "CP_STAT";
     case R200_SCRATCH_UMSK:         return "SCRATCH_UMSK";
     case R200_SCRATCH_ADDR:         return "SCRATCH_ADDR";
@@ -1329,23 +1416,74 @@ static inline void ppc_mac_gpu_reg_write_offs(uint32_t *reg, int offs,
 static void ppc_mac_gpu_update_irq(PPCMacGPUState *s)
 {
     bool level = !!(s->regs.gen_int_status & s->regs.gen_int_cntl);
+    static bool last_level;
+    if (level != last_level) {
+        tl_log("irq %d", level);
+        last_level = level;
+    }
     pci_set_irq(&s->pci, level);
     trace_ppc_mac_gpu_irq(s->regs.gen_int_status, s->regs.gen_int_cntl,
                           level);
+}
+
+static void ppc_mac_gpu_csq_ring_drain(PPCMacGPUState *s);
+
+/* The next word of a packet body, or 0 past its end: a truncated packet
+ * must not read the words of whatever follows it in the buffer. */
+static inline uint32_t pm4_next(const uint32_t *d, uint32_t *idx, uint32_t limit)
+{
+    uint32_t w = *idx < limit ? d[*idx] : 0;
+    (*idx)++;
+    return w;
+}
+static uint64_t ppc_mac_gpu_mmio_read_guest(void *opaque, hwaddr addr,
+                                            unsigned int size);
+
+/* Registers a display driver polls while it waits for the card: shown with
+ * their values in the timeline (PPCGPU_TIMELINE=1), to see what it waits on. */
+static inline bool tl_probe_reg(hwaddr addr)
+{
+    switch (addr & ~3u) {
+    case R200_GEN_INT_CNTL: case R200_GEN_INT_STATUS: case R200_CRTC_STATUS:
+    case R200_GPIO_VGA_DDC: case R200_GPIO_DVI_DDC: case R200_GPIO_MONID:
+    case 0x0094: case 0x0098: case 0x009c:      /* I2C_CNTL_0/1, I2C_DATA */
+    case 0x0210:                                /* CRTC_VLINE_CRNT_VLINE */
+    case R200_CP_RB_RPTR: case R200_CP_RB_WPTR: /* ring polling */
+    case R200_SCRATCH_REG0: case R200_SCRATCH_REG1:
+        return true;
+    }
+    return false;
 }
 
 static void ppc_mac_gpu_vblank(void *opaque)
 {
     PPCMacGPUState *s = opaque;
 
-    /* Schedule next VBlank at 60 Hz */
-    timer_mod(&s->vblank_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              NANOSECONDS_PER_SECOND / 60);
+    /*
+     * Schedule the next VBlank at 60 Hz from the previous due time, not from
+     * now: the callback runs late whenever the main thread is busy (GTK
+     * redraws hold the BQL for milliseconds), and measuring from "now" turned
+     * 60 Hz into ~28 Hz, which MorphOS's compositor waits on twice a frame.
+     * If we are more than a frame behind, resynchronise instead of bursting.
+     */
+    static int64_t next_ns;    /* ponytail: one device per machine */
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint32_t hz = s->vblank_hz ? s->vblank_hz : s->vblank_auto_hz ? s->vblank_auto_hz : 60;
+    int64_t period = NANOSECONDS_PER_SECOND / hz;
+    next_ns = (next_ns && now - next_ns < period) ? next_ns + period : now + period;
+    timer_mod(&s->vblank_timer, next_ns);
 
-    /* Set VBlank interrupt status */
-    s->regs.gen_int_status |= R200_CRTC_VBLANK_INT;
+    /*
+     * Set the per-frame CRTC interrupt status bits: VBLANK, and VLINE and
+     * VSYNC, which happen once a frame too.  MorphOS's Radeon driver waits
+     * for VLINE and VSYNC (GEN_INT_CNTL bits 1 and 2) around flips and at
+     * startup, and timed out after ~130 ms when only VBLANK was raised.
+     */
+    ppc_mac_gpu_csq_ring_drain(s);
+    s->regs.gen_int_status |= R200_CRTC_VBLANK_INT | R200_CRTC_VLINE_INT |
+                              R200_CRTC_VSYNC_INT;
     s->regs.stall_irqs++;
+    tl_log("vblank cntl 0x%x", s->regs.gen_int_cntl);
 
     /* Toggle VBLANK_SAVE in CRTC_STATUS */
     s->regs.crtc_status ^= R200_CRTC_VBLANK_SAVE;
@@ -1374,7 +1512,7 @@ static void r200_set_present_pitch(PPCMacGPUState *s, uint32_t dst_pitch)
     if (dst_pitch < min) {
         static int pitch_reject_log;
         if (pitch_reject_log < 10) {
-            fprintf(stderr, "[STRIDE_CHANGE] ignoring BLT pitch %u for "
+            mode_log("[STRIDE_CHANGE] ignoring BLT pitch %u for "
                     "%ux%u@%u (needs %u)\n", dst_pitch, s->disp.width,
                     s->disp.height, s->disp.bpp, min);
             pitch_reject_log++;
@@ -1414,7 +1552,8 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
 
     /* Extract display dimensions from CRTC timing registers */
     /* H_TOTAL_DISP: bits [7:0] = h_total/8-1, bits [23:16] = h_disp/8-1 */
-    m->width = (((h_total_disp >> 16) & 0xFF) + 1) * 8;
+    /* H_DISP is 9 bits on R300 (up to 4096 px): 2560 wide needs bit 24 */
+    m->width = (((h_total_disp >> 16) & 0x1FF) + 1) * 8;
 
     /* V_TOTAL_DISP: bits [10:0] = v_total-1, bits [26:16] = v_disp-1 */
     m->height = ((v_total_disp >> 16) & 0x7FF) + 1;
@@ -1490,7 +1629,7 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
         old.width != 0 && old.height != 0 &&
         (old.width != m->width || old.height != m->height ||
          old.bpp != m->bpp)) {
-        fprintf(stderr, "[STRIDE_CHANGE] mode change %ux%u->%ux%u: "
+        mode_log("[STRIDE_CHANGE] mode change %ux%u->%ux%u: "
                 "clearing stride override (was %u)\n",
                 old.width, old.height, m->width, m->height,
                 s->disp_stride_override_value);
@@ -1510,7 +1649,7 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
         if (m->stride != s->disp_stride_override_value) {
             static int stride_override_log = 0;
             if (stride_override_log < 20) {
-                fprintf(stderr, "[STRIDE_CHANGE] update_display_mode: "
+                mode_log("[STRIDE_CHANGE] update_display_mode: "
                         "CRTC gives %u, override forces %u\n",
                         m->stride, s->disp_stride_override_value);
                 stride_override_log++;
@@ -1525,7 +1664,7 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
      * run past its end.  Keep the display consistent instead.
      */
     if (m->stride < m->width * ((m->bpp + 7) / 8)) {
-        fprintf(stderr, "[STRIDE_CHANGE] stride %u too small for %ux%u@%u, "
+        mode_log("[STRIDE_CHANGE] stride %u too small for %ux%u@%u, "
                 "using %u\n", m->stride, m->width, m->height, m->bpp,
                 m->width * ((m->bpp + 7) / 8));
         m->stride = m->width * ((m->bpp + 7) / 8);
@@ -1544,12 +1683,40 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
         m->offset = 0;
     }
 
-    /* Check if mode changed */
-    if (memcmp(&old, m, sizeof(old)) != 0) {
-        fprintf(stderr, "GPU MODE: %ux%u bpp=%u stride=%u offset=0x%x pitch_reg=0x%x crtc_gen=0x%x\n",
+    /* A page flip changes the source pixels, not the shadow surface. */
+    if (old.width != m->width || old.height != m->height ||
+        old.bpp != m->bpp || old.stride != m->stride ||
+        old.format != m->format || old.crtc_ext != m->crtc_ext) {
+        mode_log("GPU MODE: %ux%u bpp=%u stride=%u offset=0x%x pitch_reg=0x%x crtc_gen=0x%x\n",
                 m->width, m->height, m->bpp, m->stride, m->offset, pitch, crtc_gen);
+        {
+            /*
+             * The refresh the driver programmed: pixel clock from the PLL
+             * (PPLL_REF_DIV 0x03; the PPLL_DIV_n 0x04..0x07 that
+             * CLOCK_CNTL_INDEX[9:8] selects: fb_div [10:0], post_div code
+             * [18:16]) over the CRTC totals.  MorphOS picks the rate in its
+             * Screens preferences, so the vblank timer follows it unless
+             * vblank-hz pins one.
+             */
+            uint32_t htot = ((s->regs.crtc_h_total_disp & 0x1FF) + 1) * 8;
+            uint32_t vtot = (s->regs.crtc_v_total_disp & 0x7FF) + 1;
+            uint32_t ref = s->regs.pll[0x03] & 0x3FF;
+            uint32_t sel = (s->regs.clock_cntl_index >> 8) & 3;
+            uint32_t dn = s->regs.pll[0x04 + sel];
+            static const unsigned post[8] = { 1, 2, 4, 8, 3, 0, 6, 12 };
+            unsigned pd = post[(dn >> 16) & 7];
+            double pclk = ref && pd ? 27e6 * (dn & 0x7FF) / (ref * pd) : 0;
+            double hz = htot && vtot ? pclk / htot / vtot : 0.0;
+            if (hz >= 40.0 && hz <= 250.0) {
+                s->vblank_auto_hz = (uint32_t)(hz + 0.5);
+            }
+            mode_log("GPU TIMING: htotal=%u vtotal=%u ref_div=%u div%u=%08x "
+                    "pixel clock %.1f MHz -> %.1f Hz (vblank %u Hz)\n", htot, vtot, ref,
+                    sel, dn, pclk / 1e6, hz,
+                    s->vblank_hz ? s->vblank_hz : s->vblank_auto_hz ? s->vblank_auto_hz : 60);
+        }
         if (old.stride != m->stride) {
-            fprintf(stderr, "[STRIDE_CHANGE] update_display_mode: "
+            mode_log("[STRIDE_CHANGE] update_display_mode: "
                     "%u -> %u (override=%s val=%u)\n",
                     old.stride, m->stride,
                     s->disp_stride_override_active ? "yes" : "no",
@@ -1599,12 +1766,10 @@ static void ppc_mac_gpu_bswap_line32(uint32_t *restrict dst,
         vst1q_u8((uint8_t *)(dst + i + 12), d);
     }
 #elif defined(__SSE2__)
-    const __m128i m = _mm_set1_epi32(0x00FF00FF);
     for (; i + 4 <= width; i += 4) {
         __m128i v = _mm_loadu_si128((const __m128i *)(src + i));
         v = _mm_or_si128(_mm_srli_epi32(v, 16), _mm_slli_epi32(v, 16));
-        v = _mm_or_si128(_mm_slli_epi16(_mm_and_si128(v, m), 8),
-                         _mm_srli_epi16(_mm_and_si128(v, m), 8));
+        v = _mm_or_si128(_mm_slli_epi16(v, 8), _mm_srli_epi16(v, 8));
         _mm_storeu_si128((__m128i *)(dst + i), v);
     }
 #endif
@@ -1647,11 +1812,484 @@ static void ppc_mac_gpu_cp_rate_log(double sec)
     qatomic_set(&cp.kicks, 0);
     cp.syncs = 0;
     memset(cp.sync_reg, 0, sizeof(cp.sync_reg));
+    /* The five commonest type-3 packets of the period (ring and FIFO). */
+    {
+        GString *g = g_string_new(NULL);
+        for (int k = 0; k < 5; k++) {
+            unsigned best = 0;
+            for (unsigned i = 1; i < 256; i++) {
+                if (pm4_op_hist[i] > pm4_op_hist[best]) {
+                    best = i;
+                }
+            }
+            if (!pm4_op_hist[best]) {
+                break;
+            }
+            g_string_append_printf(g, " 0x%02x=%.0f/s", best, pm4_op_hist[best] / sec);
+            pm4_op_hist[best] = 0;
+        }
+        if (g->len) {
+            qemu_log("ppc-mac-gpu pm4 ops:%s\n", g->str);
+        }
+        g_string_free(g, TRUE);
+        memset(pm4_op_hist, 0, sizeof(pm4_op_hist));
+    }
+}
+
+#define OV0(reg) (((reg) - 0x400) / 4)
+
+static bool r300_to_vram(PPCMacGPUState *s, uint32_t *addr, uint64_t len);
+
+static void r300_warn_once(const char *what, const char *detail);
+
+static bool ppc_mac_gpu_overlay_rows(PPCMacGPUState *s, int *lo, int *hi)
+{
+    const uint32_t *r = s->regs.ov0_active;
+    uint32_t ctl = r[OV0(0x420)];
+    if (!s->r300 || !(ctl & BIT(30)) || (ctl & (BIT(31) | BIT(14)))) {
+        return false;
+    }
+    *lo = MIN(s->disp.height, r[OV0(0x400)] >> 16 & 0x1fff);
+    *hi = MIN(s->disp.height, r[OV0(0x404)] >> 16 & 0x1fff);
+    return *hi > *lo;
+}
+
+static bool ppc_mac_gpu_overlay_key(uint32_t pixel, uint32_t low,
+                                    uint32_t high, unsigned fn)
+{
+    bool equal = true;
+    for (unsigned shift = 0; shift < 24; shift += 8) {
+        unsigned component = (pixel >> shift) & 255;
+        equal &= component >= ((low >> shift) & 255) &&
+                 component <= ((high >> shift) & 255);
+    }
+    return fn == 1 || (fn == 2 && equal) || (fn == 3 && !equal);
+}
+
+/*
+ * YUV->RGB of one overlay pixel.  lut[Y/Cb/Cr][value][R/G/B] holds the
+ * OV0 transform's terms (the offset folded into luma), so a pixel is nine
+ * loads instead of twelve field extracts and multiplies.  ">> 8" stands
+ * for the hardware formula's "/ 256": the two differ only for negative
+ * sums, which clamp to 0 either way.
+ */
+static inline uint32_t ppc_mac_gpu_overlay_yuv(const int32_t lut[3][256][3],
+                                               unsigned luma, unsigned cb,
+                                               unsigned cr)
+{
+    uint32_t pixel = 0;
+    for (unsigned c = 0; c < 3; c++) {
+        int out = (lut[0][luma][c] + lut[1][cb][c] + lut[2][cr][c]) >> 8;
+        pixel |= CLAMP(out, 0, 255) << (16 - c * 8);
+    }
+    return pixel;
+}
+
+/*
+ * Put video overlay 0 over its rows of shadow_buf, which the caller has
+ * just refreshed from the scanout.  This runs on every display refresh
+ * with the BQL held, so the window's pixels are converted and scaled once
+ * into s->ov0_cache and rebuilt only when an input changed; a refresh then
+ * only applies the colour keys.  Inputs: the latched OV0 registers and
+ * transform, the planes' VRAM offsets, the display size, and the source
+ * bytes.
+ *
+ * The source bytes are checked by hashing them every refresh (one pass,
+ * about 0.5 ms for a 1080p YUY2 frame, against tens of ms to convert it).
+ * The VGA dirty log would be cheaper but cannot be trusted here: with the
+ * Vulkan renderer it is the renderer's (snapshot-and-clear), and rendering
+ * written back to VRAM is not logged at all.
+ */
+static bool ppc_gpu_overlay_on_gpu(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_GPU_OVERLAY");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/* The display shadow: host-visible renderer memory when the GPU composes. */
+static void ppc_mac_gpu_shadow_free(PPCMacGPUState *s)
+{
+    if (s->shadow_from_renderer && s->renderer && s->renderer->scanout_free) {
+        s->renderer->scanout_free(s->renderer_opaque, s->shadow_buf);
+    } else {
+        g_free(s->shadow_buf);
+    }
+    s->shadow_buf = NULL;
+    s->shadow_from_renderer = false;
+    s->shadow_buf_size = 0;
+}
+
+static void ppc_mac_gpu_shadow_alloc(PPCMacGPUState *s, uint64_t size)
+{
+    ppc_mac_gpu_shadow_free(s);
+    if (s->renderer && s->renderer->scanout_alloc && ppc_gpu_overlay_on_gpu()) {
+        s->shadow_buf = s->renderer->scanout_alloc(s->renderer_opaque, size);
+        s->shadow_from_renderer = s->shadow_buf != NULL;
+    }
+    if (!s->shadow_buf) {
+        s->shadow_buf = g_malloc(size);
+    }
+    s->shadow_buf_size = size;
+}
+
+/*
+ * The OV0 overlay decoded for a composer: window, source planes (VRAM
+ * offsets), keys and colour transform.  False when the overlay is off or
+ * its registers describe nothing drawable (the same conditions as the CPU
+ * compose below).  fb_stride is the frame's stride in VRAM and in the
+ * shadow (32 bpp only).
+ */
+/* Why an OV0 setup was rejected, once per place, in the -D log. */
+static void ppc_mac_gpu_overlay_reject(int line, uint32_t a, uint32_t b)
+{
+    static uint64_t seen;
+    if (line < 64 * 32 && !(seen & (1ull << (line % 64)))) {
+        seen |= 1ull << (line % 64);
+        qemu_log("ppc-mac-gpu overlay: setup rejected at line %d (%08x %08x)\n", line, a, b);
+    }
+}
+
+static bool ppc_mac_gpu_overlay_params(PPCMacGPUState *s, uint32_t fb_stride,
+                                       PPCMacGPUOverlayParams *op)
+{
+    const uint32_t *r = s->regs.ov0_active;
+    int y0, y1;
+
+    memset(op, 0, sizeof(*op));
+    if (!ppc_mac_gpu_overlay_rows(s, &y0, &y1)) {
+        { ppc_mac_gpu_overlay_reject(__LINE__, 0, 0); return false; }
+    }
+    unsigned fmt = (r[OV0(0x420)] >> 8) & 15;
+    unsigned buffer = r[OV0(0x470)] & 7;
+    unsigned x0 = r[OV0(0x400)] & 0x1fff;
+    unsigned x1 = r[OV0(0x404)] & 0x1fff;
+    unsigned top = (r[OV0(0x400)] >> 16) & 0x1fff;
+    unsigned bottom = (r[OV0(0x404)] >> 16) & 0x1fff;
+    unsigned sx0 = (r[OV0(0x494)] >> 16) & 0x1fff;
+    unsigned sx1 = r[OV0(0x494)] & 0x1fff;
+    unsigned sh = ((r[OV0(0x430)] >> 16) & 0xfff) + 1;
+    unsigned vfn = r[OV0(0x4f4)] & 3, gfn = (r[OV0(0x4f4)] >> 4) & 3;
+    bool both = r[OV0(0x4f4)] & BIT(8);
+    bool none = both ? vfn == 0 || gfn == 0 : vfn == 0 && gfn == 0;
+    bool planar = fmt == 10;
+    if ((fmt != 3 && fmt != 4 && fmt != 10 && fmt != 11 && fmt != 12) ||
+        buffer > 1 || x1 <= x0 || sx1 < sx0 || bottom <= top || none ||
+        x0 >= MIN(x1, s->disp.width) || y1 <= y0) {
+        { ppc_mac_gpu_overlay_reject(__LINE__, 0, 0); return false; }
+    }
+    for (unsigned p = 0; p < (planar ? 3u : 1u); p++) {
+        uint32_t value = r[OV0(0x440) + buffer * 3 + p];
+        uint64_t address = (uint64_t)r[OV0(0x43c)] + (value & 0x03fffff0);
+        unsigned cpp = planar ? 1 : 2;
+        unsigned rows = p ? (sh + 1) / 2 : sh;
+        unsigned cols = p ? (sx1 / 2 + 1) : (sx1 + 1);
+        uint32_t pitch = r[OV0(0x460) + (value & 1)];
+        if (!planar && (fmt == 11 || fmt == 12)) {
+            cols = ROUND_UP(cols, 2);
+        }
+        uint64_t size = (uint64_t)(rows - 1) * pitch + cols * cpp;
+        if ((value & 2) || pitch < cols * cpp || address > UINT32_MAX) {
+            { ppc_mac_gpu_overlay_reject(__LINE__, 0, 0); return false; }
+        }
+        uint32_t base = address;
+        if (!r300_to_vram(s, &base, size)) {
+            { ppc_mac_gpu_overlay_reject(__LINE__, 0, 0); return false; }
+        }
+        op->plane[p] = base;
+        op->pitch[p] = pitch;
+    }
+    op->fb_offset = s->disp.offset;
+    op->fb_stride = fb_stride;
+    op->out_stride = fb_stride;
+    op->fb_swap = !s->r300_card_bytes;
+    op->x0 = x0;
+    op->x1 = MIN(x1, s->disp.width);
+    op->y0 = y0;
+    op->y1 = y1;
+    op->win_x0 = x0;
+    op->win_x1 = x1;
+    op->top = top;
+    op->bottom = bottom;
+    op->fmt = fmt;
+    op->sx0 = sx0;
+    op->sx1 = sx1;
+    op->src_h = sh;
+    op->vkey_lo = r[OV0(0x4e4)];
+    op->vkey_hi = r[OV0(0x4e8)];
+    op->gkey_lo = r[OV0(0x4ec)];
+    op->gkey_hi = r[OV0(0x4f0)];
+    op->vfn = vfn;
+    op->gfn = gfn;
+    op->both = both;
+    const uint32_t *t = s->regs.ov0_transform;
+    for (unsigned c = 0; c < 3; c++) {
+        /* the CPU LUT: (a*Y + b*Cb + k*Cr + off*32) >> 8 */
+        op->coef[c * 4 + 0] = sextract32(t[c * 2], 20, 12) / 256.0f;
+        op->coef[c * 4 + 1] = sextract32(t[c * 2], 4, 12) / 256.0f;
+        op->coef[c * 4 + 2] = sextract32(t[c * 2 + 1], 20, 12) / 256.0f;
+        op->coef[c * 4 + 3] = sextract32(t[c * 2 + 1], 0, 13) / 8.0f;
+    }
+    return true;
+}
+
+/*
+ * VRAM ranges of the overlay's source planes, for the refresh policy: the
+ * overlay needs recomposing only when one of them (or its registers)
+ * changed.  Returns the plane count; 0 when the overlay is off or its
+ * registers do not describe planes in VRAM (treat as changed).
+ */
+static unsigned ppc_mac_gpu_overlay_planes(PPCMacGPUState *s, uint32_t base[3],
+                                           uint64_t len[3])
+{
+    PPCMacGPUOverlayParams op;
+
+    if (!ppc_mac_gpu_overlay_params(s, 0, &op)) {
+        return 0;
+    }
+    unsigned n = op.fmt == 10 ? 3 : 1;
+    for (unsigned p = 0; p < n; p++) {
+        unsigned cpp = op.fmt == 10 ? 1 : 2;
+        unsigned rows = p ? (op.src_h + 1) / 2 : op.src_h;
+        unsigned cols = p ? (op.sx1 / 2 + 1) : (op.sx1 + 1);
+        base[p] = op.plane[p];
+        len[p] = (uint64_t)(rows - 1) * op.pitch[p] + cols * cpp;
+    }
+    return n;
+}
+
+static void ppc_mac_gpu_overlay(PPCMacGPUState *s, uint8_t *vram,
+                                 uint32_t dst_stride)
+{
+    const uint32_t *r = s->regs.ov0_active;
+    int y0, y1;
+    if (!ppc_mac_gpu_overlay_rows(s, &y0, &y1)) {
+        return;
+    }
+    unsigned fmt = (r[OV0(0x420)] >> 8) & 15;
+    unsigned buffer = r[OV0(0x470)] & 7;
+    unsigned x0 = r[OV0(0x400)] & 0x1fff;
+    unsigned x1 = r[OV0(0x404)] & 0x1fff;
+    unsigned top = (r[OV0(0x400)] >> 16) & 0x1fff;
+    unsigned bottom = (r[OV0(0x404)] >> 16) & 0x1fff;
+    unsigned sx0 = (r[OV0(0x494)] >> 16) & 0x1fff;
+    unsigned sx1 = r[OV0(0x494)] & 0x1fff;
+    unsigned sh = ((r[OV0(0x430)] >> 16) & 0xfff) + 1;
+    unsigned vfn = r[OV0(0x4f4)] & 3, gfn = (r[OV0(0x4f4)] >> 4) & 3;
+    bool both = r[OV0(0x4f4)] & BIT(8);
+    /* Key functions 0/1 never/always pass: they can settle every pixel. */
+    bool all = both ? vfn == 1 && gfn == 1 : vfn == 1 || gfn == 1;
+    bool none = both ? vfn == 0 || gfn == 0 : vfn == 0 && gfn == 0;
+    bool planar = fmt == 10;
+    if ((fmt != 3 && fmt != 4 && fmt != 10 && fmt != 11 && fmt != 12) ||
+        buffer > 1 || x1 <= x0 || sx1 < sx0 || bottom <= top || none ||
+        x0 >= MIN(x1, s->disp.width)) {
+        return;
+    }
+    unsigned w = MIN(x1, s->disp.width) - x0;
+    unsigned sw = sx1 - sx0 + 1;
+    uint32_t pitch[3] = { 0 };
+    uint64_t hash = 0;
+    PPCMacGPUOverlayKey key = {
+        .width = s->disp.width,
+        .height = s->disp.height,
+    };
+    for (unsigned p = 0; p < (planar ? 3 : 1); p++) {
+        uint32_t value = r[OV0(0x440) + buffer * 3 + p];
+        uint64_t address = (uint64_t)r[OV0(0x43c)] + (value & 0x03fffff0);
+        unsigned cpp = planar ? 1 : 2;
+        unsigned rows = p ? (sh + 1) / 2 : sh;
+        unsigned cols = p ? (sx1 / 2 + 1) : (sx1 + 1);
+        pitch[p] = r[OV0(0x460) + (value & 1)];
+        if (!planar && (fmt == 11 || fmt == 12)) {
+            cols = ROUND_UP(cols, 2);
+        }
+        uint64_t size = (uint64_t)(rows - 1) * pitch[p] + cols * cpp;
+        if ((value & 2) || pitch[p] < cols * cpp || address > UINT32_MAX) {
+            return;
+        }
+        key.base[p] = address;
+        if (!r300_to_vram(s, &key.base[p], size)) {
+            char detail[96];
+            snprintf(detail, sizeof(detail), "plane %u at 0x%08" PRIx64
+                     " (%u bytes) agp_loc 0x%08x", p, address, (unsigned)size,
+                     s->regs.mc_agp_location);
+            r300_warn_once("overlay buffer outside VRAM, overlay skipped", detail);
+            return;
+        }
+        if (p == 0) {
+            char detail[48];
+            snprintf(detail, sizeof(detail), "0x%08" PRIx64 " fmt %u", address, fmt);
+            r300_warn_once("overlay buffer", detail);
+        }
+        r200_vram_access(s, key.base[p], (uint64_t)key.base[p] + size, false, 11);
+        for (unsigned row = 0; row < rows; row++) {
+            hash = hash * 0x100000001B3ull ^
+                   r300_hash_bytes(vram + key.base[p] + (uint64_t)row * pitch[p],
+                                   cols * cpp);
+        }
+    }
+    memcpy(key.ov0, r, sizeof(key.ov0));
+    memcpy(key.transform, s->regs.ov0_transform, sizeof(key.transform));
+    key.hash[0] = hash;
+    key.hash[1] = hash >> 32;
+
+    if (!s->ov0_cache || memcmp(&key, &s->ov0_cache_key, sizeof(key))) {
+        uint64_t pixels = (uint64_t)w * (y1 - y0);
+        if (s->ov0_cache_pixels < pixels) {
+            g_free(s->ov0_cache);
+            s->ov0_cache = g_new(uint32_t, pixels);
+            s->ov0_cache_pixels = pixels;
+        }
+        g_autofree unsigned *col = g_new(unsigned, w);
+        for (unsigned x = 0; x < w; x++) {
+            col[x] = sx0 + (uint64_t)x * sw / (x1 - x0);
+        }
+        int32_t lut[3][256][3];
+        const uint32_t *t = s->regs.ov0_transform;
+        for (unsigned c = 0; c < 3; c++) {
+            int a = sextract32(t[c * 2], 20, 12);
+            int b = sextract32(t[c * 2], 4, 12);
+            int k = sextract32(t[c * 2 + 1], 20, 12);
+            int off = sextract32(t[c * 2 + 1], 0, 13);
+            for (int v = 0; v < 256; v++) {
+                lut[0][v][c] = a * v + off * 32;
+                lut[1][v][c] = b * v;
+                lut[2][v][c] = k * v;
+            }
+        }
+        /* shortcut: nearest scaling of the full source rectangle; add scaler
+         * phase/filter/interlace semantics when a guest overlay trace needs them. */
+        unsigned prev_sy = UINT_MAX;
+        for (int y = y0; y < y1; y++) {
+            unsigned sy = (uint64_t)(y - top) * sh / (bottom - top);
+            uint32_t *out = s->ov0_cache + (uint64_t)(y - y0) * w;
+            if (sy == prev_sy) {
+                memcpy(out, out - w, w * 4);    /* upscaled: a repeated row */
+                continue;
+            }
+            prev_sy = sy;
+            const uint8_t *row = vram + key.base[0] + sy * pitch[0];
+            const uint8_t *cbrow = vram + key.base[1] + (sy / 2) * pitch[1];
+            const uint8_t *crrow = vram + key.base[2] + (sy / 2) * pitch[2];
+            for (unsigned x = 0; x < w; x++) {
+                unsigned sx = col[x];
+                uint32_t pixel;
+                if (fmt == 3 || fmt == 4) {
+                    uint16_t value = lduw_le_p(row + sx * 2);
+                    unsigned red = (value >> (fmt == 4 ? 11 : 10)) & 31;
+                    unsigned green = (value >> 5) & (fmt == 4 ? 63 : 31);
+                    unsigned blue = value & 31;
+                    red = (red << 3) | (red >> 2);
+                    green = fmt == 4 ? (green << 2) | (green >> 4) :
+                                      (green << 3) | (green >> 2);
+                    blue = (blue << 3) | (blue >> 2);
+                    pixel = (red << 16) | (green << 8) | blue;
+                } else if (planar) {
+                    pixel = ppc_mac_gpu_overlay_yuv(lut, row[sx], cbrow[sx / 2],
+                                                    crrow[sx / 2]);
+                } else {
+                    const uint8_t *pair = row + (sx & ~1u) * 2;
+                    pixel = ppc_mac_gpu_overlay_yuv(lut,
+                                                    pair[(sx & 1) * 2 + (fmt == 12)],
+                                                    pair[fmt == 11 ? 1 : 0],
+                                                    pair[fmt == 11 ? 3 : 2]);
+                }
+                /* The video key depends only on this pixel: bake it in. */
+                out[x] = pixel |
+                         (ppc_mac_gpu_overlay_key(pixel, r[OV0(0x4e4)],
+                                                  r[OV0(0x4e8)], vfn) ?
+                          0xff000000u : 0);
+            }
+        }
+        s->ov0_cache_key = key;
+    }
+
+    for (int y = y0; y < y1; y++) {
+        const uint32_t *src = s->ov0_cache + (uint64_t)(y - y0) * w;
+        uint32_t *dst = (uint32_t *)(s->shadow_buf + (uint64_t)y * dst_stride) + x0;
+        if (all) {
+            for (unsigned x = 0; x < w; x++) {
+                dst[x] = src[x] | 0xff000000u;
+            }
+            continue;
+        }
+        /*
+         * Under AND a failed video key decides, under OR a passed one;
+         * otherwise the graphics key under the window does.  Written
+         * without branches so the compiler vectorises it: this runs over
+         * the whole window on every refresh (4-5% of the main thread
+         * during playback as a per-pixel branchy loop).
+         */
+        const uint32_t klo = r[OV0(0x4ec)], khi = r[OV0(0x4f0)];
+        const unsigned rlo = (klo >> 16) & 255, rhi = (khi >> 16) & 255;
+        const unsigned glo = (klo >> 8) & 255, ghi = (khi >> 8) & 255;
+        const unsigned blo = klo & 255, bhi = khi & 255;
+        const bool gfn_eq = gfn == 2, gfn_ne = gfn == 3, gfn_always = gfn == 1;
+        for (unsigned x = 0; x < w; x++) {
+            uint32_t sv = src[x], d = dst[x];
+            bool vpass = sv >> 24;
+            unsigned rc = (d >> 16) & 255, gc = (d >> 8) & 255, bc = d & 255;
+            bool eq = rc >= rlo && rc <= rhi && gc >= glo && gc <= ghi &&
+                      bc >= blo && bc <= bhi;
+            bool gpass = gfn_always || (gfn_eq && eq) || (gfn_ne && !eq);
+            bool pass = (gfn >= 2 && vpass == both) ? gpass : vpass;
+            dst[x] = pass ? (sv | 0xff000000u) : d;
+        }
+    }
 }
 
 static bool ppc_gpu_dirty_scanout = true;   /* read from env in realize */
 static bool ppc_gpu_flip_kick = true;
 static bool ppc_gpu_async_present = true;
+
+static void ppc_mac_gpu_scanout_cursor(PPCMacGPUState *s, uint32_t stride,
+                                      int y0, int y1)
+{
+    if (!s->r300_card_bytes || !s->hwc_visible) {
+        return;
+    }
+    unsigned ox = (s->regs.cur_horz_vert_off >> 16) & 63;
+    unsigned oy = s->regs.cur_horz_vert_off & 63;
+    unsigned mode = (s->regs.crtc_gen_cntl >> 20) & 7;
+    /* CUR_OFFSET already advances by the clipped rows; VERT_OFF gives
+     * the number omitted from the 64-row image (legacy Radeon DRM). */
+    for (unsigned y = 0; y < s->hwc_h - MIN(oy, s->hwc_h); y++) {
+        int dy = s->hwc_y + y;
+        if (dy < y0 || dy >= y1 || dy >= s->disp.height) {
+            continue;
+        }
+        uint32_t *dst = (uint32_t *)(s->shadow_buf + (uint64_t)dy * stride);
+        for (unsigned x = ox; x < s->hwc_w; x++) {
+            int dx = s->hwc_x + x - ox;
+            if (dx < 0 || dx >= s->disp.width) {
+                continue;
+            }
+            uint32_t p = s->hwc_pix[y * s->hwc_w + x], a = p >> 24;
+            if (!mode && p == 0x01000000) {
+                dst[dx] ^= 0x00ffffff; /* Monochrome AND=1, XOR=1. */
+                continue;
+            }
+            if (!a) {
+                continue;
+            }
+            uint32_t rgb = 0;
+            for (unsigned sh = 0; sh < 24; sh += 8) {
+                /* Radeon mode 2 stores premultiplied alpha; mode 3 stores
+                 * straight alpha (ATI M6 register guide, CRTC_CUR_MODE). */
+                unsigned source = ((p >> sh) & 255) * (mode == 2 ? 255 : a);
+                unsigned c = (source +
+                              ((dst[dx] >> sh) & 255) * (255 - a) + 127) / 255;
+                rgb |= MIN(c, 255) << sh;
+            }
+            dst[dx] = 0xff000000 | rgb;
+        }
+    }
+}
 
 /*
  * Render-queue completion for a deferred present (see the head of
@@ -1667,13 +2305,25 @@ static void ppc_mac_gpu_present_done(void *arg, uint32_t seq)
     dpy_refresh_soon(s->con);
 }
 
+static void ppc_mac_gpu_display_update_inner(void *opaque);
+
+/* The refresh timer calls this with the BQL held: time it (rate line). */
 static void ppc_mac_gpu_display_update(void *opaque)
+{
+    int64_t t_in = g_get_monotonic_time();
+
+    ppc_mac_gpu_display_update_inner(opaque);
+    r200_rate.update_us += g_get_monotonic_time() - t_in;
+}
+
+static void ppc_mac_gpu_display_update_inner(void *opaque)
 {
     PPCMacGPUState *s = opaque;
 
+    ppc_mac_gpu_csq_ring_drain(s);
     /* A machine that has just been woken: give the window the pointer the
      * sleeping one had (see ppc_mac_gpu_post_load). */
-    if (s->hwc_announce && s->con) {
+    if (s->hwc_announce && s->con && !s->r300_card_bytes) {
         s->hwc_announce = false;
         if (s->hwc_w && s->hwc_h) {
             QEMUCursor *c = cursor_alloc(s->hwc_w, s->hwc_h);
@@ -1695,19 +2345,26 @@ static void ppc_mac_gpu_display_update(void *opaque)
                 double sec = (now - r200_rate.since) / 1e6;
                 qemu_log("ppc-mac-gpu rate: %.1f flips/s, %.1f present-ops/s, "
                          "%.0f draws/s (%.0f%% GPU vertex programs), "
-                         "%.0f 2D ops/s, %.0f flushes/s, GPU wait %.1f%%\n",
+                         "%.0f 2D ops/s, %.0f flushes/s, GPU wait %.1f%%, "
+                         "display update %.1f ms/s\n",
                          r200_rate.flips / sec,
                          r200_rate.presents / sec, r200_rate.draws / sec,
                          100.0 * r200_rate.gpu_vs / r200_rate.draws,
                          r200_rate.ops2d / sec, r200_rate.flushes / sec,
-                         r200_rate.flush_us / (sec * 1e4));
+                         r200_rate.flush_us / (sec * 1e4),
+                         r200_rate.update_us / (sec * 1e3));
                 if (r200_rate.co_copies || r200_rate.co_skips ||
                     r200_rate.co_defers) {
-                    qemu_log("ppc-mac-gpu scanout: %.0f copies/s "
-                             "(%.0f partial, %.0f unchanged/s skipped), "
+                    qemu_log("ppc-mac-gpu scanout: %.0f full + %.0f partial "
+                             "copies/s (%.0f rows/copy), "
+                             "%.0f unchanged/s skipped, "
                              "%.0f presents deferred/s\n",
-                             r200_rate.co_copies / sec,
+                             (r200_rate.co_copies - r200_rate.co_partials) /
+                             sec,
                              r200_rate.co_partials / sec,
+                             r200_rate.co_copies ?
+                             (double)r200_rate.co_rows / r200_rate.co_copies :
+                             0.0,
                              r200_rate.co_skips / sec,
                              r200_rate.co_defers / sec);
                 }
@@ -1716,6 +2373,18 @@ static void ppc_mac_gpu_display_update(void *opaque)
             memset(&r200_rate, 0, sizeof(r200_rate));
             r200_rate.since = now;
         }
+    }
+    uint64_t vram_generation = 0;
+    uint64_t generation_lo = s->disp.offset;
+    uint64_t generation_hi = generation_lo +
+                             (uint64_t)s->disp.stride * s->disp.height;
+    bool use_generation = ppc_gpu_dirty_scanout && s->renderer &&
+                          s->renderer->vram_generation;
+    if (use_generation) {
+        /* Dirty RAM harvesting can yield the BQL; synchronize GPU work afterwards. */
+        vram_generation = s->renderer->vram_generation(s->renderer_opaque,
+                                                       generation_lo,
+                                                       generation_hi);
     }
     if (s->disp.stride && s->disp.height) {
         uint64_t lo = s->regs.crtc_offset;
@@ -1748,7 +2417,9 @@ static void ppc_mac_gpu_display_update(void *opaque)
     bool mode_changed;
     uint8_t *vram_ptr;
 
+    uint32_t previous_offset = s->disp.offset;
     mode_changed = ppc_mac_gpu_update_display_mode(s);
+    bool offset_changed = previous_offset != s->disp.offset;
 
     /* Phase D: Reset Metal RT tracking for new frame */
     s->metal_rt_count = 0;
@@ -1757,7 +2428,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
     if (s->disp.width == 0 || s->disp.height == 0) {
         static int zero_count = 0;
         if (zero_count < 3) {
-            fprintf(stderr, "GPU DIAG: display_update called but w=%u h=%u, skipping\n",
+            mode_log("GPU DIAG: display_update called but w=%u h=%u, skipping\n",
                     s->disp.width, s->disp.height);
             zero_count++;
         }
@@ -1798,17 +2469,9 @@ static void ppc_mac_gpu_display_update(void *opaque)
     }
 
     /*
-     * UNIFIED display path — always use shadow buffer + bswap32.
-     *
-     * QEMU's Cocoa backend hardcodes kCGBitmapByteOrder32Little in
-     * CGImageCreate regardless of the pixman format.  This means
-     * PIXMAN_BE_x8r8g8b8 surfaces get misinterpreted by Core Graphics,
-     * causing visual corruption / banding.
-     *
-     * Solution: always bswap32 the VRAM (BE) into a shadow buffer and
-     * present it as PIXMAN_x8r8g8b8 (native LE), which Cocoa handles
-     * correctly.  Works for both CRTC extended mode and VGA/boot mode
-     * since PPC always writes BE to memory_region_init_ram.
+     * Cocoa ignores big-endian pixman format flags, so present a native
+     * shadow surface. The legacy CPU view needs conversion; native R300
+     * card bytes already match its little-endian pixel layout.
      */
     uint32_t width = s->disp.width;
     uint32_t height = s->disp.height;
@@ -1816,31 +2479,41 @@ static void ppc_mac_gpu_display_update(void *opaque)
     uint32_t bpp_bytes = (s->disp.bpp + 7) / 8;
 
     /*
-     * 15/16bpp (games switch the display to "thousands of colours"): the
-     * Cocoa front end only understands 32bpp little-endian surfaces, so
-     * expand the big-endian ARGB1555 / RGB565 scanout into the shadow buffer.
+     * Expand palette indices and 1555/565 into the shadow buffer.
+     * A 32bpp surface over 8bpp VRAM misreads both the pixels and the stride.
      */
-    if (bpp_bytes == 2) {
+    if (bpp_bytes != 4) {
+        s->scanout_generation_valid = false;
+    }
+    if (bpp_bytes == 1 || bpp_bytes == 2) {
         uint64_t need = (uint64_t)width * 4 * height;
         if (!s->shadow_buf || s->shadow_buf_size < need) {
-            g_free(s->shadow_buf);
-            s->shadow_buf = g_malloc(need);
-            s->shadow_buf_size = need;
+            ppc_mac_gpu_shadow_alloc(s, need);
             mode_changed = true;
         }
-        if (mode_changed || s->display_invalid) {
-            s->display_invalid = false;
+        if (mode_changed || width != s->surface_width ||
+            height != s->surface_height || width * 4 != s->surface_stride ||
+            s->shadow_buf != s->surface_data) {
+            s->surface_width = width;
+            s->surface_height = height;
+            s->surface_stride = width * 4;
+            s->surface_data = s->shadow_buf;
             DisplaySurface *ds = qemu_create_displaysurface_from(
                 width, height, PIXMAN_x8r8g8b8, width * 4, s->shadow_buf);
             dpy_gfx_replace_surface(s->con, ds);
         }
+        s->display_invalid = false;
         bool is565 = s->disp.bpp == 16;
         if ((uint64_t)s->disp.offset + (uint64_t)stride * height <= s->vram_size) {
             for (uint32_t y = 0; y < height; y++) {
                 const uint8_t *sp = vram_ptr + s->disp.offset + (uint64_t)y * stride;
                 uint32_t *dp = (uint32_t *)s->shadow_buf + (uint64_t)y * width;
                 for (uint32_t x = 0; x < width; x++) {
-                    uint32_t v = (sp[2 * x] << 8) | sp[2 * x + 1];
+                    if (bpp_bytes == 1) {
+                        dp[x] = 0xFF000000u | (s->regs.palette[sp[x]] & 0xFFFFFF);
+                        continue;
+                    }
+                    uint32_t v = s->r300_card_bytes ? lduw_le_p(sp + 2 * x) : lduw_be_p(sp + 2 * x);
                     uint32_t r, g, b;
                     if (is565) {
                         r = (v >> 11) & 31; g = (v >> 5) & 63; b = v & 31;
@@ -1854,6 +2527,9 @@ static void ppc_mac_gpu_display_update(void *opaque)
                 }
             }
         }
+        ppc_mac_gpu_overlay(s, vram_ptr, width * 4);
+        ppc_mac_gpu_scanout_cursor(s, width * 4, 0, height);
+        s->r300_cursor_dirty = false;
         dpy_gfx_update_full(s->con);
         return;
     }
@@ -1862,12 +2538,12 @@ static void ppc_mac_gpu_display_update(void *opaque)
     if (bpp_bytes != 4) {
         static int non32_count = 0;
         if (non32_count < 3) {
-            fprintf(stderr, "GPU DIAG: non-32bpp path, bpp=%u w=%u h=%u\n",
+            mode_log("GPU DIAG: non-32bpp path, bpp=%u w=%u h=%u\n",
                     s->disp.bpp, width, height);
             non32_count++;
         }
         /* Non-32bpp: display directly (rare, only during early boot) */
-        if (mode_changed || s->display_invalid) {
+        if (mode_changed || offset_changed || s->display_invalid) {
             s->display_invalid = false;
             DisplaySurface *ds = qemu_create_displaysurface_from(
                 width, height, s->disp.format, stride,
@@ -1982,9 +2658,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
 
     /* (Re)allocate shadow buffer if needed */
     if (!s->shadow_buf || s->shadow_buf_size < frame_size) {
-        g_free(s->shadow_buf);
-        s->shadow_buf = g_malloc(frame_size);
-        s->shadow_buf_size = frame_size;
+        ppc_mac_gpu_shadow_alloc(s, frame_size);
         mode_changed = true;  /* force surface recreation */
     }
 
@@ -1994,11 +2668,11 @@ static void ppc_mac_gpu_display_update(void *opaque)
      * display_invalid means "the contents changed", which a page flip or a
      * blit sets constantly -- but replacing the surface is not how contents
      * are published.  Each replacement allocates a DisplaySurface and a
-     * pixman image, runs every listener's gfx_switch (which copies the whole
-     * frame), and frees the old one.  At 1280x1024 that was several
-     * megabytes of pointless copying per flip.  Contents reach the UI
+     * pixman image, notifies every listener's gfx_switch (recreating
+     * frontend wrappers), and frees the old one. Contents reach the UI
      * through dpy_gfx_update below.
      */
+    bool force_copy = s->display_invalid || mode_changed || offset_changed;
     if (mode_changed || width != s->surface_width ||
         height != s->surface_height || stride != s->surface_stride ||
         s->shadow_buf != s->surface_data) {
@@ -2007,6 +2681,8 @@ static void ppc_mac_gpu_display_update(void *opaque)
         s->surface_height = height;
         s->surface_stride = stride;
         s->surface_data = s->shadow_buf;
+        force_copy = true;
+        s->scanout_generation_valid = false;    /* no partial copy into it */
         trace_ppc_mac_gpu_mode_change(width, height, s->disp.bpp, stride);
         DisplaySurface *ds = qemu_create_displaysurface_from(
             width, height,
@@ -2127,8 +2803,61 @@ static void ppc_mac_gpu_display_update(void *opaque)
      * change.  Skipping the copy entirely when no row is dirty also
      * skips the UI's full-frame CGImage refresh.
      */
+    /* Harvesting can yield the BQL: only cache the range actually sampled. */
+    use_generation &= generation_lo == s->disp.offset &&
+                      generation_hi == s->disp.offset +
+                                       (uint64_t)stride * height;
+    /*
+     * The video overlay composes from planes elsewhere in VRAM: the frame
+     * is unchanged only if those did not change either, and its rows need
+     * recomposing only when they did.  (Every refresh used to copy and
+     * upload the whole frame while an overlay was on.)
+     */
+    bool ov_on = s->regs.ov0_active[OV0(R200_OV0_SCALE_CNTL)] & BIT(30);
+    bool ov_changed = ov_on;
+    if (ov_on && s->renderer && s->renderer->vram_changed_since &&
+        s->scanout_generation_valid) {
+        uint32_t pbase[3];
+        uint64_t plen[3];
+        unsigned n = ppc_mac_gpu_overlay_planes(s, pbase, plen);
+
+        ov_changed = n == 0;
+        for (unsigned p = 0; p < n && !ov_changed; p++) {
+            uint64_t first, last;
+            ov_changed = s->renderer->vram_changed_since(
+                             s->renderer_opaque, pbase[p], pbase[p] + plen[p],
+                             s->scanout_vram_generation, &first, &last);
+        }
+    }
+    bool cursor_only = use_generation && !force_copy && s->r300_cursor_dirty &&
+                       s->scanout_generation_valid && !ov_changed &&
+                       s->scanout_offset == s->disp.offset &&
+                       s->scanout_vram_generation == vram_generation;
+    if (use_generation) {
+        if (s->scanout_generation_valid && !force_copy && !s->r300_cursor_dirty &&
+            !ov_changed && s->scanout_offset == s->disp.offset &&
+            s->scanout_vram_generation == vram_generation) {
+            r200_rate.co_skips++;
+            return;
+        }
+    }
+
     int y0 = 0, y1 = (int)height;
+    if (cursor_only) {
+        y0 = CLAMP(s->r300_cursor_y0, 0, (int)height);
+        y1 = CLAMP(s->r300_cursor_y1, 0, (int)height);
+    }
     DirtyBitmapSnapshot *snap = NULL;
+    /* Copy only rows lo..hi (none if lo < 0) plus overlay and cursor. */
+    bool partial = false;
+    int lo = -1, hi = -1;
+    /*
+     * A renderer that consumes the dirty log reports what changed by page
+     * generation instead; the shadow then matches the buffer it was last
+     * copied from as of s->scanout_vram_generation.
+     */
+    bool gen_partial = use_generation && s->renderer->vram_changed_since &&
+                       s->scanout_generation_valid && !mode_changed;
 
     if (s->scanout_log_owner && ppc_gpu_dirty_scanout) {
         snap = memory_region_snapshot_and_clear_dirty(
@@ -2136,8 +2865,8 @@ static void ppc_mac_gpu_display_update(void *opaque)
     }
     if (snap && s->scanout_dirty_valid && !mode_changed &&
         s->scanout_offset == s->disp.offset) {
-        int lo = -1, hi = -1, y;
-        for (y = 0; y < (int)height; y++) {
+        partial = true;
+        for (int y = 0; y < (int)height; y++) {
             if (memory_region_snapshot_get_dirty(&s->vram, snap,
                     s->disp.offset + (uint64_t)y * stride, width * 4)) {
                 if (lo < 0) {
@@ -2146,17 +2875,63 @@ static void ppc_mac_gpu_display_update(void *opaque)
                 hi = y + 1;
             }
         }
-        g_free(snap);
-        snap = NULL;
+    } else if (gen_partial && s->scanout_offset == s->disp.offset) {
+        uint64_t first, last;
+
+        /* A page (4 KiB) covers at most a row or two: take them all. */
+        partial = true;
+        if (s->renderer->vram_changed_since(s->renderer_opaque,
+                                            s->disp.offset,
+                                            s->disp.offset + frame_size,
+                                            s->scanout_vram_generation,
+                                            &first, &last)) {
+            lo = (first - s->disp.offset) / stride;
+            hi = DIV_ROUND_UP(last - s->disp.offset, stride);
+        }
+    } else if (gen_partial && s->r300_card_bytes) {
+        /*
+         * A page flip: the shadow holds the other buffer, and generations
+         * cannot say where two buffers differ, but the bytes can.  A
+         * double-buffered desktop differs only where it was redrawn, and
+         * uploading just those rows is what saves the UI's time.
+         */
+        partial = true;
+        for (int y = 0; y < (int)height; y++) {
+            if (memcmp(s->shadow_buf + (uint64_t)y * stride,
+                       vram_ptr + s->disp.offset + (uint64_t)y * stride,
+                       width * 4)) {
+                if (lo < 0) {
+                    lo = y;
+                }
+                hi = y + 1;
+            }
+        }
+    }
+    g_free(snap);
+    if (partial) {
+        int ov_lo, ov_hi;
+        if (ov_changed && ppc_mac_gpu_overlay_rows(s, &ov_lo, &ov_hi)) {
+            lo = lo < 0 ? ov_lo : MIN(lo, ov_lo);
+            hi = MAX(hi, ov_hi);
+        }
+        if (s->r300_cursor_dirty) {
+            int cy0 = CLAMP(s->r300_cursor_y0, 0, (int)height);
+            int cy1 = CLAMP(s->r300_cursor_y1, 0, (int)height);
+            if (cy0 < cy1) {
+                lo = lo < 0 ? cy0 : MIN(lo, cy0);
+                hi = MAX(hi, cy1);
+            }
+        }
         if (lo < 0) {
+            /* Nothing to show, but a flip to identical contents still
+             * moved the shadow's source: compare against it from now. */
+            s->scanout_offset = s->disp.offset;
+            s->scanout_vram_generation = vram_generation;
             r200_rate.co_skips++;
             return;                 /* nothing was written: nothing to show */
         }
         y0 = lo;
         y1 = hi;
-    } else if (snap) {
-        g_free(snap);
-        snap = NULL;
     }
 
     /* Bswap copy: VRAM (BE) → shadow buffer (LE) */
@@ -2165,15 +2940,33 @@ static void ppc_mac_gpu_display_update(void *opaque)
     uint32_t stride_u32 = stride / 4;
     int y;
     r200_rate.co_copies++;
+    r200_rate.co_rows += y1 - y0;
     if (y0 != 0 || y1 != (int)height) {
         r200_rate.co_partials++;
     }
     for (y = y0; y < y1; y++) {
-        ppc_mac_gpu_bswap_line32(dst + y * stride_u32,
-                                  src + y * stride_u32,
-                                  width);
+        if (s->r300_card_bytes) {
+            memcpy(dst + y * stride_u32, src + y * stride_u32, width * 4);
+        } else {
+            ppc_mac_gpu_bswap_line32(dst + y * stride_u32,
+                                    src + y * stride_u32, width);
+        }
     }
+    {
+        PPCMacGPUOverlayParams op;
+        bool on_gpu = s->shadow_from_renderer && s->renderer->compose_overlay &&
+                      s->disp.bpp == 32 &&
+                      ppc_mac_gpu_overlay_params(s, stride, &op) &&
+                      s->renderer->compose_overlay(s->renderer_opaque, &op);
+        if (!on_gpu) {
+            ppc_mac_gpu_overlay(s, vram_ptr, stride);
+        }
+    }
+    ppc_mac_gpu_scanout_cursor(s, stride, y0, y1);
+    s->r300_cursor_dirty = false;
     s->scanout_offset = s->disp.offset;
+    s->scanout_vram_generation = vram_generation;
+    s->scanout_generation_valid = use_generation;
     s->scanout_dirty_valid = s->scanout_log_owner;
     s->scanout_defers = 0;
 
@@ -2239,8 +3032,17 @@ static void ppc_mac_gpu_scratch_writeback_val(PPCMacGPUState *s, int reg_idx,
      * POWEREMU_WB_BE=1 restores the old order for comparison.
      */
     uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
-    uint32_t wire_val = getenv("POWEREMU_WB_BE") ? cpu_to_be32(wb_val)
-                                                 : cpu_to_le32(wb_val);
+    /*
+     * SCRATCH_UMSK[17:16] is the write-back byte swap (2 = 32-bit): MorphOS
+     * sets it and checks the copy byte for byte in big-endian order; the OS X
+     * kext leaves it clear.  POWEREMU_WB_BE=1 forces big-endian.
+     */
+    static int wb_be_env = -1;
+    if (wb_be_env < 0) {
+        wb_be_env = getenv("POWEREMU_WB_BE") != NULL;
+    }
+    bool wb_be = wb_be_env || ((s->regs.scratch_umsk >> 16) & 3) == 2;
+    uint32_t wire_val = wb_be ? cpu_to_be32(wb_val) : cpu_to_le32(wb_val);
 
     if (ppc_mac_gpu_gart_translate(s, wb_addr, &phys) ||
         ppc_mac_gpu_agp_translate(s, wb_addr, &phys)) {
@@ -2285,8 +3087,14 @@ static void ppc_mac_gpu_rptr_writeback(PPCMacGPUState *s)
         return;                       /* nowhere to write, or the guest said not to */
     }
     uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
-    uint32_t wire_val = getenv("POWEREMU_WB_BE")
-        ? cpu_to_be32(s->regs.cp_rb_rptr) : cpu_to_le32(s->regs.cp_rb_rptr);
+    /* CP_RB_RPTR_ADDR[1:0] = RB_RPTR_SWAP (2 = 32-bit swap -> big-endian copy). */
+    static int wb_be_env = -1;
+    if (wb_be_env < 0) {
+        wb_be_env = getenv("POWEREMU_WB_BE") != NULL;
+    }
+    bool wb_be = wb_be_env || (s->regs.cp_rb_rptr_addr & 3) == 2;
+    uint32_t wire_val = wb_be ? cpu_to_be32(s->regs.cp_rb_rptr)
+                              : cpu_to_le32(s->regs.cp_rb_rptr);
 
     if (!ppc_mac_gpu_gart_translate(s, addr, &phys) &&
         !ppc_mac_gpu_agp_translate(s, addr, &phys)) {
@@ -2517,19 +3325,21 @@ static uint8_t *r200_agp_page(PPCMacGPUState *s, uint32_t gpu_addr);
 static uint32_t g_r300_arm_rt;      /* debug: drag-frame capture target */
 static void r300_surfwatch_update(PPCMacGPUState *s);
 static void r300_surface_changed(PPCMacGPUState *s);
+static void r300_ap0_update(PPCMacGPUState *s);
 static void r300_zconv(PPCMacGPUState *s, bool to_card);
+static bool r300_to_vram(PPCMacGPUState *s, uint32_t *addr, uint64_t len);
 
 /* Raw guest GPU memory (VRAM or AGP), bytes as they lie. */
 static bool r300_read_raw(void *opaque, uint32_t gpu_addr, void *dst,
                           uint32_t len)
 {
     PPCMacGPUState *s = opaque;
-    uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
+    uint32_t off = gpu_addr;
     uint8_t *out = dst;
 
-    if (gpu_addr >= fb_base && (uint64_t)gpu_addr - fb_base + len <= s->vram_size) {
+    if (r300_to_vram(s, &off, len)) {
         memcpy(dst, (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
-                    (gpu_addr - fb_base), len);
+                    off, len);
         return true;
     }
     while (len) {
@@ -2556,11 +3366,10 @@ static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s, uint32_t gpu_addr,
 static bool r300_write_raw(PPCMacGPUState *s, uint32_t gpu_addr,
                            const uint8_t bytes[4])
 {
-    uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
+    uint32_t off = gpu_addr;
     hwaddr phys;
 
-    if (gpu_addr >= fb_base && (uint64_t)gpu_addr - fb_base + 4 <= s->vram_size) {
-        uint64_t off = gpu_addr - fb_base;
+    if (r300_to_vram(s, &off, 4)) {
         /* Only batched work that touches these four bytes has to finish
          * first; a write-back next to rendering keeps the GPU running. */
         r200_vram_access(s, off, off + 4, true, 6);
@@ -2646,7 +3455,6 @@ static uint32_t r300_zb_samples(PPCMacGPUState *s, uint32_t gpu_off)
  */
 static void r300_zmask_clear(PPCMacGPUState *s)
 {
-    uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
     uint32_t off = r300_reg(s->r3, 0x4F20) & ~0x1Fu;
     uint32_t pitch = r300_reg(s->r3, 0x4F24);
     uint32_t bpp = (r300_reg(s->r3, 0x4F10) & 0xF) == 2 ? 4 : 2;
@@ -2660,12 +3468,12 @@ static void r300_zmask_clear(PPCMacGPUState *s)
         rows = s->r3_zb_height;
     }
     rows *= r300_zb_samples(s, off);
-    if (off < fb_base || !bpr || !rows) {
+    if (!bpr || !rows || !r300_to_vram(s, &off, 1)) {
         return;
     }
-    off -= fb_base;
-    if (off + bpr * rows > s->vram_size) {
-        rows = (s->vram_size - off) / bpr;
+    rows = MIN(rows, (s->vram_size - off) / bpr);
+    if (!rows) {
+        return;
     }
     r200_vram_access(s, off, off + bpr * rows, true, 7);
     r200_pattern_fill(vram + off, bpr * rows, v, bpp);
@@ -2688,10 +3496,9 @@ static void r300_zmask_clear(PPCMacGPUState *s)
  */
 static void r300_cmask_clear(PPCMacGPUState *s)
 {
-    uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
     uint32_t off = r300_reg(s->r3, 0x4E28) & ~0x1Fu;
     uint32_t pitch = r300_reg(s->r3, 0x4E38);
-    uint32_t cf = (pitch >> 21) & 0xF, endian = (pitch >> 19) & 3;
+    uint32_t cf = (pitch >> 21) & 0xF, endian = r300_color_endian(s->r3, 0);
     uint32_t rows = (r300_reg(s->r3, 0x43E4) >> 13) & 0x1FFF;
     uint32_t v = r300_reg(s->r3, 0x4E14);
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
@@ -2712,13 +3519,13 @@ static void r300_cmask_clear(PPCMacGPUState *s)
     }
     bpr = (uint64_t)(pitch & 0x3FFE) * bpp;
     rows = rows > 1440 ? rows - 1440 + 1 : 0;
-    if (off < fb_base || !bpr || !rows) {
+    if (!bpr || !rows || !r300_to_vram(s, &off, 1)) {
         return;
     }
-    off -= fb_base;
     rows *= r300_cb_samples(s, off);     /* every sample's rows */
-    if (off + bpr * rows > s->vram_size) {
-        rows = (s->vram_size - off) / bpr;
+    rows = MIN(rows, (s->vram_size - off) / bpr);
+    if (!rows) {
+        return;
     }
     r200_vram_access(s, off, off + bpr * rows, true, 8);
     if (bpp == 4) {
@@ -2740,7 +3547,11 @@ static bool r300_to_vram(PPCMacGPUState *s, uint32_t *addr, uint64_t len)
     uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
 
     if (*addr < fb_base || (uint64_t)*addr - fb_base + len > s->vram_size) {
-        return false;
+        /* MorphOS submits framebuffer addresses in the PCI aperture. */
+        fb_base = pci_default_read_config(&s->pci, PCI_BASE_ADDRESS_0, 4) & ~0xFu;
+        if (*addr < fb_base || (uint64_t)*addr - fb_base + len > s->vram_size) {
+            return false;
+        }
     }
     *addr -= fb_base;
     return true;
@@ -2766,14 +3577,18 @@ static FILE *r300_drawlog(void)
 {
     static FILE *f;
     static int init;
-    static unsigned lines;
+    static unsigned lines, max_lines = 200000;
 
     if (!init) {
         const char *p = getenv("R300_DRAWLOG");
+        const char *m = getenv("R300_DRAWLOG_MAX");   /* line cap */
         init = 1;
         f = p ? fopen(p, "w") : NULL;
+        if (m && atoi(m) > 0) {
+            max_lines = atoi(m);
+        }
     }
-    if (f && ++lines > 200000) {
+    if (f && ++lines > max_lines) {
         fclose(f);
         f = NULL;
     }
@@ -2801,6 +3616,13 @@ static void r300_drawlog_draw(PPCMacGPUState *s, uint32_t opcode,
             r300_reg(r, 0x4E0C), r300_reg(r, 0x4BD4), r300_reg(r, 0x4104),
             r300_reg(r, 0x4020), r300_reg(r, 0x4010), r300_reg(r, 0x4014),
             r300_reg(r, 0x4E88));
+    /* vertex streams: AOS count/format/addresses, PROG_STREAM_CNTL(_EXT),
+     * OUTPUT_VTX_FMT: how texcoords reach the shaders */
+    fprintf(f, " aos=%08x/%08x/%08x/%08x/%08x/%08x psc=%08x/%08x/%08x/%08x ovf=%08x/%08x",
+            r300_reg(r, 0x20C0), r300_reg(r, 0x20C4), r300_reg(r, 0x20C8),
+            r300_reg(r, 0x20CC), r300_reg(r, 0x20D0), r300_reg(r, 0x20D4),
+            r300_reg(r, 0x2150), r300_reg(r, 0x2154), r300_reg(r, 0x21E0),
+            r300_reg(r, 0x21E4), r300_reg(r, 0x2090), r300_reg(r, 0x2094));
     for (int t = 0; t < 16; t++) {
         if (r300_reg(r, 0x4104) & (1u << t)) {
             fprintf(f, " t%d=%08x/%08x/%08x/%08x/%08x", t,
@@ -2998,7 +3820,7 @@ static void r300_aa_resolve(PPCMacGPUState *s, const R300DrawPacket *pkt)
         /* The byte alpha lands in: the ARGB dword in COLOR_ENDIAN order,
          * stored little-endian (as 3D_CLEAR_CMASK writes it). */
         uint32_t amask = r300_swap_mode(0xFF000000u,
-                                        (r300_reg(s->r3, 0x4E38) >> 19) & 3);
+                                        r300_color_endian(s->r3, 0));
         int ab = ctz32(amask) / 8;
 
         if (gamma && degamma[255] == 0.0f) {
@@ -3143,6 +3965,60 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                                 s, &pkt, &err) :
         r300_draw_build(s->r3, &s->r3_arrays, opcode, d, body_dw,
                         r300_read_raw, s, &pkt, &err);
+    /* $R300_DRAWLOG_VERTS: the post-transform vertices of small draws
+     * (position and the first three varyings) into the draw log */
+    {
+        static int dump_verts = -1;             /* value: max vertices per draw */
+        if (dump_verts < 0) {
+            const char *e = getenv("R300_DRAWLOG_VERTS");
+            dump_verts = e ? (atoi(e) > 1 ? atoi(e) : 8) : 0;
+        }
+        FILE *vl = dump_verts && build_ok && pkt.num_verts <= (uint32_t)dump_verts ? r300_drawlog() : NULL;
+        /* the raw input arrays (first 4 elements) and the VS state used */
+        for (unsigned i = 0; vl && i < s->r3_arrays.count; i++) {
+            uint32_t sz = s->r3_arrays.a[i].size_dw, st = s->r3_arrays.a[i].stride_dw;
+            fprintf(vl, "A%u addr=%08x size=%u stride=%u:", i, s->r3_arrays.a[i].addr, sz, st);
+            for (unsigned e = 0; e < 4; e++) {
+                uint32_t w[8] = {0};
+                r300_read_raw(s, s->r3_arrays.a[i].addr + 4 * e * st, w, 4 * (sz > 8 ? 8 : sz));
+                fprintf(vl, " [");
+                for (unsigned k = 0; k < sz && k < 8; k++) {
+                    float fv; memcpy(&fv, &w[k], 4);
+                    fprintf(vl, "%s%g", k ? "," : "", fv);
+                }
+                fprintf(vl, "]");
+            }
+            fprintf(vl, "\n");
+        }
+        if (vl) {
+            /* the vertex program's window (CODE_CNTL_0), its constant base
+             * and the first 12 constant vectors, plus the viewport regs */
+            uint32_t cc = r300_reg(s->r3, 0x22D4), cntl0 = r300_reg(s->r3, 0x22D0);
+            uint32_t cbase = R300_PVS_CONST_START + (cc & 0xFF);
+            fprintf(vl, "VS code=%08x const=%08x vte=%08x vp=", cntl0, cc, r300_reg(s->r3, 0x20B0));
+            for (uint32_t k = 0x1D98; k <= 0x1DAC; k += 4) {
+                float fv; uint32_t w = r300_reg(s->r3, k); memcpy(&fv, &w, 4);
+                fprintf(vl, "%g,", fv);
+            }
+            for (unsigned k = 0; k < 12 && cbase + k < R300_PVS_MEM_VECS; k++) {
+                fprintf(vl, " c%u=[", k);
+                for (unsigned j = 0; j < 4; j++) {
+                    float fv; memcpy(&fv, &s->r3->pvs_mem[(cbase + k) * 4 + j], 4);
+                    fprintf(vl, "%s%g", j ? "," : "", fv);
+                }
+                fprintf(vl, "]");
+            }
+            fprintf(vl, "\n");
+        }
+        for (uint32_t v = 0; vl && v < pkt.num_verts; v++) {
+            const R300Vertex *x = &pkt.verts[v];
+            fprintf(vl, "V%u pos=%g,%g,%g,%g v0=%g,%g,%g,%g v1=%g,%g,%g,%g v2=%g,%g,%g,%g\n",
+                    v, x->pos[0], x->pos[1], x->pos[2], x->pos[3],
+                    x->v[0][0], x->v[0][1], x->v[0][2], x->v[0][3],
+                    x->v[1][0], x->v[1][1], x->v[1][2], x->v[1][3],
+                    x->v[2][0], x->v[2][1], x->v[2][2], x->v[2][3]);
+        }
+    }
     if (s->r3_dump && g_r300_arm_rt &&
         (r300_reg(s->r3, 0x4E28) & ~0x1Fu) == g_r300_arm_rt) {
         fprintf(s->r3_dump, "TRY op %02x vf %08x ok %d err %s tex0 en %u off %06x "
@@ -3467,6 +4343,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                 }
             }
             r200_rate.draws++;
+            tl_log("draw");
             r200_perf.draws++;
             r200_perf.drew = true;
             r200_perf_high(pkt.rt_gpu_addr + len);
@@ -3502,13 +4379,14 @@ static bool ppc_mac_gpu_r300_packet3(PPCMacGPUState *s, uint32_t opcode,
         fprintf(s->r3_dump, "\n");
         fflush(s->r3_dump);
     }
-    if (s->r3->draws && s->r3_trace_lines < 40000) {
+    if (s->r3_dump && s->r3->draws && s->r3_trace_lines < 40000) {
         s->r3_trace_lines++;
-        fprintf(s->r3_dump ? s->r3_dump : stderr, "T3 %02x n=%u %08x %08x\n", opcode,
+        fprintf(s->r3_dump, "T3 %02x n=%u %08x %08x\n", opcode,
                 body_dw, body_dw ? d[0] : 0, body_dw > 1 ? d[1] : 0);
     }
-    if (!draw && r300_drawlog()) {
-        fprintf(r300_drawlog(), "P op%02x n=%u %08x %08x %08x %08x\n", opcode,
+    FILE *dl = draw ? NULL : r300_drawlog();  /* one call: the 200000th closes the log */
+    if (dl) {
+        fprintf(dl, "P op%02x n=%u %08x %08x %08x %08x\n", opcode,
                 body_dw, body_dw ? d[0] : 0, body_dw > 1 ? d[1] : 0,
                 body_dw > 2 ? d[2] : 0, body_dw > 3 ? d[3] : 0);
     }
@@ -3995,7 +4873,11 @@ static inline uint32_t gmc_dst_bpp(uint32_t gmc)
     /* POWEREMU_TEX_TRACE: each 2D pixel format the guest asks for, once,
      * to find where a program's video frames really go (Halo's logos come
      * out green and magenta, and they are not 3D textures). */
-    if (getenv("POWEREMU_TEX_TRACE")) {
+    static int trace = -1;
+    if (trace < 0) {
+        trace = getenv("POWEREMU_TEX_TRACE") != NULL;   /* once: this runs per 2D op */
+    }
+    if (trace) {
         static uint32_t seen_2d;
         uint32_t dt = (gmc >> 8) & 0xF;
         if (!(seen_2d & (1u << dt))) {
@@ -4036,6 +4918,24 @@ static bool host_data_put_narrow(PPCMacGPUState *s, uint8_t *vram, uint32_t val,
     return *cy < h;
 }
 
+/*
+ * Mark the VRAM bytes a 2D rectangle touched.  A rectangle running past the
+ * end of VRAM still had its in-range pixels written, so clip the range rather
+ * than dropping it (cf. QEMU 11 ati-vga 6197c11d: blits only partly
+ * overlapping the screen were never marked).
+ */
+static void vram_rect_dirty(PPCMacGPUState *s, uint64_t offset, uint32_t pitch,
+                            uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                            uint32_t bpp)
+{
+    uint64_t start = offset + (uint64_t)y * pitch + (uint64_t)x * bpp;
+
+    if (w && h && start < s->vram_size) {
+        uint64_t len = (uint64_t)(h - 1) * pitch + (uint64_t)w * bpp;
+        memory_region_set_dirty(&s->vram, start, MIN(len, s->vram_size - start));
+    }
+}
+
 static void ppc_mac_gpu_host_data_write(PPCMacGPUState *s, uint32_t val)
 {
     if (!s->host_data_active) {
@@ -4051,12 +4951,9 @@ static void ppc_mac_gpu_host_data_write(PPCMacGPUState *s, uint32_t val)
                                   s->host_data_dst_y, s->host_data_w,
                                   s->host_data_h, &s->host_data_cur_x,
                                   &s->host_data_cur_y)) {
-            uint64_t start = (uint64_t)s->host_data_offset +
-                             (uint64_t)s->host_data_dst_y * s->host_data_pitch;
-            uint64_t len = (uint64_t)s->host_data_h * s->host_data_pitch;
-            if (start + len <= s->vram_size) {
-                memory_region_set_dirty(&s->vram, start, len);
-            }
+            vram_rect_dirty(s, s->host_data_offset, s->host_data_pitch,
+                            s->host_data_dst_x, s->host_data_dst_y,
+                            s->host_data_w, s->host_data_h, bpp);
             s->host_data_active = false;
             s->display_invalid = true;
         }
@@ -4092,7 +4989,8 @@ static void ppc_mac_gpu_host_data_write(PPCMacGPUState *s, uint32_t val)
         }
     }
 
-    mc_vram_write32(s, vram, linear_addr, val);
+    /* Register pixels use the same VRAM representation as solid fills. */
+    mc_vram_write32(s, vram, linear_addr, s->r300 && !s->r300_card_bytes ? bswap32(val) : val);
 
     /* Advance cursor: left-to-right, then next row */
     s->host_data_cur_x++;
@@ -4101,17 +4999,9 @@ static void ppc_mac_gpu_host_data_write(PPCMacGPUState *s, uint32_t val)
         s->host_data_cur_y++;
         if (s->host_data_cur_y >= s->host_data_h) {
             /* Transfer complete — mark dirty and deactivate */
-            uint64_t dirty_start = (uint64_t)s->host_data_offset +
-                                   (uint64_t)s->host_data_dst_y *
-                                       s->host_data_pitch +
-                                   (uint64_t)s->host_data_dst_x * bpp;
-            uint64_t dirty_len = (s->host_data_h > 1)
-                ? (uint64_t)(s->host_data_h - 1) * s->host_data_pitch +
-                  (uint64_t)s->host_data_w * bpp
-                : (uint64_t)s->host_data_w * bpp;
-            if (dirty_start + dirty_len <= s->vram_size) {
-                memory_region_set_dirty(&s->vram, dirty_start, dirty_len);
-            }
+            vram_rect_dirty(s, s->host_data_offset, s->host_data_pitch,
+                            s->host_data_dst_x, s->host_data_dst_y,
+                            s->host_data_w, s->host_data_h, bpp);
             if (g_frame_tracker) {
                 frame_tracker_record_detail(g_frame_tracker,
                                             PASS_EVENT_HOST_UPLOAD,
@@ -4332,10 +5222,8 @@ static int mc_find_tiled_surface(PPCMacGPUState *s, uint64_t linear_addr,
 /*
  * Do the source and destination rectangles of a blit share pixels?
  *
- * Only meaningful for copies within one surface: if the two rectangles sit
- * in different surfaces (different base offset or pitch) they cannot alias,
- * and a plain forward copy is always safe.  Callers use this to decide
- * which direction to walk the rectangle, the way memmove does.
+ * This checks rectangles in the same surface view. The untiled copy helper
+ * also checks physical addresses, since different base offsets can alias.
  */
 static bool blit_overlaps(uint32_t src_offset, uint32_t src_pitch,
                           uint32_t src_x, uint32_t src_y,
@@ -4396,10 +5284,16 @@ static bool blit_rect_untiled(PPCMacGPUState *s, uint8_t *vram,
         return false;
     }
 
-    bool rev_rows = blit_overlaps(src_offset, src_pitch, src_x, src_y,
-                                  dst_offset, dst_pitch, dst_x, dst_y,
-                                  w, h, bpp) && dst_y > src_y;
     size_t row_bytes = (size_t)w * bpp;
+    uint64_t first_src = (uint64_t)src_offset + (uint64_t)src_y * src_pitch +
+                         (uint64_t)src_x * bpp;
+    uint64_t first_dst = (uint64_t)dst_offset + (uint64_t)dst_y * dst_pitch +
+                         (uint64_t)dst_x * bpp;
+    /* Different base offsets can describe overlapping views of the same
+     * rows. Walk backwards when the destination follows the source, even
+     * when their x/y origins are equal. memmove handles each row's overlap. */
+    bool rev_rows = h && src_pitch == dst_pitch && first_dst > first_src &&
+                    first_dst < first_src + (uint64_t)(h - 1) * src_pitch + row_bytes;
 
     for (uint32_t r = 0; r < h; r++) {
         uint32_t row = rev_rows ? (h - 1 - r) : r;
@@ -4421,11 +5315,21 @@ static bool blit_rect_untiled(PPCMacGPUState *s, uint8_t *vram,
     return true;
 }
 
-/*
- * MC VRAM write: write a 32-bit pixel to VRAM at a linear address.
- * If the address falls within a tiled surface, the tiling swizzle is
- * applied transparently.
- */
+/* Keep all system-memory copy commands in the same native/legacy pixel view. */
+static uint32_t gart_blit_pixel(PPCMacGPUState *s, uint32_t pixel, uint32_t bpp)
+{
+    if (s->r300_card_bytes) {
+        return r300_swap_mode(pixel, s->r300_src_swap);
+    }
+    if (s->r300 && bpp == 4 && s->r300_src_swap != 2) {
+        return bswap32(r300_swap_mode(pixel, s->r300_src_swap));
+    }
+    if (s->r300 && bpp == 2 && s->r300_src_swap == 0) {
+        return r300_swap_mode(pixel, 1);
+    }
+    return pixel;
+}
+
 /*
  * Copy a rectangle from GART/AGP system RAM into untiled VRAM.
  *
@@ -4466,12 +5370,22 @@ static void gart_blit_rows(PPCMacGPUState *s, AddressSpace *as, bool gart,
             done += n;
         }
 
-        if (s->r300 && bpp == 4 && s->r300_src_swap != 2) {
+        if (s->r300_card_bytes && s->r300_src_swap) {
+            /* Native VRAM is the card view: apply only the requested DMA swap. */
+            /* shortcut: swap2/3 leave partial DWORD tails unchanged;
+             * fetch adjacent source bytes if a guest submits one. */
+            for (size_t i = 0; i + 4 <= row_bytes; i += 4) {
+                stl_he_p(out + i, gart_blit_pixel(s, ldl_he_p(out + i), bpp));
+            }
+            if ((row_bytes & 3) == 2 && s->r300_src_swap == 1) {
+                stw_be_p(out + (row_bytes & ~3u), lduw_le_p(out + (row_bytes & ~3u)));
+            }
+        } else if (s->r300 && !s->r300_card_bytes && bpp == 4 && s->r300_src_swap != 2) {
             for (size_t i = 0; i + 4 <= row_bytes; i += 4) {
                 uint32_t px = ldl_he_p(out + i);
-                stl_he_p(out + i, bswap32(r300_swap_mode(px, s->r300_src_swap)));
+                stl_he_p(out + i, gart_blit_pixel(s, px, bpp));
             }
-        } else if (s->r300 && bpp == 2 && s->r300_src_swap == 0) {
+        } else if (s->r300 && !s->r300_card_bytes && bpp == 2 && s->r300_src_swap == 0) {
             for (size_t i = 0; i + 2 <= row_bytes; i += 2) {
                 stw_he_p(out + i, bswap16(lduw_he_p(out + i)));
             }
@@ -4516,22 +5430,50 @@ static inline void mc_vram_write32(PPCMacGPUState *s, uint8_t *vram,
     }
 }
 
-/*
- * Store one solid-fill pixel.  VRAM holds pixels as the CPU sees them
- * (big-endian, see qemu-ppc-gpu-endianness-and-tiling-are-correct), while a
- * fill colour arrives as a register value, so it is stored big-endian at the
- * surface's pixel size.  (Copies move bytes and need no conversion.)
- */
+/* Register colors use card bytes after native takeover, legacy CPU bytes before. */
 static inline void fill_vram_px(PPCMacGPUState *s, uint8_t *vram,
                                 uint64_t addr, uint32_t color, uint32_t bpp)
 {
     if (bpp == 4) {
-        mc_vram_write32(s, vram, addr, be32_to_cpu(color));
+        mc_vram_write32(s, vram, addr, s->r300_card_bytes ? cpu_to_le32(color) : be32_to_cpu(color));
     } else if (addr + bpp <= s->vram_size) {
         if (bpp == 2) {
-            stw_be_p(vram + addr, color);
+            if (s->r300_card_bytes) {
+                stw_le_p(vram + addr, color);
+            } else {
+                stw_be_p(vram + addr, color);
+            }
         } else {
             vram[addr] = color;
+        }
+    }
+}
+
+static void fill_vram_rect(PPCMacGPUState *s, uint8_t *vram,
+                          uint32_t offset, uint32_t pitch,
+                          uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                          uint32_t color, uint32_t bpp)
+{
+#ifdef CONFIG_PIXMAN
+    uint64_t end = (uint64_t)offset + ((uint64_t)y + h - 1) * pitch +
+                   ((uint64_t)x + w) * bpp;
+    uint32_t pixel = bpp == 4 ? (s->r300_card_bytes ? cpu_to_le32(color) : be32_to_cpu(color)) :
+                     bpp == 2 ? (s->r300_card_bytes ? cpu_to_le16(color) : be16_to_cpu(color)) : color;
+
+    /* Match register-pixel byte order while using the ATI fast fill path. */
+    if (w && h && !(offset & 3) && !(pitch & 3) &&
+        end <= s->vram_size &&
+        !mc_rect_is_tiled(s, offset, pitch, x, y, bpp) &&
+        pixman_fill((uint32_t *)(vram + offset), pitch / 4, bpp * 8,
+                    x, y, w, h, pixel)) {
+        return;
+    }
+#endif
+    for (uint32_t row = 0; row < h; row++) {
+        for (uint32_t col = 0; col < w; col++) {
+            uint64_t addr = (uint64_t)offset + ((uint64_t)y + row) * pitch +
+                            ((uint64_t)x + col) * bpp;
+            fill_vram_px(s, vram, addr, color, bpp);
         }
     }
 }
@@ -4593,6 +5535,103 @@ static inline uint32_t mc_vram_read32(PPCMacGPUState *s, uint8_t *vram,
     return 0;
 }
 
+/*
+ * PPCGPU_GPU2D=0 keeps every 2D engine operation on the CPU.  Otherwise a
+ * copy or fill that would have to wait for rendering in flight (the flush
+ * in r200_vram_access) is recorded on the GPU behind that rendering
+ * instead: MorphOS's compositor interleaves the two engines dozens of
+ * times a frame, and each wait was a GPU round trip.
+ */
+static bool r200_gpu2d_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_GPU2D");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/* The accounting r200_vram_access does for a CPU-side write of [lo, hi). */
+static void r200_gpu2d_done(PPCMacGPUState *s, uint64_t lo, uint64_t hi)
+{
+    r200_rate.ops2d++;
+    tl_log("2d-gpu");
+    if (lo < (uint64_t)s->regs.crtc_offset + (uint64_t)s->disp.stride * s->disp.height &&
+        hi > s->regs.crtc_offset) {
+        r200_rate.presents++;
+        r200_perf_present();
+    }
+    memory_region_set_dirty(&s->vram, lo, hi - lo);
+}
+
+/* The 2D engine's SRCCOPY on the GPU: true if recorded (nothing left to do). */
+static bool r200_gpu_copy(PPCMacGPUState *s, uint32_t src_offset, uint32_t src_pitch,
+                          uint32_t src_x, uint32_t src_y, uint32_t dst_offset,
+                          uint32_t dst_pitch, uint32_t dst_x, uint32_t dst_y,
+                          uint32_t w, uint32_t h, uint32_t bpp)
+{
+    if (!r200_gpu2d_on() || !s->renderer || !s->renderer->copy_2d_r200 ||
+        !s->renderer->range_busy_r200 || !w || !h ||
+        (bpp != 1 && bpp != 2 && bpp != 4) ||
+        src_pitch < w * bpp || dst_pitch < w * bpp ||
+        mc_rect_is_tiled(s, src_offset, src_pitch, src_x, src_y, bpp) ||
+        mc_rect_is_tiled(s, dst_offset, dst_pitch, dst_x, dst_y, bpp)) {
+        return false;
+    }
+    uint64_t row = (uint64_t)w * bpp;
+    uint64_t src = (uint64_t)src_offset + (uint64_t)src_y * src_pitch + (uint64_t)src_x * bpp;
+    uint64_t dst = (uint64_t)dst_offset + (uint64_t)dst_y * dst_pitch + (uint64_t)dst_x * bpp;
+    uint64_t src_hi = src + (uint64_t)(h - 1) * src_pitch + row;
+    uint64_t dst_hi = dst + (uint64_t)(h - 1) * dst_pitch + row;
+    if (src_hi > s->vram_size || dst_hi > s->vram_size) {
+        return false;
+    }
+    /* Nothing to wait for: the CPU does it now, as before. */
+    if (!s->renderer->range_busy_r200(s->renderer_opaque, dst, dst_hi, true) &&
+        !s->renderer->range_busy_r200(s->renderer_opaque, src, src_hi, false)) {
+        return false;
+    }
+    if (!s->renderer->copy_2d_r200(s->renderer_opaque, src, src_pitch,
+                                   dst, dst_pitch, row, h)) {
+        return false;
+    }
+    r200_gpu2d_done(s, dst, dst_hi);
+    return true;
+}
+
+/* The 2D engine's solid fill on the GPU: true if recorded. */
+static bool r200_gpu_fill(PPCMacGPUState *s, uint32_t dst_offset, uint32_t dst_pitch,
+                          uint32_t dst_x, uint32_t dst_y, uint32_t w, uint32_t h,
+                          uint32_t color, uint32_t bpp)
+{
+    if (!r200_gpu2d_on() || !s->renderer || !s->renderer->fill_2d_r200 ||
+        !s->renderer->range_busy_r200 || !w || !h ||
+        (bpp != 1 && bpp != 2 && bpp != 4) || dst_pitch < w * bpp ||
+        mc_rect_is_tiled(s, dst_offset, dst_pitch, dst_x, dst_y, bpp)) {
+        return false;
+    }
+    uint64_t row = (uint64_t)w * bpp;
+    uint64_t dst = (uint64_t)dst_offset + (uint64_t)dst_y * dst_pitch + (uint64_t)dst_x * bpp;
+    uint64_t dst_hi = dst + (uint64_t)(h - 1) * dst_pitch + row;
+    if (dst_hi > s->vram_size ||
+        !s->renderer->range_busy_r200(s->renderer_opaque, dst, dst_hi, true)) {
+        return false;
+    }
+    /* the bytes fill_vram_rect would store */
+    uint32_t pixel = bpp == 4 ? (s->r300_card_bytes ? cpu_to_le32(color) : be32_to_cpu(color)) :
+                     bpp == 2 ? (s->r300_card_bytes ? cpu_to_le16(color) : be16_to_cpu(color)) :
+                     color;
+    uint32_t pattern = bpp == 4 ? pixel :
+                       bpp == 2 ? (pixel & 0xFFFF) * 0x10001u : (pixel & 0xFF) * 0x01010101u;
+    if (!s->renderer->fill_2d_r200(s->renderer_opaque, dst, dst_pitch, row, h, pattern)) {
+        return false;
+    }
+    r200_gpu2d_done(s, dst, dst_hi);
+    return true;
+}
+
 static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
 {
     /*
@@ -4620,6 +5659,10 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
     uint32_t src_pitch  = (src_po & 0x3FC00000) >> 16;
     uint32_t dst_offset = (dst_po & 0x3FFFFF) << 10;
     uint32_t dst_pitch  = (dst_po & 0x3FC00000) >> 16;
+    if (s->r300) {
+        r300_to_vram(s, &src_offset, 0);
+        r300_to_vram(s, &dst_offset, 0);
+    }
     /*
      * Tiling policy — MC-style surface registry.
      *
@@ -4678,6 +5721,22 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
         return;
     }
 
+    if (s->r300) {
+        /* Reverse walks specify the last pixel, not the rectangle origin. */
+        if (!(s->regs.dp_cntl & 1)) {
+            dst_x += 1 - blit_w;
+            src_x += 1 - blit_w;
+        }
+        if (!(s->regs.dp_cntl & 2)) {
+            dst_y += 1 - blit_h;
+            src_y += 1 - blit_h;
+        }
+        if (dst_x > 0x3FFF || dst_y > 0x3FFF ||
+            (rop3 == 0xCC && (src_x > 0x3FFF || src_y > 0x3FFF))) {
+            return;
+        }
+    }
+
     /* Path instrumentation: log MMIO combined blit with its packed state */
     g_blit_stats.mmio_count++;
     {
@@ -4705,10 +5764,53 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
         }
     }
 
-    r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y, blit_h), true, 1);
-    if (src_offset < s->vram_size) {
-        r200_vram_access(s, R200_ROWS(src_offset, src_pitch ? src_pitch : dst_pitch,
-                                      src_y, blit_h), false, 1);
+    /*
+     * A source in the AGP window or the card's own GART is system memory:
+     * MorphOS copies each video-overlay frame (and other AGP surfaces)
+     * into VRAM with this register-triggered blit.  Read it through the
+     * GART; VRAM holds nothing at that address.
+     */
+    if (rop3 == 0xCC && src_type != 3) {
+        uint32_t agp_loc = s->regs.mc_agp_location;
+        bool agp = agp_loc != 0 &&
+                   src_offset >= ((agp_loc & 0xFFFF) << 16) &&
+                   src_offset <= ((((agp_loc >> 16) & 0xFFFF) << 16) | 0xFFFF);
+        bool aic = (s->regs.aic_ctrl & 1) && src_offset >= s->regs.aic_lo_addr &&
+                   src_offset <= s->regs.aic_hi_addr;
+        if ((agp || aic) && dst_pitch) {
+            uint32_t bpp = gmc_dst_bpp(s->regs.dp_gui_master_cntl);
+            uint32_t pitch = src_pitch ? src_pitch : dst_pitch;
+            r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y, blit_h), true, 1);
+            gart_blit_rows(s, pci_get_address_space(&s->pci), aic, src_offset, pitch,
+                           src_x, src_y, memory_region_get_ram_ptr(&s->vram),
+                           dst_offset, dst_pitch, dst_x, dst_y, blit_w, blit_h, bpp);
+            vram_rect_dirty(s, dst_offset, dst_pitch, dst_x, dst_y, blit_w, blit_h, bpp);
+            seq_log("REG  rop=cc agp src=%08x/%u (%u,%u) dst=%06x/%u (%u,%u) %ux%u",
+                    src_offset, pitch, src_x, src_y, dst_offset, dst_pitch, dst_x, dst_y,
+                    blit_w, blit_h);
+            return;
+        }
+    }
+    bool gpu_done = false;
+    {
+        uint32_t gbpp = gmc_dst_bpp(s->regs.dp_gui_master_cntl);
+        bool gart = (s->regs.aic_ctrl & 1) && src_offset >= s->regs.aic_lo_addr &&
+                    src_offset <= s->regs.aic_hi_addr;
+        if (rop3 == 0xCC && src_type != 3 && !gart) {
+            gpu_done = r200_gpu_copy(s, src_offset, src_pitch ? src_pitch : dst_pitch,
+                                     src_x, src_y, dst_offset, dst_pitch, dst_x, dst_y,
+                                     blit_w, blit_h, gbpp);
+        } else if (rop3 == 0xF0) {
+            gpu_done = r200_gpu_fill(s, dst_offset, dst_pitch, dst_x, dst_y, blit_w, blit_h,
+                                     s->regs.dp_brush_frgd_clr, gbpp);
+        }
+    }
+    if (!gpu_done) {
+        r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y, blit_h), true, 1);
+        if (rop3 == 0xCC && src_type != 3 && src_offset < s->vram_size) {
+            r200_vram_access(s, R200_ROWS(src_offset, src_pitch ? src_pitch : dst_pitch,
+                                          src_y, blit_h), false, 1);
+        }
     }
     seq_log("REG  rop=%02x src=%06x/%u (%u,%u) dst=%06x/%u (%u,%u) %ux%u",
             rop3, src_offset, src_pitch, src_x, src_y,
@@ -4800,8 +5902,7 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
             src_offset >= 0x100000 && blit_w >= 4 && blit_h >= 4) {
             static int intra_log = 0;
             if (intra_log < 100) {
-                fprintf(stderr,
-                    "[INTRA_RT_MOVE] off=0x%x pitch=%u "
+                mode_log("[INTRA_RT_MOVE] off=0x%x pitch=%u "
                     "src=(%u,%u) dst=(%u,%u) %ux%u\n",
                     src_offset, src_pitch / bpp,
                     src_x, src_y, dst_x, dst_y,
@@ -4835,13 +5936,8 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
                                    dst_x, dst_y, blit_w, blit_h,
                                    true, true);
                 }
-                uint64_t dirty_start = (uint64_t)dst_offset +
-                                       (uint64_t)dst_y * dst_pitch +
-                                       (uint64_t)dst_x * bpp;
-                uint64_t dirty_len = (blit_h > 1)
-                    ? (uint64_t)(blit_h - 1) * dst_pitch + (uint64_t)blit_w * bpp
-                    : (uint64_t)blit_w * bpp;
-                memory_region_set_dirty(&s->vram, dirty_start, dirty_len);
+                vram_rect_dirty(s, dst_offset, dst_pitch, dst_x, dst_y,
+                                blit_w, blit_h, bpp);
 
                 /* Phase A/C: stride override for shadow RT path */
                 if (dst_offset == s->regs.crtc_offset &&
@@ -4865,8 +5961,7 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
                         !s->disp_stride_override_active) {
                         static int srt_so_log = 0;
                         if (srt_so_log < 20) {
-                            fprintf(stderr,
-                                "[STRIDE_CHANGE] MMIO_SRT: "
+                            mode_log("[STRIDE_CHANGE] MMIO_SRT: "
                                 "override %s %u -> %u\n",
                                 s->disp_stride_override_active
                                     ? "update" : "activate",
@@ -4915,6 +6010,9 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
                         address_space_read(&address_space_memory, phys,
                                            MEMTXATTRS_UNSPECIFIED,
                                            &pixel, 4);
+                    }
+                    if (bpp == 4) {
+                        pixel = gart_blit_pixel(s, pixel, bpp);
                     }
 
                     uint64_t dst_linear = (uint64_t)dst_offset +
@@ -5019,9 +6117,9 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
                 rev_cols = (dst_y == src_y) && (dst_x > src_x);
             }
 
-            if (!blit_rect_untiled(s, vram, src_offset, src_pitch,
-                                   src_x, src_y, dst_offset, dst_pitch,
-                                   dst_x, dst_y, blit_w, blit_h, bpp))
+            if (!gpu_done && !blit_rect_untiled(s, vram, src_offset, src_pitch,
+                                                src_x, src_y, dst_offset, dst_pitch,
+                                                dst_x, dst_y, blit_w, blit_h, bpp))
             for (uint32_t r = 0; r < blit_h; r++) {
                 uint32_t row = rev_rows ? (blit_h - 1 - r) : r;
                 for (uint32_t c = 0; c < blit_w; c++) {
@@ -5038,13 +6136,8 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
             }
         }
         /* Mark display dirty */
-        uint64_t dirty_start = (uint64_t)dst_offset +
-                               (uint64_t)dst_y * dst_pitch +
-                               (uint64_t)dst_x * bpp;
-        uint64_t dirty_len = (blit_h > 1)
-            ? (uint64_t)(blit_h - 1) * dst_pitch + (uint64_t)blit_w * bpp
-            : (uint64_t)blit_w * bpp;
-        memory_region_set_dirty(&s->vram, dirty_start, dirty_len);
+        vram_rect_dirty(s, dst_offset, dst_pitch, dst_x, dst_y,
+                        blit_w, blit_h, bpp);
 
         /*
          * SRT write-through: if this 2D BLIT wrote to a VRAM offset
@@ -5070,7 +6163,7 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
              */
             pe_window_saw_blit(src_offset, src_pitch, dst_x, dst_y,
                                blit_w, blit_h,
-                               ((((s->regs.crtc_h_total_disp) >> 16) & 0xFF) + 1) * 8,
+                               ((((s->regs.crtc_h_total_disp) >> 16) & 0x1FF) + 1) * 8,
                                (((s->regs.crtc_v_total_disp) >> 16) & 0x7FF) + 1);
             frame_tracker_record_2d_event(PASS_EVENT_FALLBACK_2D,
                                           src_offset, src_pitch,
@@ -5111,8 +6204,7 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
                 !s->disp_stride_override_active) {
                 static int mmio_nosrt_so = 0;
                 if (mmio_nosrt_so < 20) {
-                    fprintf(stderr,
-                        "[STRIDE_CHANGE] MMIO_NOSRT: "
+                    mode_log("[STRIDE_CHANGE] MMIO_NOSRT: "
                         "override %s %u -> %u\n",
                         s->disp_stride_override_active
                             ? "update" : "activate",
@@ -5159,21 +6251,12 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
     } else if (rop3 == 0xF0) {
         /* Pattern fill (solid color from DP_BRUSH_FRGD_CLR) */
         uint32_t color = s->regs.dp_brush_frgd_clr;
-        for (uint32_t row = 0; row < blit_h; row++) {
-            for (uint32_t col = 0; col < blit_w; col++) {
-                uint64_t dst_linear = (uint64_t)dst_offset +
-                                      (uint64_t)(dst_y + row) * dst_pitch +
-                                      (uint64_t)(dst_x + col) * bpp;
-                fill_vram_px(s, vram, dst_linear, color, bpp);
-            }
+        if (!gpu_done) {
+            fill_vram_rect(s, vram, dst_offset, dst_pitch, dst_x, dst_y,
+                           blit_w, blit_h, color, bpp);
         }
-        uint64_t fill_dirty_start = (uint64_t)dst_offset +
-                                    (uint64_t)dst_y * dst_pitch +
-                                    (uint64_t)dst_x * bpp;
-        uint64_t fill_dirty_len = (blit_h > 1)
-            ? (uint64_t)(blit_h - 1) * dst_pitch + (uint64_t)blit_w * bpp
-            : (uint64_t)blit_w * bpp;
-        memory_region_set_dirty(&s->vram, fill_dirty_start, fill_dirty_len);
+        vram_rect_dirty(s, dst_offset, dst_pitch, dst_x, dst_y,
+                        blit_w, blit_h, bpp);
         r200_fill_notify(s, dst_offset, dst_pitch, dst_x, dst_y,
                          blit_w, blit_h, bpp, color);
     }
@@ -5194,6 +6277,10 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
     uint32_t src_pitch  = s->regs.src_pitch;  /* R200 separate PITCH regs are in bytes */
     uint32_t dst_offset = s->regs.dst_offset;
     uint32_t dst_pitch  = s->regs.dst_pitch;  /* R200 separate PITCH regs are in bytes */
+    if (s->r300) {
+        r300_to_vram(s, &src_offset, 0);
+        r300_to_vram(s, &dst_offset, 0);
+    }
 
     /*
      * MC-style tiling: the DST_PITCH_OFFSET register may describe a tiled
@@ -5204,6 +6291,9 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
     uint32_t parent_base  = (parent_po & 0x3FFFFF) << 10;
     uint32_t parent_pitch = (parent_po & 0x3FC00000) >> 16;
     bool     parent_macro = (parent_po >> 30) & 1;
+    if (s->r300) {
+        r300_to_vram(s, &parent_base, 0);
+    }
     if (parent_macro && parent_base > 0 && parent_pitch > 0) {
         mc_register_tiled_surface(s, parent_base, parent_pitch, "SEP_parent");
     }
@@ -5227,10 +6317,26 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
         return;
     }
 
-    r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y, blit_h), true, 2);
-    if (src_offset < s->vram_size) {
-        r200_vram_access(s, R200_ROWS(src_offset, src_pitch ? src_pitch : dst_pitch,
-                                      src_y, blit_h), false, 2);
+    bool gpu_done = false;
+    {
+        uint32_t gbpp = gmc_dst_bpp(gmc);
+        bool gart = (s->regs.aic_ctrl & 1) && src_offset >= s->regs.aic_lo_addr &&
+                    src_offset <= s->regs.aic_hi_addr;
+        if (rop3 == 0xCC && src_type != 3 && !gart) {
+            gpu_done = r200_gpu_copy(s, src_offset, src_pitch ? src_pitch : dst_pitch,
+                                     src_x, src_y, dst_offset, dst_pitch, dst_x, dst_y,
+                                     blit_w, blit_h, gbpp);
+        } else if (rop3 == 0xF0) {
+            gpu_done = r200_gpu_fill(s, dst_offset, dst_pitch, dst_x, dst_y, blit_w, blit_h,
+                                     s->regs.dp_brush_frgd_clr, gbpp);
+        }
+    }
+    if (!gpu_done) {
+        r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y, blit_h), true, 2);
+        if (rop3 == 0xCC && src_type != 3 && src_offset < s->vram_size) {
+            r200_vram_access(s, R200_ROWS(src_offset, src_pitch ? src_pitch : dst_pitch,
+                                          src_y, blit_h), false, 2);
+        }
     }
     seq_log("SEP  rop=%02x srctype=%u src=%06x/%u (%u,%u) "
             "dst=%06x/%u (%u,%u) %ux%u",
@@ -5277,7 +6383,19 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
     /* Path instrumentation */
     g_blit_stats.sep_count++;
     {
-        static uint64_t sep_logged = 0;
+        static uint64_t sep_logged = 0, offcard_logged = 0;
+        bool src_off_card = src_type != 0 && !src_is_gart && !src_is_agp &&
+                            (uint64_t)src_offset + (uint64_t)src_y * src_pitch >=
+                            s->vram_size;
+        if ((src_is_gart || src_is_agp || src_off_card) && offcard_logged < 200) {
+            offcard_logged++;
+            qemu_log("ppc-mac-gpu 2d: %s source 0x%08x pitch %u (%u,%u) -> "
+                     "0x%08x pitch %u (%u,%u) %ux%u bpp %u rop %02x %s\n",
+                     src_is_gart ? "GART" : src_is_agp ? "AGP" : "OFF-CARD",
+                     src_offset, src_pitch, src_x, src_y, dst_offset, dst_pitch,
+                     dst_x, dst_y, blit_w, blit_h, bpp, rop3,
+                     g_in_pm4 ? "pm4" : "mmio");
+        }
         if (sep_logged < 500) {
             uint32_t mc_base, mc_pitch;
             uint64_t test_addr = (uint64_t)dst_offset +
@@ -5373,11 +6491,7 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
                          * view after the 0x15D4 swap; store the CPU view.
                          * A swap equal to the aperture's is a plain copy.
                          */
-                        if (s->r300 && bpp == 4 && s->r300_src_swap != 2) {
-                            pixel = bswap32(r300_swap_mode(pixel, s->r300_src_swap));
-                        } else if (s->r300 && bpp == 2 && s->r300_src_swap == 0) {
-                            pixel = r300_swap_mode(pixel, 1);
-                        }
+                        pixel = gart_blit_pixel(s, pixel, bpp);
                         xlate_ok++;
                     } else {
                         xlate_fail++;
@@ -5465,9 +6579,9 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
                 rev_rows = dst_y > src_y;
                 rev_cols = (dst_y == src_y) && (dst_x > src_x);
             }
-            if (!blit_rect_untiled(s, vram, src_offset, src_pitch,
-                                   src_x, src_y, dst_offset, dst_pitch,
-                                   dst_x, dst_y, blit_w, blit_h, bpp)) {
+            if (!gpu_done && !blit_rect_untiled(s, vram, src_offset, src_pitch,
+                                                src_x, src_y, dst_offset, dst_pitch,
+                                                dst_x, dst_y, blit_w, blit_h, bpp)) {
                 for (uint32_t r = 0; r < blit_h; r++) {
                     uint32_t row = rev_rows ? (blit_h - 1 - r) : r;
                     for (uint32_t c = 0; c < blit_w; c++) {
@@ -5487,15 +6601,8 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
         }
 
         /* Mark dirty */
-        uint64_t dirty_start = (uint64_t)dst_offset +
-                               (uint64_t)dst_y * dst_pitch +
-                               (uint64_t)dst_x * bpp;
-        uint64_t dirty_len = (blit_h > 1)
-            ? (uint64_t)(blit_h - 1) * dst_pitch + (uint64_t)blit_w * bpp
-            : (uint64_t)blit_w * bpp;
-        if (dirty_start + dirty_len <= s->vram_size) {
-            memory_region_set_dirty(&s->vram, dirty_start, dirty_len);
-        }
+        vram_rect_dirty(s, dst_offset, dst_pitch, dst_x, dst_y,
+                        blit_w, blit_h, bpp);
         s->display_invalid = true;
 
         /*
@@ -5522,8 +6629,7 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
                 s->disp_stride_override_value != dst_pitch) {
                 static int mmio_so_log = 0;
                 if (mmio_so_log < 20) {
-                    fprintf(stderr,
-                        "[STRIDE_CHANGE] MMIO_2D: "
+                    mode_log("[STRIDE_CHANGE] MMIO_2D: "
                         "override %s %u -> %u\n",
                         s->disp_stride_override_active
                             ? "update" : "activate",
@@ -5539,23 +6645,12 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
     } else if (rop3 == 0xF0) {
         /* Pattern fill — MC helper handles tiling */
         uint32_t color = s->regs.dp_brush_frgd_clr;
-        for (uint32_t row = 0; row < blit_h; row++) {
-            for (uint32_t col = 0; col < blit_w; col++) {
-                uint64_t dst_linear = (uint64_t)dst_offset +
-                    (uint64_t)(dst_y + row) * dst_pitch +
-                    (uint64_t)(dst_x + col) * bpp;
-                fill_vram_px(s, vram, dst_linear, color, bpp);
-            }
+        if (!gpu_done) {
+            fill_vram_rect(s, vram, dst_offset, dst_pitch, dst_x, dst_y,
+                           blit_w, blit_h, color, bpp);
         }
-        uint64_t dirty_start = (uint64_t)dst_offset +
-                               (uint64_t)dst_y * dst_pitch +
-                               (uint64_t)dst_x * bpp;
-        uint64_t dirty_len = (blit_h > 1)
-            ? (uint64_t)(blit_h - 1) * dst_pitch + (uint64_t)blit_w * bpp
-            : (uint64_t)blit_w * bpp;
-        if (dirty_start + dirty_len <= s->vram_size) {
-            memory_region_set_dirty(&s->vram, dirty_start, dirty_len);
-        }
+        vram_rect_dirty(s, dst_offset, dst_pitch, dst_x, dst_y,
+                        blit_w, blit_h, bpp);
         r200_fill_notify(s, dst_offset, dst_pitch, dst_x, dst_y,
                          blit_w, blit_h, bpp, color);
         s->display_invalid = true;
@@ -7496,7 +8591,7 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
         r200_warn_once(&r200_warned, 1024,
                        "render target 0x%x pitch %u height %u outside VRAM",
                        pkt.rt_offset, pkt.rt_pitch, pkt.rt_height);
-    } else if (r200_rate.draws++,
+    } else if (r200_rate.draws++, tl_log("draw"),
                r200_render_draw(s, vram, &pkt) == 0) {
         memory_region_set_dirty(&s->vram, pkt.rt_offset,
                                 (uint64_t)pkt.rt_height * pkt.rt_pitch * rt_bpp);
@@ -7931,7 +9026,9 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
             /* Type 3: GPU engine command */
             uint32_t pkt_count = ((hdr >> 16) & 0x3FFF) + 2;
             uint32_t opcode = (hdr >> 8) & 0xFF;
-            uint32_t body_dw = pkt_count - 1;
+            pm4_op_hist[opcode]++;
+            /* A packet cut off by the end of the buffer: read only what is there. */
+            uint32_t body_dw = MIN(pkt_count - 1, size_dw - i);
             uint32_t body_adv = body_dw;   /* 0x1B may widen body_dw */
             uint32_t *d = &pm4_data[i];
             if (s->r3 && ppc_mac_gpu_r300_packet3(s, opcode, d, body_dw)) {
@@ -7981,11 +9078,15 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
              */
             static uint32_t bbm_hdr[6], bbm_hdr_n;
             uint32_t bbm_cont[256];
-            if (opcode == 0x1b && bbm_hdr_n && body_dw >= 3 &&
-                bbm_hdr_n + body_dw <= ARRAY_SIZE(bbm_cont)) {
-                memcpy(bbm_cont, bbm_hdr, bbm_hdr_n * 4);
-                memcpy(bbm_cont + bbm_hdr_n, d, body_dw * 4);
-                d = bbm_cont;
+            g_autofree uint32_t *bbm_long = NULL;   /* up to 16384 words */
+            if (opcode == 0x1b && bbm_hdr_n && body_dw >= 3) {
+                uint32_t *cont = bbm_cont;
+                if (bbm_hdr_n + body_dw > ARRAY_SIZE(bbm_cont)) {
+                    cont = bbm_long = g_new(uint32_t, bbm_hdr_n + body_dw);
+                }
+                memcpy(cont, bbm_hdr, bbm_hdr_n * 4);
+                memcpy(cont + bbm_hdr_n, d, body_dw * 4);
+                d = cont;
                 body_dw += bbm_hdr_n;
                 opcode = 0x9b;
             }
@@ -8023,12 +9124,12 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                  * copies the damage forward every frame.
                  */
                 if (gmc & R200_GMC_SRC_PITCH_OFFSET_CNTL) {
-                    src_po = d[hdr_dw++];
+                    src_po = pm4_next(d, &hdr_dw, body_dw);
                 } else {
                     src_po = s->regs.default_pitch_offset;
                 }
                 if (gmc & R200_GMC_DST_PITCH_OFFSET_CNTL) {
-                    dst_po = d[hdr_dw++];
+                    dst_po = pm4_next(d, &hdr_dw, body_dw);
                 } else {
                     dst_po = s->regs.default_pitch_offset;
                 }
@@ -8038,8 +9139,8 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                     hdr_dw++;                   /* SRC_SC_BOTTOM_RIGHT */
                 }
                 if (gmc & R200_GMC_DST_CLIPPING) {
-                    bbm_clip_tl = d[hdr_dw++];
-                    bbm_clip_br = d[hdr_dw++];
+                    bbm_clip_tl = pm4_next(d, &hdr_dw, body_dw);
+                    bbm_clip_br = pm4_next(d, &hdr_dw, body_dw);
                 }
 
                 if (hdr_dw <= ARRAY_SIZE(bbm_hdr)) {
@@ -8057,6 +9158,10 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                 uint32_t dst_pitch  = (dst_po & 0x3FC00000) >> 16;
                 uint32_t src_offset = (src_po & 0x3FFFFF) << 10;
                 uint32_t src_pitch  = (src_po & 0x3FC00000) >> 16;
+                if (s->r300) {
+                    r300_to_vram(s, &src_offset, 0);
+                    r300_to_vram(s, &dst_offset, 0);
+                }
                 /* MC-style tiling: register surfaces from PO if macro_tile=1 */
                 if ((dst_po >> 30) & 1) {
                     mc_register_tiled_surface(s, dst_offset, dst_pitch, "BBM_dst");
@@ -8267,10 +9372,25 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                         }
                     }
 
-                    r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y,
-                                                  blit_h), true, 3);
-                    r200_vram_access(s, R200_ROWS(src_offset, src_pitch, src_y,
-                                                  blit_h), false, 3);
+                    bool gpu_done = false;
+                    {
+                        hwaddr test_phys;
+                        bool gart = (s->regs.aic_ctrl & 1) &&
+                                    src_offset >= s->regs.aic_lo_addr &&
+                                    src_offset <= s->regs.aic_hi_addr;
+                        if (rop3 == 0xCC && !gart &&
+                            !ppc_mac_gpu_agp_translate(s, src_offset, &test_phys)) {
+                            gpu_done = r200_gpu_copy(s, src_offset, src_pitch, src_x, src_y,
+                                                     dst_offset, dst_pitch, dst_x, dst_y,
+                                                     blit_w, blit_h, bpp);
+                        }
+                    }
+                    if (!gpu_done) {
+                        r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y,
+                                                      blit_h), true, 3);
+                        r200_vram_access(s, R200_ROWS(src_offset, src_pitch, src_y,
+                                                      blit_h), false, 3);
+                    }
                     seq_log("BBM  rop=%02x src=%06x/%u (%u,%u) "
                             "dst=%06x/%u (%u,%u) %ux%u",
                             rop3, src_offset, src_pitch, src_x, src_y,
@@ -8376,6 +9496,9 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                                             MEMTXATTRS_UNSPECIFIED,
                                             &pixel, 4);
                                     }
+                                    if (bpp == 4) {
+                                        pixel = gart_blit_pixel(s, pixel, bpp);
+                                    }
                                     uint64_t d_linear = (uint64_t)dst_offset +
                                         (uint64_t)(dst_y + row) * dst_pitch +
                                         (uint64_t)(dst_x + col) * bpp;
@@ -8405,7 +9528,8 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                                 rev_cols = (dst_y == src_y) && (dst_x > src_x);
                             }
 
-                            if (blit_rect_untiled(s, vram,
+                            if (gpu_done ||
+                                blit_rect_untiled(s, vram,
                                                   src_offset, src_pitch,
                                                   src_x, src_y,
                                                   dst_offset, dst_pitch,
@@ -8430,20 +9554,8 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                             }
                         }
                     blit_mark_dirty:
-                        /* Mark dirty */
-                        {
-                        uint64_t dirty_start = (uint64_t)dst_offset +
-                            (uint64_t)dst_y * dst_pitch +
-                            (uint64_t)dst_x * bpp;
-                        uint64_t dirty_len = (blit_h > 1)
-                            ? (uint64_t)(blit_h - 1) * dst_pitch +
-                              (uint64_t)blit_w * bpp
-                            : (uint64_t)blit_w * bpp;
-                        if (dirty_start + dirty_len <= s->vram_size) {
-                            memory_region_set_dirty(&s->vram,
-                                                    dirty_start, dirty_len);
-                        }
-                        }
+                        vram_rect_dirty(s, dst_offset, dst_pitch, dst_x, dst_y,
+                                        blit_w, blit_h, bpp);
 
                         /* SRT write-through for BBM path */
                         if (!r200_direct_enabled() && s->renderer && s->renderer->srt_write_through &&
@@ -8526,8 +9638,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                                     s->disp_stride_override_value != dst_pitch) {
                                     static int so_log = 0;
                                     if (so_log < 20) {
-                                        fprintf(stderr,
-                                            "[STRIDE_CHANGE] PM4_BBM: "
+                                        mode_log("[STRIDE_CHANGE] PM4_BBM: "
                                             "override %s %u -> %u\n",
                                             s->disp_stride_override_active
                                                 ? "update" : "activate",
@@ -8572,6 +9683,9 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                     uint32_t po = d[idx++];
                     offset = (po & 0x3FFFFF) << 10;
                     pitch  = (po & 0x3FC00000) >> 16;
+                    if (s->r300) {
+                        r300_to_vram(s, &offset, 0);
+                    }
                     /* MC-style: register tiled surface if macro_tile=1 */
                     if ((po >> 30) & 1) {
                         mc_register_tiled_surface(s, offset, pitch, "PAINT_PO");
@@ -8582,6 +9696,9 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                     uint32_t po = s->regs.default_pitch_offset;
                     offset = (po & 0x3FFFFF) << 10;
                     pitch  = (po & 0x3FC00000) >> 16;
+                    if (s->r300) {
+                        r300_to_vram(s, &offset, 0);
+                    }
                 }
 
                 /* Packet clip fields (GMC bits 2/3) come before the brush. */
@@ -8602,7 +9719,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                 uint32_t brush_type = (gmc >> 4) & 0xF;
                 uint32_t color;
                 if (brush_type == 0xD) {
-                    color = d[idx++];
+                    color = pm4_next(d, &idx, body_dw);
                 } else {
                     color = s->regs.dp_brush_frgd_clr;
                 }
@@ -8613,7 +9730,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                 }
 
                 uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
-                uint32_t num_fills = (body_dw - idx) / 2;
+                uint32_t num_fills = body_dw > idx ? (body_dw - idx) / 2 : 0;
 
                 /* Path instrumentation for PAINT */
                 g_blit_stats.paint_count++;
@@ -8694,8 +9811,13 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                         continue;
                     }
 
-                    r200_vram_access(s, R200_ROWS(offset, pitch, dst_y, blit_h),
-                                     true, 4);
+                    bool gpu_done = (rop3 == 0xF0 || rop3 == 0xCC) &&
+                        r200_gpu_fill(s, offset, pitch, dst_x, dst_y, blit_w, blit_h,
+                                      color, bpp);
+                    if (!gpu_done) {
+                        r200_vram_access(s, R200_ROWS(offset, pitch, dst_y, blit_h),
+                                         true, 4);
+                    }
                     seq_log("FILL rop=%02x dst=%06x/%u (%u,%u) %ux%u "
                             "color=%08x",
                             rop3, offset, pitch, dst_x, dst_y,
@@ -8708,26 +9830,12 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                                            dst_x, dst_y, blit_w, blit_h,
                                            false, color != 0);
                         }
-                        /* MC helper handles tiling transparently */
-                        for (uint32_t row = 0; row < blit_h; row++) {
-                            for (uint32_t col = 0; col < blit_w; col++) {
-                                uint64_t d_linear = (uint64_t)offset +
-                                    (uint64_t)(dst_y + row) * pitch +
-                                    (uint64_t)(dst_x + col) * bpp;
-                                fill_vram_px(s, vram, d_linear, color, bpp);
-                            }
+                        if (!gpu_done) {
+                            fill_vram_rect(s, vram, offset, pitch, dst_x, dst_y,
+                                           blit_w, blit_h, color, bpp);
                         }
-                        uint64_t dirty_start = (uint64_t)offset +
-                            (uint64_t)dst_y * pitch +
-                            (uint64_t)dst_x * bpp;
-                        uint64_t dirty_len = (blit_h > 1)
-                            ? (uint64_t)(blit_h - 1) * pitch +
-                              (uint64_t)blit_w * bpp
-                            : (uint64_t)blit_w * bpp;
-                        if (dirty_start + dirty_len <= s->vram_size) {
-                            memory_region_set_dirty(&s->vram,
-                                                    dirty_start, dirty_len);
-                        }
+                        vram_rect_dirty(s, offset, pitch, dst_x, dst_y,
+                                        blit_w, blit_h, bpp);
                         r200_fill_notify(s, offset, pitch, dst_x, dst_y,
                                          blit_w, blit_h, bpp, color);
                     }
@@ -8745,6 +9853,9 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                 uint32_t po = d[1];
                 uint32_t dst_offset = (po & 0x3FFFFF) << 10;
                 uint32_t dst_pitch  = (po & 0x3FC00000) >> 16;
+                if (s->r300) {
+                    r300_to_vram(s, &dst_offset, 0);
+                }
                 /* MC-style: register tiled surface if macro_tile=1 */
                 if ((po >> 30) & 1) {
                     mc_register_tiled_surface(s, dst_offset, dst_pitch, "HD_PO");
@@ -8824,7 +9935,8 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                         uint64_t d_linear = (uint64_t)dst_offset +
                             (uint64_t)(dst_y + cy) * dst_pitch +
                             (uint64_t)(dst_x + cx) * bpp;
-                        mc_vram_write32(s, vram, d_linear, d[4 + dw]);
+                        mc_vram_write32(s, vram, d_linear,
+                                        s->r300 && !s->r300_card_bytes ? bswap32(d[4 + dw]) : d[4 + dw]);
                         pix_idx++;
                     }
 
@@ -8844,17 +9956,8 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                         s->host_data_active = true;
                     } else {
                         /* All inline data written, mark dirty */
-                        uint64_t dirty_start = (uint64_t)dst_offset +
-                            (uint64_t)dst_y * dst_pitch +
-                            (uint64_t)dst_x * bpp;
-                        uint64_t dirty_len = (blit_h > 1)
-                            ? (uint64_t)(blit_h - 1) * dst_pitch +
-                              (uint64_t)blit_w * bpp
-                            : (uint64_t)blit_w * bpp;
-                        if (dirty_start + dirty_len <= s->vram_size) {
-                            memory_region_set_dirty(&s->vram,
-                                                    dirty_start, dirty_len);
-                        }
+                        vram_rect_dirty(s, dst_offset, dst_pitch, dst_x, dst_y,
+                                        blit_w, blit_h, bpp);
                         s->display_invalid = true;
                     }
                 }
@@ -9528,6 +10631,43 @@ static const MemoryRegionOps ppc_mac_gpu_cp_wptr_ops = {
     },
 };
 
+/*
+ * Lock-free CP_RB_RPTR: MorphOS polls it ~500k times/s while the CP thread
+ * works.  Through the generic path every poll took the BQL (contending with
+ * the CP thread's slices) and forced a renderer flush; here it is one atomic
+ * load.  Engine completion is still answered by RBBM_STATUS/CP_CSQ_STAT.
+ */
+static uint64_t ppc_mac_gpu_cp_rptr_read(void *opaque, hwaddr addr,
+                                         unsigned size)
+{
+    PPCMacGPUState *s = opaque;
+    return qatomic_read(&s->regs.cp_rb_rptr);
+}
+
+static void ppc_mac_gpu_cp_rptr_write(void *opaque, hwaddr addr,
+                                      uint64_t val, unsigned size)
+{
+    bool locked = bql_locked();
+
+    if (!locked) {
+        bql_lock();
+    }
+    ppc_mac_gpu_mmio_write(opaque, R200_CP_RB_RPTR, val, size);
+    if (!locked) {
+        bql_unlock();
+    }
+}
+
+static const MemoryRegionOps ppc_mac_gpu_cp_rptr_ops = {
+    .read = ppc_mac_gpu_cp_rptr_read,
+    .write = ppc_mac_gpu_cp_rptr_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
 static void ppc_mac_gpu_cp_start(PPCMacGPUState *s)
 {
     const char *e = getenv("PPCGPU_CP_SYNC");
@@ -9545,6 +10685,14 @@ static void ppc_mac_gpu_cp_start(PPCMacGPUState *s)
     memory_region_enable_lockless_io(&s->cp_wptr_mr);
     memory_region_add_subregion_overlap(&s->mmio, R200_CP_RB_WPTR,
                                         &s->cp_wptr_mr, 1);
+    if (!getenv("PPCGPU_RPTR_LOCKED")) {
+        memory_region_init_io(&s->cp_rptr_mr, OBJECT(s),
+                              &ppc_mac_gpu_cp_rptr_ops, s,
+                              "ppc-mac-gpu-cp-rptr", 4);
+        memory_region_enable_lockless_io(&s->cp_rptr_mr);
+        memory_region_add_subregion_overlap(&s->mmio, R200_CP_RB_RPTR,
+                                            &s->cp_rptr_mr, 1);
+    }
 }
 
 static void ppc_mac_gpu_cp_stop(void)
@@ -9638,8 +10786,20 @@ static void ppc_mac_gpu_pm4_fifo_push(PPCMacGPUState *s, uint32_t val)
                  * Reconstruct the header so process_pm4 can parse it. */
                 uint32_t opcode = s->pm4_pkt_opcode;
                 uint32_t ndw = s->pm4_fifo_idx;
-                if (ndw > 0 && ndw <= 60) {
-                    uint32_t pm4_buf[64];
+                if (ndw > 0) {
+                    /*
+                     * A copy, not s->pm4_fifo itself, in case processing
+                     * lets more FIFO words in.  Short packets (nearly all)
+                     * keep the stack buffer, whose slack also covers the
+                     * fixed header words process_pm4 reads before it
+                     * checks a packet's length.
+                     */
+                    uint32_t stack_buf[64];
+                    g_autofree uint32_t *heap_buf = NULL;
+                    uint32_t *pm4_buf = stack_buf;
+                    if (ndw > ARRAY_SIZE(stack_buf) - 4) {
+                        pm4_buf = heap_buf = g_new(uint32_t, ndw + 1);
+                    }
                     /* Type 3 header: type=3, count=ndw-1, opcode */
                     pm4_buf[0] = (3U << 30) |
                                  ((ndw - 1) << 16) |
@@ -9651,6 +10811,107 @@ static void ppc_mac_gpu_pm4_fifo_push(PPCMacGPUState *s, uint32_t val)
             s->pm4_fifo_idx = 0;
         }
     }
+}
+
+/* ========================================================================
+ * Lock-free PM4 PIO FIFO
+ *
+ * MorphOS draws through the PIO FIFO: a dozen register words per 2D
+ * operation, two million a second when it is busy, and every one of them
+ * used to take and release the BQL on its way in (a fifth of the vCPU's
+ * time).  The FIFO aperture is now a lock-free region: a write queues the
+ * word, and the queue is carried out, in order, before the next access that
+ * does hold the lock -- any other register read or write, the frame timer,
+ * the display refresh.  The driver reads a status register before it
+ * touches VRAM from the CPU (as it must on real hardware, whose FIFO is
+ * asynchronous too), so it never sees a half-done queue.
+ * PPCGPU_CSQ_RING=0 keeps the old synchronous path.
+ * ======================================================================== */
+
+static void ppc_mac_gpu_csq_ring_drain(PPCMacGPUState *s)
+{
+    uint32_t words[256];
+    unsigned n, i;
+
+    while (qatomic_read(&s->csq_ring_count)) {
+        qemu_spin_lock(&s->csq_ring_lock);
+        n = MIN(s->csq_ring_count, ARRAY_SIZE(words));
+        for (i = 0; i < n; i++) {
+            words[i] = s->csq_ring[(s->csq_ring_tail + i) % ARRAY_SIZE(s->csq_ring)];
+        }
+        s->csq_ring_tail = (s->csq_ring_tail + n) % ARRAY_SIZE(s->csq_ring);
+        s->csq_ring_count -= n;
+        qemu_spin_unlock(&s->csq_ring_lock);
+        for (i = 0; i < n; i++) {
+            ppc_mac_gpu_pm4_fifo_push(s, words[i]);
+        }
+    }
+}
+
+/* Runs on the vCPU thread without the BQL (or with it, from a DMA path). */
+static void ppc_mac_gpu_csq_ring_write(void *opaque, hwaddr addr,
+                                       uint64_t val, unsigned size)
+{
+    PPCMacGPUState *s = opaque;
+
+    if (unlikely(bql_locked() || gpu_debug_enabled() || r200_traffic_on())) {
+        /* Keep the order, and the loggers' view, of the old path. */
+        BQL_LOCK_GUARD();
+        ppc_mac_gpu_csq_ring_drain(s);
+        ppc_mac_gpu_mmio_write(s, R200_PM4_FIFO_DATA_BASE + addr, val, size);
+        return;
+    }
+    qemu_spin_lock(&s->csq_ring_lock);
+    if (unlikely(s->csq_ring_count == ARRAY_SIZE(s->csq_ring))) {
+        /* A driver that never looks at the card: carry the queue out here. */
+        qemu_spin_unlock(&s->csq_ring_lock);
+        bql_lock();
+        ppc_mac_gpu_csq_ring_drain(s);
+        bql_unlock();
+        qemu_spin_lock(&s->csq_ring_lock);
+    }
+    s->csq_ring[(s->csq_ring_tail + s->csq_ring_count) % ARRAY_SIZE(s->csq_ring)] = val;
+    s->csq_ring_count++;
+    qemu_spin_unlock(&s->csq_ring_lock);
+}
+
+static uint64_t ppc_mac_gpu_csq_ring_read(void *opaque, hwaddr addr,
+                                          unsigned size)
+{
+    PPCMacGPUState *s = opaque;
+
+    BQL_LOCK_GUARD();
+    return ppc_mac_gpu_mmio_read_guest(s, R200_PM4_FIFO_DATA_BASE + addr, size);
+}
+
+static const MemoryRegionOps ppc_mac_gpu_csq_ring_ops = {
+    .read = ppc_mac_gpu_csq_ring_read,
+    .write = ppc_mac_gpu_csq_ring_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
+static void ppc_mac_gpu_csq_ring_start(PPCMacGPUState *s)
+{
+    const char *e = getenv("PPCGPU_CSQ_RING");
+
+    qemu_spin_init(&s->csq_ring_lock);
+    if (e && e[0] == '0') {
+        return;
+    }
+    memory_region_init_io(&s->csq_ring_mr, OBJECT(s), &ppc_mac_gpu_csq_ring_ops,
+                          s, "ppc-mac-gpu-csq", R200_PM4_FIFO_DATA_END -
+                          R200_PM4_FIFO_DATA_BASE);
+    memory_region_enable_lockless_io(&s->csq_ring_mr);
+    memory_region_add_subregion_overlap(&s->mmio, R200_PM4_FIFO_DATA_BASE,
+                                        &s->csq_ring_mr, 1);
 }
 
 /* ========================================================================
@@ -9701,6 +10962,88 @@ static bool is_r300_register(uint32_t addr)
 #define PPC_MAC_GPU_HWC_BASE  0xFF00
 #define PPC_MAC_GPU_HWC_END   0xFF20
 #define PPC_MAC_GPU_HWC_MAGIC 0x48574331
+
+static void ppc_mac_gpu_radeon_cursor(PPCMacGPUState *s, bool define)
+{
+    if (!s->r300 || !s->regs.cur_offset || !s->con) {
+        return;
+    }
+    if (s->regs.cur_horz_vert_posn & (1u << 31)) {
+        return; /* Cursor registers are locked until the position is committed. */
+    }
+    int old_x = s->hwc_x, old_y = s->hwc_y;
+    bool old_visible = s->hwc_visible;
+    s->hwc_x = (s->regs.cur_horz_vert_posn >> 16) & 0x3FFF;
+    s->hwc_y = s->regs.cur_horz_vert_posn & 0xFFF;
+    s->hwc_visible = (s->regs.crtc_gen_cntl & (1u << 16)) != 0;
+    if (define && s->hwc_visible) {
+        uint32_t off = s->regs.cur_offset & ~0xFu;
+        unsigned mode = (s->regs.crtc_gen_cntl >> 20) & 7;
+        unsigned rows = s->r300_card_bytes ? 64 - (s->regs.cur_horz_vert_off & 63) : 64;
+        uint32_t len = rows * (mode ? 256 : 16);
+        if (!r300_to_vram(s, &off, len)) {
+            return;
+        }
+        const uint8_t *src = (uint8_t *)memory_region_get_ram_ptr(&s->vram) + off;
+        QEMUCursor *c = cursor_alloc(64, 64);
+        c->hot_x = s->regs.cur_horz_vert_off >> 16 & 63;
+        c->hot_y = s->regs.cur_horz_vert_off & 63;
+        if (!mode) {
+            uint8_t mask[512], bits[512];
+            for (unsigned y = 0; y < rows; y++) {
+                memcpy(mask + y * 8, src + y * 16, 8);
+                memcpy(bits + y * 8, src + y * 16 + 8, 8);
+            }
+            if (s->r300_card_bytes) {
+                for (unsigned i = 0; i < 64 * rows; i++) {
+                    unsigned bit = 0x80 >> (i & 7);
+                    bool a = mask[i / 8] & bit, b = bits[i / 8] & bit;
+                    c->data[i] = a ? (b ? 0x01000000 : 0) :
+                                 0xff000000 | (b ? s->regs.cur_clr1 : s->regs.cur_clr0);
+                }
+            } else {
+                cursor_set_mono(c, s->regs.cur_clr1, s->regs.cur_clr0, bits, 1, mask);
+            }
+        } else {
+            for (unsigned i = 0; i < 64 * rows; i++) {
+                if (s->r300_card_bytes && (mode == 2 || mode == 3)) {
+                    /* Alpha cursor words are aRGB8888 in physical VRAM;
+                     * CPU aperture swapping is independent of scanout. */
+                    c->data[i] = ldl_le_p(src + i * 4);
+                } else {
+                    /* Preserve the firmware/NDRV aperture-zero RGBA view. */
+                    uint32_t v = ldl_be_p(src + i * 4);
+                    c->data[i] = (v >> 8) | (v << 24);
+                }
+            }
+        }
+        s->hwc_w = s->hwc_h = 64;
+        memcpy(s->hwc_pix, c->data, sizeof(s->hwc_pix));
+        if (!s->r300_card_bytes) {
+            dpy_cursor_define(s->con, c);
+        }
+        cursor_unref(c);
+    }
+    if (s->r300_card_bytes) {
+        /* GTK hides its host cursor on grab. Rendering here also avoids
+         * feeding guest-position warps back into relative mouse input. */
+        if (define || old_x != s->hwc_x || old_y != s->hwc_y ||
+            old_visible != s->hwc_visible) {
+            int lo = old_visible ? old_y : s->hwc_y;
+            int hi = old_visible ? old_y + s->hwc_h : s->hwc_y;
+            if (s->hwc_visible) {
+                lo = MIN(lo, s->hwc_y);
+                hi = MAX(hi, s->hwc_y + (int)s->hwc_h);
+            }
+            s->r300_cursor_y0 = s->r300_cursor_dirty ? MIN(s->r300_cursor_y0, lo) : lo;
+            s->r300_cursor_y1 = s->r300_cursor_dirty ? MAX(s->r300_cursor_y1, hi) : hi;
+            s->r300_cursor_dirty = true;
+            dpy_refresh_soon(s->con);
+        }
+        return;
+    }
+    dpy_mouse_set(s->con, s->hwc_x, s->hwc_y, s->hwc_visible);
+}
 
 static void ppc_mac_gpu_hwc_write(PPCMacGPUState *s, uint32_t reg, uint32_t val)
 {
@@ -9757,6 +11100,8 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
 {
     PPCMacGPUState *s = opaque;
     uint64_t val = 0;
+    bool async_status = s->r300 && s->renderer && s->renderer->busy_r200 &&
+                        (addr == R200_RBBM_STATUS || addr == R200_GUI_STAT);
 
     /*
      * POWEREMU_STALL_TRACE: the last register accesses before the guest
@@ -9764,7 +11109,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
      * for something; this says what it touched on the way in, and what it
      * keeps touching while stuck.
      */
-    if (getenv("POWEREMU_STALL_TRACE")) {
+    if (trace_flag(&g_stall_trace, "POWEREMU_STALL_TRACE")) {
         static struct { uint32_t addr, val; bool wr; } ring[256];
         static unsigned n;
         static int64_t last_draw_seen;
@@ -9865,7 +11210,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
      * this says which -- Halo's title screen draws and then stops, with its
      * sound looping, so something it waits for never arrives.
      */
-    if (getenv("POWEREMU_POLL_TRACE")) {
+    if (trace_flag(&g_poll_trace, "POWEREMU_POLL_TRACE")) {
         static uint32_t count[0x4000 / 4];
         static int64_t next_report;
         int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
@@ -9902,8 +11247,23 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         return size == 4 ? ppc_mac_gpu_hwc_read(s, addr - PPC_MAC_GPU_HWC_BASE) : 0;
     }
 
+    if (s->r300 && s->edid_read_done && addr >= 0x400 && addr + size <= 0x500) {
+        uint32_t value = s->regs.ov0[OV0(addr & ~3u)];
+        if ((addr & ~3u) == 0x410) {
+            value |= value & 1 ? BIT(3) : BIT(4);
+        }
+        return ppc_mac_gpu_reg_read_offs(value, addr & 3, size);
+    }
+    if (s->r300 && addr >= 0xd20 && addr + size <= 0xd38) {
+        return ppc_mac_gpu_reg_read_offs(s->regs.ov0_transform[(addr - 0xd20) / 4],
+                                         addr & 3, size);
+    }
+
     if (addr >= 0x780 && addr < 0x7C0) {
         seq_log("DMA  rd reg=%03x", (unsigned)addr);
+    }
+    if (addr == 0x0e40 || addr == 0x07f8 || addr == 0x0044) {
+        tl_log("rd %03x", (unsigned)addr);
     }
     if (unlikely(r200_traffic_on())) {
         r200_traffic.mmio_reads++;
@@ -9913,7 +11273,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
     if (addr >= R200_SCRATCH_REG0 && addr <= R200_SCRATCH_REG5 && !(addr & 3) &&
         r200_direct_enabled() && r200_scratch_read_wait(s, (addr - R200_SCRATCH_REG0) / 4)) {
         /* fence poll: answered without flushing later work */
-    } else if (addr != R200_CP_CSQ_CNTL && addr != R200_CP_CSQ_STAT &&
+    } else if (!async_status && addr != R200_CP_CSQ_CNTL && addr != R200_CP_CSQ_STAT &&
         addr != R200_CRTC_VLINE_CRNT_VLINE && addr != 0x0044) {
         r200_flush_at(s, R200_WHY_REG(addr));
     }
@@ -9933,10 +11293,18 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         return val;
     }
 
-    /* Handle indexed register access via MM_INDEX/MM_DATA */
-    if (addr == R200_MM_DATA && s->regs.mm_index) {
-        /* Recursive call with the indexed address */
-        return ppc_mac_gpu_mmio_read(s, s->regs.mm_index, size);
+    /* Indexed register or VRAM access, including subword data lanes. */
+    if (addr >= R200_MM_DATA && addr <= R200_MM_DATA + 3) {
+        if (s->regs.mm_index & BIT(31)) {
+            uint32_t index = (s->regs.mm_index & ~BIT(31)) + addr - R200_MM_DATA;
+            if (index <= s->vram_size - size) {
+                return ldn_le_p(memory_region_get_ram_ptr(&s->vram) + index, size);
+            }
+        } else if (s->regs.mm_index > R200_MM_DATA + 3 &&
+                   s->regs.mm_index + addr - R200_MM_DATA + size <= PPC_MAC_GPU_MMIO_SIZE) {
+            return ppc_mac_gpu_mmio_read(s, s->regs.mm_index + addr - R200_MM_DATA, size);
+        }
+        return 0;
     }
 
     switch (addr) {
@@ -9997,6 +11365,12 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         /* Report memory controller idle */
         val = R200_MC_IDLE;
         break;
+    case R200_MEM_SDRAM_MODE_REG:
+        /* Initialized SDRAM status, matching ati-vga's Radeon path. */
+        val = (1u << 28) | (1u << 20);
+        /* The native driver needs real byte registers, not Bochs NDRV EDID. */
+        s->edid_read_done = true;
+        break;
 
     /* Bus */
     case R200_BUS_CNTL:
@@ -10006,14 +11380,21 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         val = s->regs.host_path_cntl | (1 << 23); /* HDP_SOFT_RESET capable */
         break;
 
-    /* RBBM - report idle with 64 free FIFO entries */
+    /* FIFO capacity is independent of whether submitted drawing is idle. */
     case R200_RBBM_STATUS:
+    case R200_GUI_STAT:
         /* bits [6:0] = CMDFIFO_AVAIL (free entries)
          * bit 31 = GUI_ACTIVE (1=busy, 0=idle)
          * bits [30:7] = various pipeline busy flags
          * ATI kext checks GUI_ACTIVE to wait for idle */
-        val = 64; /* 64 free entries, GUI_ACTIVE=0 (idle) */
-        gpu_debug_log("STATUS_RD RBBM_STATUS -> 0x%08x (idle, %u free)", val, val & 0x7f);
+        val = 64;
+        if (async_status) {
+            r200_async_drain();
+            if (s->renderer->busy_r200(s->renderer_opaque)) {
+                val |= R200_RBBM_ACTIVE;
+            }
+        }
+        gpu_debug_log("STATUS_RD RBBM_STATUS -> 0x%08x (%u free)", val, val & 0x7f);
         {
             static int rbbm_read_count = 0;
             rbbm_read_count++;
@@ -10021,16 +11402,10 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
                 (rbbm_read_count <= 20 || rbbm_read_count % 1000 == 0)) {
                 qemu_log("[QE_GATE_READ] reg=0x%04x value=0x%08x "
                          "context=idle_poll sequence_id=%d "
-                         "note=RBBM_STATUS_always_idle\n",
+                         "note=RBBM_STATUS_capacity_and_busy\n",
                          (uint32_t)addr, val, rbbm_read_count);
             }
         }
-        break;
-
-    /* GUI status - report idle */
-    case R200_GUI_STAT:
-        val = 64; /* Free FIFO entries */
-        gpu_debug_log("STATUS_RD GUI_STAT -> 0x%08x", val);
         break;
 
     /*
@@ -10067,11 +11442,13 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         val = 0;
         break;
     /* CRTC */
-    case R200_CRTC_GEN_CNTL:
-        val = s->regs.crtc_gen_cntl;
+    case R200_CRTC_GEN_CNTL ... R200_CRTC_GEN_CNTL + 3:
+        val = ppc_mac_gpu_reg_read_offs(s->regs.crtc_gen_cntl,
+                                      addr - R200_CRTC_GEN_CNTL, size);
         break;
-    case R200_CRTC_EXT_CNTL:
-        val = s->regs.crtc_ext_cntl;
+    case R200_CRTC_EXT_CNTL ... R200_CRTC_EXT_CNTL + 3:
+        val = ppc_mac_gpu_reg_read_offs(s->regs.crtc_ext_cntl,
+                                      addr - R200_CRTC_EXT_CNTL, size);
         break;
     case R200_CRTC_STATUS:
         val = s->regs.crtc_status;
@@ -10132,8 +11509,9 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         break;
 
     /* DAC */
-    case R200_DAC_CNTL:
-        val = s->regs.dac_cntl;
+    case R200_DAC_CNTL ... R200_DAC_CNTL + 3:
+        val = ppc_mac_gpu_reg_read_offs(s->regs.dac_cntl,
+                                      addr - R200_DAC_CNTL, size);
         break;
     case R200_DAC_CNTL2:
         val = s->regs.dac_cntl2;
@@ -10150,25 +11528,28 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         break;
 
     /* Cursor */
-    case R200_CUR_OFFSET:
-        val = s->regs.cur_offset;
+    case R200_CUR_OFFSET ... R200_CUR_OFFSET + 3:
+        val = ppc_mac_gpu_reg_read_offs(s->regs.cur_offset, addr - R200_CUR_OFFSET, size);
         break;
-    case R200_CUR_HORZ_VERT_POSN:
-        val = s->regs.cur_horz_vert_posn;
+    case R200_CUR_HORZ_VERT_POSN ... R200_CUR_HORZ_VERT_POSN + 3:
+        val = ppc_mac_gpu_reg_read_offs(s->regs.cur_horz_vert_posn,
+                                      addr - R200_CUR_HORZ_VERT_POSN, size);
         break;
-    case R200_CUR_HORZ_VERT_OFF:
-        val = s->regs.cur_horz_vert_off;
+    case R200_CUR_HORZ_VERT_OFF ... R200_CUR_HORZ_VERT_OFF + 3:
+        val = ppc_mac_gpu_reg_read_offs(s->regs.cur_horz_vert_off,
+                                      addr - R200_CUR_HORZ_VERT_OFF, size);
         break;
-    case R200_CUR_CLR0:
-        val = s->regs.cur_clr0;
+    case R200_CUR_CLR0 ... R200_CUR_CLR0 + 3:
+        val = ppc_mac_gpu_reg_read_offs(s->regs.cur_clr0, addr - R200_CUR_CLR0, size);
         break;
-    case R200_CUR_CLR1:
-        val = s->regs.cur_clr1;
+    case R200_CUR_CLR1 ... R200_CUR_CLR1 + 3:
+        val = ppc_mac_gpu_reg_read_offs(s->regs.cur_clr1, addr - R200_CUR_CLR1, size);
         break;
 
     /* Surface */
-    case R200_SURFACE_CNTL:
-        val = s->regs.surface_cntl;
+    case R200_SURFACE_CNTL ... R200_SURFACE_CNTL + 3:
+        val = ppc_mac_gpu_reg_read_offs(s->regs.surface_cntl,
+                                      addr - R200_SURFACE_CNTL, size);
         break;
 
     /* Display */
@@ -10199,12 +11580,16 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         val = s->regs.agp_cntl;
         break;
 
-    /* Clock/PLL - stub with fixed values */
-    case R200_CLOCK_CNTL_INDEX:
-        val = s->regs.clock_cntl_index;
+    /* Clock/PLL - indexed register storage; clocks themselves are virtual. */
+    case R200_CLOCK_CNTL_INDEX ... R200_CLOCK_CNTL_INDEX + 3:
+        val = ppc_mac_gpu_reg_read_offs(s->regs.clock_cntl_index,
+                                      addr - R200_CLOCK_CNTL_INDEX, size);
         break;
-    case R200_CLOCK_CNTL_DATA:
-        val = s->regs.clock_cntl_data;
+    case R200_CLOCK_CNTL_DATA ... R200_CLOCK_CNTL_DATA + 3:
+        val = ppc_mac_gpu_reg_read_offs(s->r300 ?
+                                      s->regs.pll[s->regs.clock_cntl_index & 0x3f] :
+                                      s->regs.clock_cntl_data,
+                                      addr - R200_CLOCK_CNTL_DATA, size);
         break;
 
     /* 2D engine - read back state */
@@ -10323,6 +11708,10 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
             val = (mode == 2) ? top : (top | 0x40);
         }
         break;
+    case R300_CP_CSQ_AVAIL:
+        /* PIO packets are consumed synchronously: both queues have room. */
+        val = 64 | (64 << 16);
+        break;
     case R200_SCRATCH_UMSK:
         val = s->regs.scratch_umsk;
         break;
@@ -10343,6 +11732,26 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
          * continue initialization with an error (which is acceptable —
          * we're reverting to the 8500 kext anyway). */
         val = 0;
+        /*
+         * After a lazily handled WAIT_UNTIL the queue reads "not drained"
+         * until the GPU has finished, so a driver that drains the FIFO
+         * before touching VRAM from the CPU really waits for that.
+         */
+        if (s->csq_drain) {
+            bool busy = false;
+            r200_async_drain();
+            if (s->renderer && s->renderer->wait_busy_r200) {
+                /* a batch takes ~0.3 ms: one or two polls instead of hundreds */
+                busy = s->renderer->wait_busy_r200(s->renderer_opaque, 250);
+            } else if (s->renderer && s->renderer->busy_r200) {
+                busy = s->renderer->busy_r200(s->renderer_opaque);
+            }
+            if (busy) {
+                val = 0x00000100;       /* primary queue: rptr 0, wptr 1 */
+            } else {
+                s->csq_drain = false;
+            }
+        }
         break;
     case R200_CP_CSQ_IND_ADDR:
         val = 0;
@@ -10366,25 +11775,9 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         break;
 
     /* Wait/sync */
-    case R200_WAIT_UNTIL:
-        /*
-         * WAIT_UNTIL is write-to-trigger / read-for-completion.
-         *
-         * The kext writes a bitmask of conditions to wait for (e.g.
-         * WAIT_2D_IDLECLEAN, WAIT_HOST_IDLECLEAN, WAIT_DMA_IDLECLEAN),
-         * then polls the register until it reads back 0 (all conditions
-         * satisfied).  On real R200 hardware the GPU clears the bits
-         * once the corresponding pipeline stages become idle.
-         *
-         * In this emulation there is no asynchronous pipeline —
-         * command processing completes synchronously, and RBBM_STATUS
-         * already reports idle.  All wait conditions are therefore
-         * trivially satisfied by the time the guest reads back, so
-         * we always return 0.
-         *
-         * The written value is still latched in s->regs.wait_until
-         * for tracing/debug purposes.
-         */
+    case R200_WAIT_UNTIL ... R200_WAIT_UNTIL + 3:
+        /* The common read path finishes rendering before reporting completion.
+         * Idle-clean writes also finish it before subsequent CPU VRAM access. */
         val = 0;
         break;
     case R200_ISYNC_CNTL:
@@ -10405,7 +11798,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
     case R200_SCRATCH_REG0 ... R200_SCRATCH_REG5: {
         int scratch_idx = (addr - R200_SCRATCH_REG0) / 4;
         val = s->regs.scratch_reg[scratch_idx];
-        if (getenv("POWEREMU_FENCE_TRACE")) {
+        if (trace_flag(&g_fence_trace, "POWEREMU_FENCE_TRACE")) {
             static uint32_t last[6] = { 0xFFFFFFFF }; static int n;
             if (val != last[scratch_idx] && n++ < 40) {
                 last[scratch_idx] = val;
@@ -10779,6 +12172,9 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         fprintf(s->r3_dump, "R %04x %08x %s\n", (unsigned)addr, (uint32_t)val,
                 ppc_mac_gpu_reg_name(addr));
     }
+    if (tl_probe_reg(addr)) {
+        tl_log("rdv %03x=%08x", (unsigned)addr, (uint32_t)val);
+    }
     return val;
 }
 
@@ -10846,6 +12242,9 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     if (addr >= 0x780 && addr < 0x7C0) {
         seq_log("DMA  wr reg=%03x val=%08x", (unsigned)addr, (uint32_t)val);
     }
+    if (tl_probe_reg(addr)) {
+        tl_log("wrv %03x=%08x", (unsigned)addr, (uint32_t)val);
+    }
     /* No flush here: CPU-side 2D operations check their own VRAM ranges
      * (r200_vram_access), fences complete asynchronously, and the other
      * registers do not touch VRAM. */
@@ -10878,6 +12277,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     }
     if (s->r300 && addr >= 0x0B00 && addr < 0x0B80) {
         s->r300_surf[(addr - 0x0B00) / 4] = val;   /* SURFACEn bounds/info */
+        r300_ap0_update(s);
         if (addr == 0x0B0C) {
             r300_surface_changed(s);
             r300_surfwatch_update(s);
@@ -10887,22 +12287,49 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         s->r300_aic_pt_base = val & ~0xFFFu;    /* PCI GART table base */
         r200_agp_tc_flush();
     }
-    if (unlikely(s->r3_dump && s->r3->draws && s->r3_trace_lines < 40000)) {
+    if (unlikely(s->r3_dump && s->r3_trace_lines < 40000)) {
         const char *nm = r300_state_owns(addr) ? r300_reg_name(addr) : NULL;
         s->r3_trace_lines++;
         fprintf(s->r3_dump, "W %04x %08x %s%s\n", (unsigned)addr, (uint32_t)val,
                 nm ? nm : ppc_mac_gpu_reg_name(addr), r200_in_pm4 ? "" : " (mmio)");
     }
 
-    /* Handle indexed register access */
-    if (addr == R200_MM_DATA && s->regs.mm_index) {
-        ppc_mac_gpu_mmio_write(s, s->regs.mm_index, val, size);
+    if (s->r300 && s->edid_read_done && addr >= 0x400 && addr + size <= 0x500) {
+        ppc_mac_gpu_reg_write_offs(&s->regs.ov0[OV0(addr & ~3u)], addr & 3, val, size);
+        if (!(s->regs.ov0[OV0(0x410)] & 1)) {
+            memcpy(s->regs.ov0_active, s->regs.ov0, sizeof(s->regs.ov0));
+            s->scanout_dirty_valid = false;
+            s->scanout_generation_valid = false;
+            dpy_refresh_soon(s->con);
+        }
+        return;
+    }
+    if (s->r300 && addr >= 0xd20 && addr + size <= 0xd38) {
+        ppc_mac_gpu_reg_write_offs(&s->regs.ov0_transform[(addr - 0xd20) / 4],
+                                  addr & 3, val, size);
+        s->scanout_dirty_valid = false;
+        s->scanout_generation_valid = false;
+        return;
+    }
+
+    /* Indexed register or VRAM access, including subword data lanes. */
+    if (addr >= R200_MM_DATA && addr <= R200_MM_DATA + 3) {
+        if (s->regs.mm_index & BIT(31)) {
+            uint32_t index = (s->regs.mm_index & ~BIT(31)) + addr - R200_MM_DATA;
+            if (index <= s->vram_size - size) {
+                stn_le_p(memory_region_get_ram_ptr(&s->vram) + index, size, val);
+                memory_region_set_dirty(&s->vram, index, size);
+            }
+        } else if (s->regs.mm_index > R200_MM_DATA + 3 &&
+                   s->regs.mm_index + addr - R200_MM_DATA + size <= PPC_MAC_GPU_MMIO_SIZE) {
+            ppc_mac_gpu_mmio_write(s, s->regs.mm_index + addr - R200_MM_DATA, val, size);
+        }
         return;
     }
 
     switch (addr) {
     case R200_MM_INDEX:
-        s->regs.mm_index = val & 0xFFFF;
+        s->regs.mm_index = val & ~3u;
         break;
 
     /* BIOS scratch */
@@ -10913,18 +12340,13 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     /* Interrupt */
     case R200_GEN_INT_CNTL:
         s->regs.gen_int_cntl = val;
-        if (val & R200_CRTC_VBLANK_INT) {
-            /* Enable VBlank timer */
-            timer_mod(&s->vblank_timer,
-                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                      NANOSECONDS_PER_SECOND / 60);
-        } else {
-            timer_del(&s->vblank_timer);
-        }
+        tl_log("int_cntl 0x%x", (unsigned)val);
+        /* The frame timer runs regardless (see ppc_mac_gpu_reset). */
         ppc_mac_gpu_update_irq(s);
         break;
     case R200_GEN_INT_STATUS:
         /* Writing 1 to a bit acknowledges/clears it */
+        tl_log("int_ack 0x%x status 0x%x", (unsigned)val, s->regs.gen_int_status);
         s->regs.gen_int_status &= ~val;
         ppc_mac_gpu_update_irq(s);
         break;
@@ -10959,8 +12381,20 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
 
     /* Surface */
-    case R200_SURFACE_CNTL:
-        s->regs.surface_cntl = val;
+    case R200_SURFACE_CNTL ... R200_SURFACE_CNTL + 3:
+        ppc_mac_gpu_reg_write_offs(&s->regs.surface_cntl,
+                                 addr - R200_SURFACE_CNTL, val, size);
+        if (s->r300) {
+            /* A native Radeon driver has taken over from the NDRV framebuffer. */
+            if (!s->r300_card_bytes) {
+                s->r300_src_swap = s->r300_shadow[0x15D4 / 4] & 3;
+            }
+            s->r300_card_bytes = s->r3->card_bytes = true;
+            s->display_invalid = true;
+            /* The shadow holds byte-swapped rows the generations cannot see. */
+            s->scanout_generation_valid = false;
+            r300_ap0_update(s);
+        }
         break;
 
     /*
@@ -11017,12 +12451,15 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
 
     /* CRTC */
-    case R200_CRTC_GEN_CNTL:
-        s->regs.crtc_gen_cntl = val;
+    case R200_CRTC_GEN_CNTL ... R200_CRTC_GEN_CNTL + 3:
+        ppc_mac_gpu_reg_write_offs(&s->regs.crtc_gen_cntl,
+                                 addr - R200_CRTC_GEN_CNTL, val, size);
+        ppc_mac_gpu_radeon_cursor(s, true);
         s->display_invalid = true;
         break;
-    case R200_CRTC_EXT_CNTL:
-        s->regs.crtc_ext_cntl = val;
+    case R200_CRTC_EXT_CNTL ... R200_CRTC_EXT_CNTL + 3:
+        ppc_mac_gpu_reg_write_offs(&s->regs.crtc_ext_cntl,
+                                 addr - R200_CRTC_EXT_CNTL, val, size);
         s->display_invalid = true;
         break;
     case R200_CRTC_H_TOTAL_DISP:
@@ -11040,6 +12477,14 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         s->regs.crtc_v_sync_strt_wid = val;
         break;
     case R200_CRTC_OFFSET:
+        /*
+         * Bits 2:0 are hardwired to 0 (QEMU 11 ati-vga 4bbe831f; the X.org
+         * radeon driver: "3 lower bits are always 0").  Bits 31:30 are
+         * OFFSET_LOCK / GUI_TRIG_OFFSET, not address: Linux sets the lock
+         * around every page flip, which used to push the scanout past VRAM.
+         * ponytail: the lock is not modelled, so bit 31 reads back 0.
+         */
+        val &= 0x3FFFFFF8;
         if (s->rv250) {
             val &= ~R200_CRTC_OFFSET_BIAS;
         }
@@ -11047,6 +12492,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
             blit_path_log("CRTC", "OFFSET changed 0x%x -> 0x%x",
                           s->regs.crtc_offset, val);
             r200_rate.flips++;             /* page flip: one frame */
+            tl_log("flip 0x%x", (unsigned)val);
             r200_perf_present();
             /*
              * A flip is the frame boundary the guest itself defines: go
@@ -11087,8 +12533,9 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
 
     /* DAC */
-    case R200_DAC_CNTL:
-        s->regs.dac_cntl = val;
+    case R200_DAC_CNTL ... R200_DAC_CNTL + 3:
+        ppc_mac_gpu_reg_write_offs(&s->regs.dac_cntl,
+                                 addr - R200_DAC_CNTL, val, size);
         break;
     case R200_DAC_CNTL2:
         s->regs.dac_cntl2 = val;
@@ -11106,20 +12553,29 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
 
     /* Cursor */
-    case R200_CUR_OFFSET:
-        s->regs.cur_offset = val;
+    case R200_CUR_OFFSET ... R200_CUR_OFFSET + 3:
+        ppc_mac_gpu_reg_write_offs(&s->regs.cur_offset, addr - R200_CUR_OFFSET, val, size);
+        ppc_mac_gpu_radeon_cursor(s, true);
         break;
-    case R200_CUR_HORZ_VERT_POSN:
-        s->regs.cur_horz_vert_posn = val;
+    case R200_CUR_HORZ_VERT_POSN ... R200_CUR_HORZ_VERT_POSN + 3: {
+        bool locked = s->regs.cur_horz_vert_posn & (1u << 31);
+        ppc_mac_gpu_reg_write_offs(&s->regs.cur_horz_vert_posn,
+                                 addr - R200_CUR_HORZ_VERT_POSN, val, size);
+        ppc_mac_gpu_radeon_cursor(s, locked);
         break;
-    case R200_CUR_HORZ_VERT_OFF:
-        s->regs.cur_horz_vert_off = val;
+    }
+    case R200_CUR_HORZ_VERT_OFF ... R200_CUR_HORZ_VERT_OFF + 3:
+        ppc_mac_gpu_reg_write_offs(&s->regs.cur_horz_vert_off,
+                                 addr - R200_CUR_HORZ_VERT_OFF, val, size);
+        ppc_mac_gpu_radeon_cursor(s, true);
         break;
-    case R200_CUR_CLR0:
-        s->regs.cur_clr0 = val;
+    case R200_CUR_CLR0 ... R200_CUR_CLR0 + 3:
+        ppc_mac_gpu_reg_write_offs(&s->regs.cur_clr0, addr - R200_CUR_CLR0, val, size);
+        ppc_mac_gpu_radeon_cursor(s, true);
         break;
-    case R200_CUR_CLR1:
-        s->regs.cur_clr1 = val;
+    case R200_CUR_CLR1 ... R200_CUR_CLR1 + 3:
+        ppc_mac_gpu_reg_write_offs(&s->regs.cur_clr1, addr - R200_CUR_CLR1, val, size);
+        ppc_mac_gpu_radeon_cursor(s, true);
         break;
 
     /* Display */
@@ -11151,12 +12607,22 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
 
     /* Clock/PLL - accept writes but don't actually change clocks */
-    case R200_CLOCK_CNTL_INDEX:
-        s->regs.clock_cntl_index = val;
+    case R200_CLOCK_CNTL_INDEX ... R200_CLOCK_CNTL_INDEX + 3:
+        ppc_mac_gpu_reg_write_offs(&s->regs.clock_cntl_index,
+                                 addr - R200_CLOCK_CNTL_INDEX, val, size);
         break;
-    case R200_CLOCK_CNTL_DATA:
-        s->regs.clock_cntl_data = val;
+    case R200_CLOCK_CNTL_DATA ... R200_CLOCK_CNTL_DATA + 3: {
+        uint32_t index = s->regs.clock_cntl_index & 0x3f;
+        uint32_t *data = s->r300 ? &s->regs.pll[index] : &s->regs.clock_cntl_data;
+        if (!s->r300 || (s->regs.clock_cntl_index & BIT(7))) {
+            ppc_mac_gpu_reg_write_offs(data, addr - R200_CLOCK_CNTL_DATA, val, size);
+            /* PPLL/P2PLL atomic divider updates complete synchronously. */
+            if (s->r300 && (index == 3 || index == 0x2b)) {
+                *data &= ~BIT(15);
+            }
+        }
         break;
+    }
 
     /* 2D engine registers - store state */
     case R200_SRC_PITCH_OFFSET:
@@ -11166,6 +12632,9 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
             uint32_t spo_base  = (val & 0x3FFFFF) << 10;
             uint32_t spo_pitch = (val & 0x3FC00000) >> 16;
             bool spo_macro     = (val >> 30) & 1;
+            if (s->r300) {
+                r300_to_vram(s, &spo_base, 0);
+            }
             if (spo_macro && spo_base > 0 && spo_pitch > 0) {
                 mc_register_tiled_surface(s, spo_base, spo_pitch, "SRC_PO");
             }
@@ -11178,6 +12647,9 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
             uint32_t dpo_base  = (val & 0x3FFFFF) << 10;
             uint32_t dpo_pitch = (val & 0x3FC00000) >> 16;
             bool dpo_macro     = (val >> 30) & 1;
+            if (s->r300) {
+                r300_to_vram(s, &dpo_base, 0);
+            }
             if (dpo_macro && dpo_base > 0 && dpo_pitch > 0) {
                 mc_register_tiled_surface(s, dpo_base, dpo_pitch, "DST_PO");
             }
@@ -11244,6 +12716,9 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     }
     case R200_DP_GUI_MASTER_CNTL:
         s->regs.dp_gui_master_cntl = val;
+        s->regs.dp_datatype = (val & 0x0F00) >> 8 |
+                             (val & 0x30F0) << 4 | (val & 0x4000) << 16;
+        s->regs.dp_mix = (val & 0x00FF0000) | (val & 0x07000000) >> 16;
         break;
     case R200_DP_BRUSH_FRGD_CLR:
         s->regs.dp_brush_frgd_clr = val;
@@ -11265,12 +12740,20 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
     case R200_DP_DATATYPE:
         s->regs.dp_datatype = val;
-        /* DP_DATATYPE and DP_GUI_MASTER_CNTL share the dst datatype. */
-        s->regs.dp_gui_master_cntl = (s->regs.dp_gui_master_cntl & ~0xF00u) |
-                                     ((val & 0xF) << 8);
+        /*
+         * DP_GUI_MASTER_CNTL reads alias the DP_DATATYPE fields (QEMU 11
+         * ati-vga 5c531f80): the inverse of the split done on a GMC write --
+         * dst 3:0 -> 11:8, brush 11:8 -> 7:4, src 17:16 -> 13:12,
+         * byte_pix_order 30 -> 14.
+         */
+        s->regs.dp_gui_master_cntl = (s->regs.dp_gui_master_cntl & ~0x7FF0u) |
+                                     (val & 0xF) << 8 | (val & 0xF00) >> 4 |
+                                     (val & 0x30000) >> 4 | (val & BIT(30)) >> 16;
         break;
     case R200_DP_MIX:
         s->regs.dp_mix = val;
+        s->regs.dp_gui_master_cntl = (s->regs.dp_gui_master_cntl & ~0x07FF0000u) |
+                                     (val & 0x00FF0000) | (val & 0x0700) << 16;
         break;
     case R200_SC_TOP_LEFT:
         s->regs.sc_top_left = val;
@@ -11439,13 +12922,35 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
 
     /* Wait/sync */
-    case R200_WAIT_UNTIL:
-        /* Writing WAIT_UNTIL on real hardware causes the CP to stall until
-         * the specified conditions are met. Since we execute everything
-         * synchronously, all conditions are always met instantly.
-         * Store 0 to indicate all waits satisfied (not the pending mask). */
+    case R200_WAIT_UNTIL ... R200_WAIT_UNTIL + 3: {
+        uint32_t conditions = (uint32_t)val << (8 * (addr - R200_WAIT_UNTIL));
+        /* WAIT_2D_IDLECLEAN, WAIT_3D_IDLECLEAN and WAIT_HOST_IDLECLEAN are
+         * write-side barriers, including when issued by a PM4 type-0 packet.
+         * An older asynchronous draw must not overwrite later CPU stores. */
+        if (conditions & (BIT(16) | BIT(17) | BIT(18))) {
+            if (s->renderer && s->renderer->submit_r200 && r200_lazy_wait_until()) {
+                /*
+                 * A WAIT_UNTIL stalls the CP, not the CPU: on the card the
+                 * write is queued (registers 0x1400-0x1eff go through the
+                 * command FIFO) and later packets wait behind it.  Our
+                 * engines run in order, CPU-side 2D ops check for
+                 * overlapping GPU work (r200_vram_access), and the idle
+                 * polls (RBBM_STATUS, and CP_CSQ_STAT after this) report
+                 * busy until everything has finished, so start the queued
+                 * drawing now and let the guest carry on.  MorphOS emits
+                 * hundreds of these a second, in the stream while
+                 * compositing and by MMIO while painting the desktop;
+                 * waiting for the GPU on each cost most of the frame time.
+                 */
+                s->renderer->submit_r200(s->renderer_opaque, NULL, NULL);
+                s->csq_drain = true;
+            } else {
+                r200_flush_at(s, R200_WHY_REG(R200_WAIT_UNTIL));
+            }
+        }
         s->regs.wait_until = 0;
         break;
+    }
     case R200_ISYNC_CNTL:
         s->regs.isync_cntl = val;
         break;
@@ -11725,9 +13230,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
             break;
         }
 
-        /* VAP/TCL and RBBM registers below 0x1C00 — store for readback.
-         * 0x15C0 = VAP_OUTPUT_VTX_FMT_0, 0x15CC = VAP_VTX_STATE_CNTL,
-         * 0x1700 = RBBM_GUICNTL, 0x1704 = SE_TCL_TEX_PROC_CTL_0 */
+        /* Accept other low register writes used by the kext. */
         if (addr == 0x15C0 || addr == 0x15CC ||
             addr == 0x1700 || addr == 0x1704) {
             break;
@@ -11754,6 +13257,7 @@ static uint64_t ppc_mac_gpu_mmio_read_guest(void *opaque, hwaddr addr,
         !(addr >= PPC_MAC_GPU_HWC_BASE && addr < PPC_MAC_GPU_HWC_END)) {
         ppc_mac_gpu_cp_sync(s, addr);
     }
+    ppc_mac_gpu_csq_ring_drain(s);
     return ppc_mac_gpu_mmio_read(opaque, addr, size);
 }
 
@@ -11766,6 +13270,7 @@ static void ppc_mac_gpu_mmio_write_guest(void *opaque, hwaddr addr,
         !(addr >= PPC_MAC_GPU_HWC_BASE && addr < PPC_MAC_GPU_HWC_END)) {
         ppc_mac_gpu_cp_sync(s, addr);
     }
+    ppc_mac_gpu_csq_ring_drain(s);
     ppc_mac_gpu_mmio_write(opaque, addr, val, size);
 }
 
@@ -11893,15 +13398,15 @@ static void ppc_mac_gpu_vram_bswap_write(void *opaque, hwaddr addr,
 /*
  * R300 aperture 1.  A Radeon's frame-buffer BAR holds two apertures onto
  * the same VRAM, each with its own CPU byte swap: SURFACE_CNTL.NONSURF_APn_SWP,
- * or SURFACEn_INFO.SURF_APn_SWP inside a surface's bounds.  VRAM here holds
- * what the CPU sees through aperture 0 with its 32-bit swap (mode 2), so an
- * aperture 1 access is converted from that view.  Apple's GL driver reads
+ * or SURFACEn_INFO.SURF_APn_SWP inside a surface's bounds.  Native VRAM holds
+ * card bytes; the legacy NDRV view additionally reverses each DWORD.
+ * Apple's GL driver reads
  * the depth buffer back (glReadPixels, e.g. Chess's mouse picking) through
  * aperture 1 with a surface that sets its swap.
  */
 static unsigned r300_ap_swap(PPCMacGPUState *s, uint32_t off, int ap)
 {
-    for (int n = 0; n < 8; n++) {
+    for (int n = 0; n < 8 && !(s->regs.surface_cntl & (1u << 8)); n++) {
         uint32_t info = s->r300_surf[3 + 4 * n];
         uint32_t lo = s->r300_surf[1 + 4 * n], hi = s->r300_surf[2 + 4 * n];
         if ((lo || hi) && off >= lo && off <= hi) {
@@ -11921,6 +13426,64 @@ static void r300_permute(uint8_t b[4], unsigned mode)
     default: break;
     }
 }
+
+static void r300_ap0_update(PPCMacGPUState *s)
+{
+    bool swap = s->r300_card_bytes && ((s->regs.surface_cntl >> 20) & 3);
+
+    if (s->r300_card_bytes && !(s->regs.surface_cntl & (1u << 8))) {
+        for (int n = 0; n < 8; n++) {
+            uint32_t lo = s->r300_surf[1 + 4 * n];
+            uint32_t hi = s->r300_surf[2 + 4 * n];
+            swap |= hi >= lo && hi < s->vram_size && (lo || hi) &&
+                    ((s->r300_surf[3 + 4 * n] >> 20) & 3);
+        }
+    }
+    memory_region_set_enabled(&s->vram_ap0, swap);
+}
+
+static uint64_t r300_ap0_read(void *opaque, hwaddr addr, unsigned size)
+{
+    PPCMacGPUState *s = opaque;
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint64_t value = 0;
+
+    ppc_mac_gpu_cp_sync(s, 0xFFFFFFFF);
+    r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
+    if (addr + size > s->vram_size) return 0;
+    for (unsigned i = 0; i < size; i++) {
+        hwaddr a = addr + i;
+        unsigned mode = r300_ap_swap(s, a & ~3u, 0);
+        unsigned lane = mode == 1 ? 1 : mode == 2 ? 3 : mode == 3 ? 2 : 0;
+        value = (value << 8) | vram[a ^ lane];
+    }
+    return value;
+}
+
+static void r300_ap0_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
+{
+    PPCMacGPUState *s = opaque;
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+
+    if (addr + size > s->vram_size) return;
+    r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
+    for (unsigned i = 0; i < size; i++) {
+        hwaddr a = addr + i;
+        unsigned mode = r300_ap_swap(s, a & ~3u, 0);
+        unsigned lane = mode == 1 ? 1 : mode == 2 ? 3 : mode == 3 ? 2 : 0;
+        vram[a ^ lane] = value >> (8 * (size - 1 - i));
+    }
+    memory_region_set_dirty(&s->vram, addr & ~3u,
+                            MIN((hwaddr)8, s->vram_size - (addr & ~3u)));
+}
+
+static const MemoryRegionOps r300_ap0_ops = {
+    .read = r300_ap0_read,
+    .write = r300_ap0_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
 
 static void r300_ap1_note(PPCMacGPUState *s, hwaddr off, bool wr, unsigned m)
 {
@@ -11947,7 +13510,7 @@ static uint64_t r300_ap1_read(void *opaque, hwaddr addr, unsigned size)
     r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
     unsigned m = r300_ap_swap(s, base, 1);
     memcpy(b, vram + base, 4);
-    r300_permute(b, 2);                 /* aperture 0 view -> card's bytes */
+    if (!s->r300_card_bytes) r300_permute(b, 2); /* legacy CPU view */
     r300_permute(b, m);                 /* -> aperture 1 view */
     for (unsigned i = 0; i < size && (addr & 3) + i < 4; i++) {
         v = (v << 8) | b[(addr & 3) + i];
@@ -11970,13 +13533,13 @@ static void r300_ap1_write(void *opaque, hwaddr addr, uint64_t val,
     r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
     unsigned m = r300_ap_swap(s, base, 1);
     memcpy(b, vram + base, 4);
-    r300_permute(b, 2);
+    if (!s->r300_card_bytes) r300_permute(b, 2);
     r300_permute(b, m);
     for (unsigned i = 0; i < size && (addr & 3) + i < 4; i++) {
         b[(addr & 3) + i] = val >> (8 * (size - 1 - i));
     }
     r300_permute(b, m);
-    r300_permute(b, 2);
+    if (!s->r300_card_bytes) r300_permute(b, 2);
     memcpy(vram + base, b, 4);
     memory_region_set_dirty(&s->vram, base, 4);
     r300_ap1_note(s, addr, true, m);
@@ -12196,6 +13759,9 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
     PPCMacGPUState *s = PPC_MAC_GPU(dev);
 
     cp.epoch++;                 /* a CP thread mid-ring drops what it has */
+    qemu_spin_lock(&s->csq_ring_lock);
+    s->csq_ring_tail = s->csq_ring_count = 0;
+    qemu_spin_unlock(&s->csq_ring_lock);
     memset(&s->regs, 0, sizeof(s->regs));
     s->hwc_w = s->hwc_h = s->hwc_idx = 0;
     s->regs.regs_3d[R200_3D_IDX(0x3230)] = 0xFFFFFFFFu;  /* DEPTHCLEARVALUE */
@@ -12267,7 +13833,8 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
 
     s->mode = PPC_MAC_GPU_MODE_EXT;
     s->display_invalid = true;
-    s->scanout_dirty_valid = false;   /* next copy is a whole frame */
+    s->scanout_dirty_valid = false;
+    s->scanout_generation_valid = false;   /* next copy is a whole frame */
 
     /*
      * State kept outside the register file must come back to what realize
@@ -12276,6 +13843,12 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
      * screen would keep that OS's stride override and tiled surfaces.
      */
     s->edid_read_done = false;
+    s->r300_card_bytes = false;
+    s->r300_cursor_dirty = false;
+    if (s->r3) {
+        s->r3->card_bytes = false;
+        memory_region_set_enabled(&s->vram_ap0, false);
+    }
     s->disp_stride_override_active = false;
     s->disp_stride_override_value = 0;
     s->host_data_active = false;
@@ -12286,7 +13859,13 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
     s->metal_rt_count = 0;
     s->vb_count = 0;
 
-    timer_del(&s->vblank_timer);
+    /*
+     * The frame timer always runs: as on the card, the CRTC status bits in
+     * GEN_INT_STATUS are set every frame whether or not their interrupts are
+     * enabled, and MorphOS's driver polls them with the enables clear.
+     */
+    timer_mod(&s->vblank_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + NANOSECONDS_PER_SECOND / 60);
 }
 
 /*
@@ -12300,6 +13879,16 @@ static void ppc_mac_gpu_vram_dirty(void *arg, unsigned long *bitmap,
 {
     PPCMacGPUState *s = arg;
     const uint64_t pg = PPC_MAC_GPU_DIRTY_PAGE, chunk = 256 * pg;
+
+    /*
+     * The renderer asks before every draw.  Snapshotting and clearing the
+     * log of all of VRAM costs an allocation, a bitmap copy and a TLB
+     * walk each time; a scan for any set bit is a fraction of that and is
+     * all that is needed when nothing was written, the common case.
+     */
+    if (!memory_region_get_dirty(&s->vram, 0, s->vram_size, DIRTY_MEMORY_VGA)) {
+        return;
+    }
     DirtyBitmapSnapshot *snap =
         memory_region_snapshot_and_clear_dirty(&s->vram, 0, s->vram_size,
                                                DIRTY_MEMORY_VGA);
@@ -12332,6 +13921,7 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
         const char *dump = getenv("R300_DUMP");
 
         s->r3 = g_new0(R300State, 1);
+        s->r3->morphos_color_compat = s->morphos_color_compat;
         s->r3_dump = dump ? fopen(dump, "w") : NULL;
         if (s->r3_dump) {
             setvbuf(s->r3_dump, NULL, _IOLBF, 0);
@@ -12440,6 +14030,10 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
         memory_region_init(&s->vram_bar, obj, "ppc-mac-gpu-vram-bar",
                            2 * s->vram_size);
         memory_region_add_subregion(&s->vram_bar, 0, &s->vram);
+        memory_region_init_io(&s->vram_ap0, obj, &r300_ap0_ops, s,
+                              "ppc-mac-gpu-vram-ap0", s->vram_size);
+        memory_region_set_enabled(&s->vram_ap0, false);
+        memory_region_add_subregion_overlap(&s->vram_bar, 0, &s->vram_ap0, 1);
         memory_region_init_io(&s->vram_ap1, obj, &r300_ap1_ops, s,
                               "ppc-mac-gpu-vram-ap1", s->vram_size);
         memory_region_add_subregion(&s->vram_bar, s->vram_size, &s->vram_ap1);
@@ -12456,6 +14050,7 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
     pci_register_bar(dev, PPC_MAC_GPU_MMIO_BAR,
                      PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
     ppc_mac_gpu_cp_start(s);
+    ppc_mac_gpu_csq_ring_start(s);
 
     /* BAR1: I/O space alias to first 256 bytes of MMIO */
     memory_region_init_alias(&s->io, obj, "ppc-mac-gpu-io",
@@ -12528,6 +14123,47 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
         bitbang_i2c_init(&s->bbi2c, i2cbus);
         I2CSlave *i2cddc = I2C_SLAVE(qdev_new(TYPE_I2CDDC));
         i2c_slave_set_address(i2cddc, 0x50);
+        /* MorphOS reads this EDID over DDC and picks its screen mode from
+         * it; QEMU's generator prefers 1280x800 unless told otherwise. */
+        if (s->edid_width && s->edid_height) {
+            qdev_prop_set_uint32(DEVICE(i2cddc), "xres", s->edid_width);
+            qdev_prop_set_uint32(DEVICE(i2cddc), "yres", s->edid_height);
+            qdev_prop_set_uint32(DEVICE(i2cddc), "xmax", s->edid_width);
+            qdev_prop_set_uint32(DEVICE(i2cddc), "ymax", s->edid_height);
+            if (s->edid_hz) {
+                /* milli-Hz, as edid_info.refresh_rate counts them */
+                qdev_prop_set_uint32(DEVICE(i2cddc), "refresh_rate", s->edid_hz * 1000);
+            }
+            /* i2c-ddc builds its EDID in instance_init, before properties. */
+            qemu_edid_generate(I2CDDC(i2cddc)->edid_blob,
+                               sizeof(I2CDDC(i2cddc)->edid_blob),
+                               &I2CDDC(i2cddc)->edid_info);
+            /*
+             * QEMU's EDID says "digital"; MorphOS then caps modes at the
+             * 165 MHz of single-link DVI (1920x1080 passes, 2560x1440 at
+             * 241 MHz does not).  The card's DDC is on its VGA port, so
+             * describe an analog monitor and the 400 MHz DAC limit applies.
+             */
+            {
+                uint8_t *blob = I2CDDC(i2cddc)->edid_blob;
+                uint8_t sum = 0;
+                blob[20] = 0x0e;    /* analog, 0.7/0.3 V, separate syncs */
+                /* Monitor range limits: let MorphOS offer up to 160 Hz
+                 * (vertical 50-160 Hz, horizontal 30-255 kHz). */
+                for (int d = 54; d <= 108; d += 18) {
+                    if (blob[d] == 0 && blob[d + 1] == 0 && blob[d + 3] == 0xfd) {
+                        blob[d + 5] = 50;
+                        blob[d + 6] = 160;
+                        blob[d + 7] = 30;
+                        blob[d + 8] = 255;
+                    }
+                }
+                for (int i = 0; i < 127; i++) {
+                    sum += blob[i];
+                }
+                blob[127] = (uint8_t)-sum;
+            }
+        }
         qdev_realize_and_unref(DEVICE(i2cddc), BUS(i2cbus), &error_abort);
     }
 
@@ -12614,19 +14250,33 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
         e[50] = 0x01; e[51] = 0x01;
         e[52] = 0x01; e[53] = 0x01;
 
-        /* Detailed Timing Descriptor #1: 1024x768@60Hz (preferred) */
-        /* Pixel clock: 65.00 MHz = 6500 in 10kHz units */
-        e[54] = 0x64; e[55] = 0x19; /* pixel clock low/high (6500 = 0x1964) */
-        e[56] = 0x00; /* H active low 8 bits (1024 & 0xFF = 0x00) */
-        e[57] = 0x18; /* H blanking low 8 bits (280 & 0xFF = 0x18) */
-        e[58] = 0x41; /* H active high:H blanking high (4:1) → (1024>>8)<<4 | (280>>8) = 0x41 */
-        e[59] = 0x00; /* V active low 8 bits (768 & 0xFF = 0x00) */
-        e[60] = 0x23; /* V blanking low 8 bits (35 & 0xFF = 0x23) */
-        e[61] = 0x30; /* V active high:V blanking high → (768>>8)<<4 | (35>>8) = 0x30 */
-        e[62] = 0x18; /* H sync offset low (24) */
-        e[63] = 0x88; /* H sync width low (136) */
-        e[64] = 0x36; /* V sync offset(3):V sync width(6) */
-        e[65] = 0x00; /* HS offset hi:HS width hi:VS offset hi:VS width hi */
+        /*
+         * Detailed Timing Descriptor #1: the preferred mode, 1024x768@60 by
+         * default (edid-width/edid-height choose another, e.g. 2560x1440 for
+         * MorphOS on a QHD monitor).  Timings are CVT reduced blanking:
+         * 160-pixel horizontal blank (48 front porch, 32 sync, 80 back
+         * porch) and a vertical blank of about 460 us; the emulated CRTC only
+         * needs them consistent, and the pixel clock in 10 kHz units must fit
+         * in 16 bits (so up to ~650 MHz).
+         */
+        {
+            uint32_t hact = s->edid_width ? s->edid_width : 1024;
+            uint32_t vact = s->edid_height ? s->edid_height : 768;
+            uint32_t hblank = 160, vblank = MAX(16u, (vact * 285 + 5000) / 10000);
+            uint32_t clock_10khz = (uint64_t)(hact + hblank) * (vact + vblank) * 60 / 10000;
+
+            e[54] = clock_10khz & 0xFF; e[55] = clock_10khz >> 8;
+            e[56] = hact & 0xFF;
+            e[57] = hblank & 0xFF;
+            e[58] = ((hact >> 8) << 4) | (hblank >> 8);
+            e[59] = vact & 0xFF;
+            e[60] = vblank & 0xFF;
+            e[61] = ((vact >> 8) << 4) | (vblank >> 8);
+            e[62] = 48;   /* H sync offset */
+            e[63] = 32;   /* H sync width */
+            e[64] = 0x35; /* V sync offset 3, width 5 */
+            e[65] = 0x00; /* HS offset hi:HS width hi:VS offset hi:VS width hi */
+        }
         e[66] = 0x30; /* H image size low (304mm, low 8 bits) */
         e[67] = 0xE4; /* V image size low (228mm, low 8 bits) */
         e[68] = 0x10; /* H/V image size upper */
@@ -12651,7 +14301,7 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
         e[95] = 50;   /* min V freq */
         e[96] = 75;   /* max V freq */
         e[97] = 30;   /* min H freq (kHz) */
-        e[98] = 81;   /* max H freq (kHz) */
+        e[98] = 160;  /* max H freq (kHz): 2560x1440@60 needs 89 */
         e[99] = 140;  /* max pixel clock / 10 MHz */
         e[100] = 0x00; /* no GTF */
         /* Pad with 0x0A, 0x20 */
@@ -12726,9 +14376,8 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
                 s->renderer = NULL;
             }
         }
-        if (!s->renderer)
 #endif
-        {
+        if (!s->renderer) {
             s->renderer = ppc_mac_gpu_renderer_sw();
             s->renderer_opaque = s->renderer->init(vram_ptr, s->vram_size);
             qemu_log("ppc-mac-gpu: using software renderer (3D textured quad)\n");
@@ -12832,8 +14481,10 @@ static void ppc_mac_gpu_exit(PCIDevice *dev)
 
     ppc_mac_gpu_cp_stop();
     timer_del(&s->vblank_timer);
-    g_free(s->shadow_buf);
-    s->shadow_buf = NULL;
+    ppc_mac_gpu_shadow_free(s);
+    g_free(s->ov0_cache);
+    s->ov0_cache = NULL;
+    s->ov0_cache_pixels = 0;
     g_free(s->draw_verts);
     s->draw_verts = NULL;
     s->draw_verts_cap = 0;
@@ -12850,8 +14501,13 @@ static void ppc_mac_gpu_exit(PCIDevice *dev)
 static const Property ppc_mac_gpu_properties[] = {
     DEFINE_PROP_UINT32("vgamem_mb", PPCMacGPUState, vram_size_mb, 128),
     DEFINE_PROP_BOOL("host-aspect-modes", PPCMacGPUState, host_aspect_modes, false),
+    DEFINE_PROP_UINT32("edid-width", PPCMacGPUState, edid_width, 0),
+    DEFINE_PROP_UINT32("edid-height", PPCMacGPUState, edid_height, 0),
+    DEFINE_PROP_UINT32("edid-hz", PPCMacGPUState, edid_hz, 0),
+    DEFINE_PROP_UINT32("vblank-hz", PPCMacGPUState, vblank_hz, 0),
     DEFINE_PROP_STRING("biosrom", PPCMacGPUState, biosrom),
     DEFINE_PROP_STRING("renderer", PPCMacGPUState, renderer_name),
+    DEFINE_PROP_BOOL("morphos-color-compat", PPCMacGPUState, morphos_color_compat, false),
 };
 
 /* Read-only "perf": the running totals behind PowerEmu's overlay. */
@@ -12891,6 +14547,7 @@ static void ppc_mac_gpu_set_trace(Object *obj, const char *value, Error **errp)
     }
     /* Logs that remember whether they were switched on have to be told. */
     g_seq_log_enabled = -1;
+    g_stall_trace = g_poll_trace = g_fence_trace = -1;
     fprintf(stderr, "ppc-mac-gpu: %s %s\n", name, off ? "off" : "on");
 }
 
@@ -12950,6 +14607,7 @@ static char *ppc_mac_gpu_get_perf(Object *obj, Error **errp)
 static int ppc_mac_gpu_pre_save(void *opaque)
 {
     ppc_mac_gpu_cp_sync(opaque, 0xFFFFFFFF);  /* save with the ring done */
+    ppc_mac_gpu_csq_ring_drain(opaque);
     return 0;
 }
 
@@ -12957,9 +14615,17 @@ static int ppc_mac_gpu_post_load(void *opaque, int version_id)
 {
     PPCMacGPUState *s = opaque;
 
+    if (s->r3) {
+        s->r3->card_bytes = s->r300_card_bytes;
+        if (s->r300_card_bytes) {
+            s->r300_src_swap = s->r300_shadow[0x15D4 / 4] & 3;
+        }
+        r300_ap0_update(s);
+    }
     /* Ask for one full screen update; everything derived follows from it. */
     s->display_invalid = true;
     s->scanout_dirty_valid = false;
+    s->scanout_generation_valid = false;
     /* Force the mode -- and the surface handed to the window -- to be
      * built again from the restored registers. */
     s->disp.width = 0;
@@ -12987,7 +14653,7 @@ static int ppc_mac_gpu_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_ppc_mac_gpu = {
     .name = "ppc-mac-gpu",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .pre_save = ppc_mac_gpu_pre_save,
     .post_load = ppc_mac_gpu_post_load,
@@ -12998,6 +14664,8 @@ static const VMStateDescription vmstate_ppc_mac_gpu = {
                              "graphics registers were laid out differently"),
         VMSTATE_BUFFER_UNSAFE(regs, PPCMacGPUState, 1, sizeof(PPCMacGPURegs)),
         VMSTATE_BOOL(display_invalid, PPCMacGPUState),
+        VMSTATE_BOOL_V(r300_card_bytes, PPCMacGPUState, 2),
+        VMSTATE_UINT32_ARRAY_V(r300_surf, PPCMacGPUState, 32, 2),
         /*
          * What the card has learned rather than been told: Mac OS X's
          * driver sets the scanline length by drawing at it, not by writing

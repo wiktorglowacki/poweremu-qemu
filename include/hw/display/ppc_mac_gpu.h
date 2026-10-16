@@ -17,6 +17,7 @@
 #include "hw/i2c/bitbang_i2c.h"
 #include "hw/display/i2c-ddc.h"
 #include "ui/console.h"
+#include "qemu/thread.h"
 #include "qom/object.h"
 
 /* Defined in hw/display/ppc_mac_gpu_renderer.h, private to the device. */
@@ -82,6 +83,7 @@ struct R200Vertex;
 #define R200_CONFIG_REG_1_BASE        0x010C
 #define R200_CONFIG_REG_APER_SIZE     0x0110
 #define R200_CONFIG_MEMSIZE           0x00F8
+#define R200_MEM_SDRAM_MODE_REG       0x0158
 #define R200_CONFIG_CNTL              0x00E0
 
 /* PCI config space mirror in MMIO (0x0F00-0x0F3F) */
@@ -266,6 +268,7 @@ struct R200Vertex;
 #define R200_CP_CSQ_IND_ADDR          0x07F0
 #define R200_CP_CSQ_IND_DATA          0x07F4
 #define R200_CP_CSQ_STAT              0x07F8
+#define R300_CP_CSQ_AVAIL             0x07B8
 
 /* HOST_DATA */
 #define R200_HOST_DATA0               0x17C0
@@ -422,6 +425,9 @@ typedef struct PPCMacGPURenderer PPCMacGPURenderer;
 
 /* Register file - stores all emulated register values */
 typedef struct PPCMacGPURegs {
+    /* OV0 writes are latched together when the register-load lock is released. */
+    uint32_t ov0[64], ov0_active[64];
+    uint32_t ov0_transform[6];
     /* Indexed access */
     uint32_t mm_index;
 
@@ -554,6 +560,7 @@ typedef struct PPCMacGPURegs {
     /* Clock (stub) */
     uint32_t clock_cntl_index;
     uint32_t clock_cntl_data;
+    uint32_t pll[64];
 
     /* GPIO / DDC */
     uint32_t gpio_vga_ddc;
@@ -624,6 +631,18 @@ typedef struct PPCMacGPUDisplayMode {
     bool crtc_ext;       /* true when CRTC extended mode active (kext) */
 } PPCMacGPUDisplayMode;
 
+/*
+ * Everything the CPU video overlay's converted image is a function of (see
+ * ppc_mac_gpu_overlay).  All uint32_t, so there is no padding to upset the
+ * memcmp that compares two of them.
+ */
+typedef struct PPCMacGPUOverlayKey {
+    uint32_t ov0[64], transform[6];     /* as latched */
+    uint32_t base[3];                   /* planes' VRAM offsets */
+    uint32_t width, height;             /* the display's: they clip the window */
+    uint32_t hash[2];                   /* the source planes' bytes */
+} PPCMacGPUOverlayKey;
+
 #include "../../../hw/display/r300/r300_draw.h"
 
 #define TYPE_PPC_MAC_GPU "ppc-mac-gpu"
@@ -659,6 +678,9 @@ struct PPCMacGPUState {
     /* Memory regions */
     MemoryRegion vram;          /* BAR0: VRAM aperture */
     MemoryRegion vram_bar;      /* r300: BAR0 = aperture 0 (vram) + aperture 1 */
+    bool r300_card_bytes;      /* native driver owns physical card-byte VRAM */
+    bool morphos_color_compat; /* opt-in native RGBA8 compatibility profile */
+    MemoryRegion vram_ap0;      /* enabled only for CPU endian swapping */
     MemoryRegion vram_ap1;      /* r300: aperture 1, byte-swapping view of vram */
     uint32_t r300_surf[32];     /* r300: SURFACE0..7 regs (0x0B00 + 4*i) */
     MemoryRegion r300_watch;    /* $R300_SURFWATCH: logs CPU access to surface 0 */
@@ -666,7 +688,13 @@ struct PPCMacGPUState {
     uint32_t r300_watch_base, r300_watch_logged;
     MemoryRegion io;            /* BAR1: I/O register alias */
     MemoryRegion mmio;          /* BAR2: MMIO register space */
-    MemoryRegion cp_wptr_mr;    /* CP_RB_WPTR, lock-free (CP thread) */
+    MemoryRegion cp_wptr_mr;
+    MemoryRegion cp_rptr_mr;        /* lock-free CP_RB_RPTR poll */    /* CP_RB_WPTR, lock-free (CP thread) */
+    MemoryRegion csq_ring_mr;   /* PM4 PIO FIFO, lock-free: words queue here */
+    QemuSpin csq_ring_lock;
+    uint32_t csq_ring[4096];
+    unsigned csq_ring_tail;
+    unsigned csq_ring_count;
     MemoryRegion rom_mr;        /* ROM BAR: traced expansion ROM */
 
     /* ROM data */
@@ -747,11 +775,17 @@ struct PPCMacGPUState {
      * Cocoa backend expects little-endian XRGB: bytes [B,G,R,X].
      * We bswap32 each pixel from VRAM into this buffer. */
     uint8_t *shadow_buf;
+    bool shadow_from_renderer;      /* scanout_alloc'd (GPU-composable) */
     /* What the UI's current surface describes, so it is replaced only when
      * it would actually differ (see ppc_mac_gpu_display_update). */
     uint32_t surface_width, surface_height, surface_stride;
     void *surface_data;
     uint32_t shadow_buf_size;
+    /* The video overlay's window as last converted and scaled, alpha 0xff
+     * where the video key passes, and what it was built from. */
+    uint32_t *ov0_cache;
+    uint64_t ov0_cache_pixels;    /* allocated */
+    PPCMacGPUOverlayKey ov0_cache_key;
 
     /* Dirty-region scanout (see ppc_mac_gpu_display_update): the VRAM dirty
      * log is consumed here, so the last scanout this copy served is remembered
@@ -759,6 +793,8 @@ struct PPCMacGPUState {
      * buffer we are flipping *to* was still the back buffer). */
     uint64_t scanout_offset;      /* crtc_offset the shadow buffer mirrors */
     bool scanout_dirty_valid;     /* shadow_buf/dirty log are in sync */
+    uint64_t scanout_vram_generation;
+    bool scanout_generation_valid;
     bool scanout_log_owner;       /* this device consumes the VGA dirty log */
     int scanout_defers;           /* deferrals of the frame we are after */
 
@@ -841,8 +877,16 @@ struct PPCMacGPUState {
     uint32_t hwc_pix[64 * 64];
     uint32_t hwc_w, hwc_h, hwc_idx;
     bool host_aspect_modes;       /* EDID offers the patched NDRV's 1.545 modes */
+    uint32_t edid_width, edid_height; /* EDID preferred mode; 0 = 1024x768 */
+    uint32_t edid_hz;               /* its refresh in Hz; 0 = the generator's default */
+    uint32_t vblank_hz;           /* frame timer rate (VBLANK/VLINE/VSYNC) */
+    uint32_t vblank_auto_hz;      /* from the programmed mode when vblank-hz is 0 */
+    bool csq_drain;               /* CP_CSQ_STAT reads busy until the GPU is idle */
     int32_t hwc_x, hwc_y;
     bool hwc_visible;
+    /* Native Radeon cursors are composited into scanout, never guest VRAM. */
+    bool r300_cursor_dirty;
+    int32_t r300_cursor_y0, r300_cursor_y1;
     /* A woken machine's window has never been told what the pointer looks
      * like: the guest uploaded it once, before the machine slept, and will
      * not do it again.  Set when a machine is restored, acted on at the

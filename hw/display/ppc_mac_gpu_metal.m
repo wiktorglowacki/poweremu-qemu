@@ -9021,6 +9021,10 @@ static uint64_t g_r300_tcache_clock;
 static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> dev,
                                         uint8_t *vram_ptr, const R300TexDesc *td)
 {
+    if (!r300_tex_card_swap_valid(td)) {
+        r300_metal_warn(256, "endian-swapped texture lacks complete swap words");
+        return nil;
+    }
     const uint8_t *src = td->host_data ? td->host_data : vram_ptr + td->gpu_addr;
     uint64_t lo = td->gpu_addr, hi = lo + td->size_bytes;
     MTLPixelFormat pf;
@@ -9045,7 +9049,7 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
 
     R300TexCacheKey key = { td->gpu_addr, td->format, td->kind, td->width, td->height,
                             td->depth, td->dim, td->levels, td->pitch_bytes,
-                            td->host_data != NULL ? 1u + (td->endian << 1) : td->endian << 1,
+                            (td->host_data != NULL ? 1u : 0u) | (td->endian << 1) | (td->card_bytes ? 8u : 0u),
                             r300_hash_tex(src, td->size_bytes) };
     int lru = 0;
     for (int i = 0; i < R300_TCACHE; i++) {
@@ -9129,6 +9133,10 @@ static id<MTLTexture> r300_texture_raw(PPCMacGPUMetalState *st, id<MTLDevice> de
                                               td->size_bytes, NULL)) {
         r200_flush_locked(st);
     }
+    if (!r300_tex_card_swap_valid(td)) {
+        r300_metal_warn(256, "endian-swapped texture lacks complete swap words");
+        return nil;
+    }
     const uint8_t *src = td->host_data ? td->host_data : vram_ptr + td->gpu_addr;
     uint32_t n = (td->size_bytes + eb - 1) / eb;        /* elements */
     uint32_t w = 64;
@@ -9144,7 +9152,7 @@ static id<MTLTexture> r300_texture_raw(PPCMacGPUMetalState *st, id<MTLDevice> de
     /* GART texels: the swapped copy is cached by content, since rebuilding
      * it every draw costs a full copy, bswap and upload. */
     uint64_t rhash = td->host_data ? r300_hash_bytes(td->host_data, td->size_bytes) : 0;
-    uint32_t rkey[6] = { 3, eb, w, h, td->gpu_addr, td->size_bytes };
+    uint32_t rkey[6] = { 3u | (td->card_bytes ? 8u : 0u), eb, w, h, td->gpu_addr, td->size_bytes };
     if (td->host_data) {
         id<MTLTexture> c = aux_tex_find(rhash, rkey);
         if (c) {
@@ -9154,7 +9162,7 @@ static id<MTLTexture> r300_texture_raw(PPCMacGPUMetalState *st, id<MTLDevice> de
     }
     uint8_t *buf = g_malloc0(bytes);
     memcpy(buf, src, td->size_bytes);
-    if (td->host_data) {
+    if (td->host_data && !td->card_bytes) {
         uint32_t *dw = (uint32_t *)buf;
         for (size_t i = 0; i < bytes / 4; i++) {
             dw[i] = __builtin_bswap32(dw[i]);
@@ -9190,7 +9198,7 @@ static id<MTLTexture> r300_texture(PPCMacGPUMetalState *st, id<MTLDevice> dev,
     if (td->kind == R300_TEXK_RAW) {
         return r300_texture_raw(st, dev, vram_ptr, vram_size, td, rowel);
     }
-    if (td->levels > 1 || td->dim != R300_TEXDIM_2D) {
+    if ((td->card_bytes && td->endian) || td->levels > 1 || td->dim != R300_TEXDIM_2D) {
         return r300_texture_full(st, dev, vram_ptr, td);
     }
     switch (td->kind) {
