@@ -93,8 +93,14 @@ void surface_gl_create_texture(QemuGLShader *gls,
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ONE);
     }
 
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    /* $QEMU_GL_FILTER=nearest: unfiltered scaling (crisp at integer
+     * ratios, e.g. a 1920x1080 guest on a 3840x2160 monitor) */
+    {
+        const char *f = getenv("QEMU_GL_FILTER");
+        GLint filter = f && !strcmp(f, "nearest") ? GL_NEAREST : GL_LINEAR;
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+    }
 }
 
 void surface_gl_update_texture(QemuGLShader *gls,
@@ -126,7 +132,7 @@ void surface_gl_render_texture(QemuGLShader *gls,
     glClearColor(0.1f, 0.1f, 0.1f, 0.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    qemu_gl_run_texture_blit(gls, false, false);
+    qemu_gl_run_texture_blit(gls, false, surface->glswapped);
 }
 
 void surface_gl_destroy_texture(QemuGLShader *gls,
