@@ -1455,12 +1455,46 @@ static inline bool tl_probe_reg(hwaddr addr)
     return false;
 }
 
+/* The refresh the vblank timer, VLINE and the frame counter run at. */
+static uint32_t ppc_mac_gpu_refresh_hz(PPCMacGPUState *s)
+{
+    return s->vblank_hz ? s->vblank_hz : s->vblank_auto_hz ? s->vblank_auto_hz : 60;
+}
+
+/*
+ * Frame clock for CRTC_CRNT_FRAME and CRTC_VLINE_CRNT_VLINE: frames counted
+ * at the current refresh since the last rate change, so a switch to 120 Hz
+ * speeds the beam up and the counter never runs backwards.
+ */
+static struct { int64_t base_ns; uint32_t base_frame, hz; } frame_clock;  /* ponytail: one device per machine */
+
+static void ppc_mac_gpu_frame_clock(PPCMacGPUState *s, int64_t now,
+                                    uint32_t *frame, uint64_t *into_ns,
+                                    uint64_t *period_ns)
+{
+    uint32_t hz = ppc_mac_gpu_refresh_hz(s);
+    uint64_t period = NANOSECONDS_PER_SECOND / hz;
+
+    if (frame_clock.hz != hz) {
+        if (frame_clock.hz) {
+            frame_clock.base_frame += (now - frame_clock.base_ns) /
+                                      (NANOSECONDS_PER_SECOND / frame_clock.hz);
+        }
+        frame_clock.base_ns = now;
+        frame_clock.hz = hz;
+    }
+    *frame = frame_clock.base_frame + (now - frame_clock.base_ns) / period;
+    *into_ns = (now - frame_clock.base_ns) % period;
+    *period_ns = period;
+}
+
 static void ppc_mac_gpu_vblank(void *opaque)
 {
     PPCMacGPUState *s = opaque;
 
     /*
-     * Schedule the next VBlank at 60 Hz from the previous due time, not from
+     * Schedule the next VBlank one refresh period (60 Hz unless the PLL or
+     * vblank-hz says otherwise) after the previous due time, not from
      * now: the callback runs late whenever the main thread is busy (GTK
      * redraws hold the BQL for milliseconds), and measuring from "now" turned
      * 60 Hz into ~28 Hz, which MorphOS's compositor waits on twice a frame.
@@ -1468,8 +1502,7 @@ static void ppc_mac_gpu_vblank(void *opaque)
      */
     static int64_t next_ns;    /* ponytail: one device per machine */
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    uint32_t hz = s->vblank_hz ? s->vblank_hz : s->vblank_auto_hz ? s->vblank_auto_hz : 60;
-    int64_t period = NANOSECONDS_PER_SECOND / hz;
+    int64_t period = NANOSECONDS_PER_SECOND / ppc_mac_gpu_refresh_hz(s);
     next_ns = (next_ns && now - next_ns < period) ? next_ns + period : now + period;
     timer_mod(&s->vblank_timer, next_ns);
 
@@ -1683,38 +1716,46 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
         m->offset = 0;
     }
 
+    /*
+     * The refresh the driver programmed: pixel clock from the PLL
+     * (PPLL_REF_DIV 0x03; the PPLL_DIV_n 0x04..0x07 that
+     * CLOCK_CNTL_INDEX[9:8] selects: fb_div [10:0], post_div code [18:16])
+     * over the CRTC totals.  MorphOS picks the rate in its Screens
+     * preferences, so the vblank timer follows it unless vblank-hz pins
+     * one.  Worked out on every update, not only on a mode change: a new
+     * rate at the same resolution changes no other register we track, and
+     * the mode change itself is often seen before the PLL is programmed
+     * (ref_div 0, which is rejected), so the old rate would stick.
+     */
+    uint32_t htot = ((s->regs.crtc_h_total_disp & 0x1FF) + 1) * 8;
+    uint32_t vtot = (s->regs.crtc_v_total_disp & 0x7FF) + 1;
+    uint32_t ref = s->regs.pll[0x03] & 0x3FF;
+    uint32_t sel = (s->regs.clock_cntl_index >> 8) & 3;
+    uint32_t dn = s->regs.pll[0x04 + sel];
+    static const unsigned post[8] = { 1, 2, 4, 8, 3, 0, 6, 12 };
+    unsigned pd = post[(dn >> 16) & 7];
+    double pclk = ref && pd ? 27e6 * (dn & 0x7FF) / (ref * pd) : 0;
+    double hz = htot && vtot ? pclk / htot / vtot : 0.0;
+    bool rate_changed = false;
+    if (hz >= 40.0 && hz <= 250.0 && (uint32_t)(hz + 0.5) != s->vblank_auto_hz) {
+        s->vblank_auto_hz = (uint32_t)(hz + 0.5);
+        rate_changed = true;
+    }
+
     /* A page flip changes the source pixels, not the shadow surface. */
+    if (rate_changed || old.width != m->width || old.height != m->height ||
+        old.bpp != m->bpp || old.stride != m->stride ||
+        old.format != m->format || old.crtc_ext != m->crtc_ext) {
+        mode_log("GPU TIMING: htotal=%u vtotal=%u ref_div=%u div%u=%08x "
+                "pixel clock %.1f MHz -> %.1f Hz (vblank %u Hz)%s\n", htot, vtot, ref,
+                sel, dn, pclk / 1e6, hz, ppc_mac_gpu_refresh_hz(s),
+                rate_changed ? " [rate change]" : "");
+    }
     if (old.width != m->width || old.height != m->height ||
         old.bpp != m->bpp || old.stride != m->stride ||
         old.format != m->format || old.crtc_ext != m->crtc_ext) {
         mode_log("GPU MODE: %ux%u bpp=%u stride=%u offset=0x%x pitch_reg=0x%x crtc_gen=0x%x\n",
                 m->width, m->height, m->bpp, m->stride, m->offset, pitch, crtc_gen);
-        {
-            /*
-             * The refresh the driver programmed: pixel clock from the PLL
-             * (PPLL_REF_DIV 0x03; the PPLL_DIV_n 0x04..0x07 that
-             * CLOCK_CNTL_INDEX[9:8] selects: fb_div [10:0], post_div code
-             * [18:16]) over the CRTC totals.  MorphOS picks the rate in its
-             * Screens preferences, so the vblank timer follows it unless
-             * vblank-hz pins one.
-             */
-            uint32_t htot = ((s->regs.crtc_h_total_disp & 0x1FF) + 1) * 8;
-            uint32_t vtot = (s->regs.crtc_v_total_disp & 0x7FF) + 1;
-            uint32_t ref = s->regs.pll[0x03] & 0x3FF;
-            uint32_t sel = (s->regs.clock_cntl_index >> 8) & 3;
-            uint32_t dn = s->regs.pll[0x04 + sel];
-            static const unsigned post[8] = { 1, 2, 4, 8, 3, 0, 6, 12 };
-            unsigned pd = post[(dn >> 16) & 7];
-            double pclk = ref && pd ? 27e6 * (dn & 0x7FF) / (ref * pd) : 0;
-            double hz = htot && vtot ? pclk / htot / vtot : 0.0;
-            if (hz >= 40.0 && hz <= 250.0) {
-                s->vblank_auto_hz = (uint32_t)(hz + 0.5);
-            }
-            mode_log("GPU TIMING: htotal=%u vtotal=%u ref_div=%u div%u=%08x "
-                    "pixel clock %.1f MHz -> %.1f Hz (vblank %u Hz)\n", htot, vtot, ref,
-                    sel, dn, pclk / 1e6, hz,
-                    s->vblank_hz ? s->vblank_hz : s->vblank_auto_hz ? s->vblank_auto_hz : 60);
-        }
         if (old.stride != m->stride) {
             mode_log("[STRIDE_CHANGE] update_display_mode: "
                     "%u -> %u (override=%s val=%u)\n",
@@ -11495,18 +11536,23 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
          * anything waiting for a scanline saw zero for ever.
          */
         uint32_t vtotal = (s->regs.crtc_v_total_disp & 0x7FF) + 1;
-        if (vtotal == 0) vtotal = 628; /* safety */
-        int64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-        uint64_t frame_ns = NANOSECONDS_PER_SECOND / 60;
-        uint32_t line = (uint32_t)((now_ns % frame_ns) * vtotal / frame_ns);
+        uint32_t frame;
+        uint64_t into, period;
+        ppc_mac_gpu_frame_clock(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                &frame, &into, &period);
+        uint32_t line = (uint32_t)(into * vtotal / period);
         val = (s->regs.crtc_vline & 0x7FF) | ((line & 0x7FF) << 16);
         break;
     }
-    case R200_CRTC_CRNT_FRAME:
-        /* Frame counter - increment with time */
-        val = (uint32_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) /
-                         (NANOSECONDS_PER_SECOND / 60));
+    case R200_CRTC_CRNT_FRAME: {
+        /* Frame counter - increment with time, at the current refresh */
+        uint32_t frame;
+        uint64_t into, period;
+        ppc_mac_gpu_frame_clock(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                &frame, &into, &period);
+        val = frame;
         break;
+    }
 
     /* DAC */
     case R200_DAC_CNTL ... R200_DAC_CNTL + 3:
