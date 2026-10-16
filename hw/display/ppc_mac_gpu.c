@@ -6005,7 +6005,7 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
                     s->disp.bpp == 32 && dst_pitch > 0 &&
                     blit_w >= 256 && blit_h >= 256) {
                     static int srt_present_log = 0;
-                    if (srt_present_log < 50) {
+                    if (gpu_diag_on() && srt_present_log < 50) {
                         fprintf(stderr,
                             "[PRESENT_BLIT] MMIO_SRT: "
                             "src=0x%x+%u dst=0x%x+%u "
@@ -6248,7 +6248,7 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
             s->disp.bpp == 32 && dst_pitch > 0 &&
             blit_w >= 256 && blit_h >= 256) {
             static int mmio_pb_log = 0;
-            if (mmio_pb_log < 50) {
+            if (gpu_diag_on() && mmio_pb_log < 50) {
                 fprintf(stderr,
                     "[PRESENT_BLIT] MMIO_NOSRT: "
                     "src=0x%x+%u dst=0x%x+%u "
@@ -6673,7 +6673,7 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
         if (dst_offset == s->regs.crtc_offset && s->disp.bpp == 32 &&
             dst_pitch > 0 && blit_w >= 256 && blit_h >= 256) {
             static int mmio_present_log = 0;
-            if (mmio_present_log < 50) {
+            if (gpu_diag_on() && mmio_present_log < 50) {
                 fprintf(stderr,
                     "[PRESENT_BLIT] MMIO_2D: "
                     "src=0x%x+%u dst=0x%x+%u "
@@ -9667,7 +9667,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                                 }
                             }
                             static int present_blit_log = 0;
-                            if (present_blit_log < 50) {
+                            if (gpu_diag_on() && present_blit_log < 50) {
                                 fprintf(stderr,
                                     "[PRESENT_BLIT] PM4_BBM: "
                                     "src=0x%x+%u dst=0x%x+%u "
