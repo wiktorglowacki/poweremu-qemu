@@ -1956,12 +1956,63 @@ static bool ppc_gpu_overlay_on_gpu(void)
 }
 
 /* The display shadow: host-visible renderer memory when the GPU composes. */
+static void ppc_mac_gpu_shadow_release(PPCMacGPUState *s, uint8_t *buf,
+                                       bool from_renderer)
+{
+    if (from_renderer && s->renderer && s->renderer->scanout_free) {
+        s->renderer->scanout_free(s->renderer_opaque, buf);
+    } else {
+        g_free(buf);
+    }
+}
+
+/* Free retired shadow buffers a second old (all of them if asked). */
+static void ppc_mac_gpu_shadow_reap(PPCMacGPUState *s, bool all)
+{
+    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+
+    for (int i = 0; i < ARRAY_SIZE(s->shadow_retired); i++) {
+        if (s->shadow_retired[i].buf &&
+            (all || now - s->shadow_retired[i].retired_ms >= 1000)) {
+            ppc_mac_gpu_shadow_release(s, s->shadow_retired[i].buf,
+                                       s->shadow_retired[i].from_renderer);
+            s->shadow_retired[i].buf = NULL;
+        }
+    }
+}
+
+/*
+ * The console surface points at the shadow without owning it, and a UI may
+ * read it from its own thread after this one replaced the surface: Cocoa
+ * copies the surface on the macOS main thread and switches surfaces
+ * asynchronously, so freeing at once crashed QEMU on a growing mode change
+ * (SIGSEGV in -[QemuCocoaView updateLayer], RTCW switching to 2560x1440).
+ * The buffer is retired here and freed a second later.
+ * ponytail: time-based; a pixman destroy callback would be exact, but the
+ * renderer's buffers have to be freed on this thread.
+ */
 static void ppc_mac_gpu_shadow_free(PPCMacGPUState *s)
 {
-    if (s->shadow_from_renderer && s->renderer && s->renderer->scanout_free) {
-        s->renderer->scanout_free(s->renderer_opaque, s->shadow_buf);
-    } else {
-        g_free(s->shadow_buf);
+    if (s->shadow_buf) {
+        int slot = 0;
+        for (int i = 0; i < ARRAY_SIZE(s->shadow_retired); i++) {
+            if (!s->shadow_retired[i].buf) {
+                slot = i;
+                break;
+            }
+            if (s->shadow_retired[i].retired_ms <
+                s->shadow_retired[slot].retired_ms) {
+                slot = i;
+            }
+        }
+        if (s->shadow_retired[slot].buf) {      /* all busy: the oldest goes */
+            ppc_mac_gpu_shadow_release(s, s->shadow_retired[slot].buf,
+                                       s->shadow_retired[slot].from_renderer);
+        }
+        s->shadow_retired[slot].buf = s->shadow_buf;
+        s->shadow_retired[slot].from_renderer = s->shadow_from_renderer;
+        s->shadow_retired[slot].retired_ms =
+            qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
     }
     s->shadow_buf = NULL;
     s->shadow_from_renderer = false;
@@ -14550,6 +14601,7 @@ static void ppc_mac_gpu_exit(PCIDevice *dev)
     ppc_mac_gpu_cp_stop();
     timer_del(&s->vblank_timer);
     ppc_mac_gpu_shadow_free(s);
+    ppc_mac_gpu_shadow_reap(s, true);
     g_free(s->ov0_cache);
     s->ov0_cache = NULL;
     s->ov0_cache_pixels = 0;

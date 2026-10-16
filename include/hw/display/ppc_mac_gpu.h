@@ -781,6 +781,13 @@ struct PPCMacGPUState {
     uint32_t surface_width, surface_height, surface_stride;
     void *surface_data;
     uint32_t shadow_buf_size;
+    /* Replaced shadow buffers a UI may still read from its own thread
+     * (ppc_mac_gpu_shadow_free): freed a second after their replacement. */
+    struct {
+        uint8_t *buf;
+        bool from_renderer;
+        int64_t retired_ms;
+    } shadow_retired[4];
     /* The video overlay's window as last converted and scaled, alpha 0xff
      * where the video key passes, and what it was built from. */
     uint32_t *ov0_cache;
