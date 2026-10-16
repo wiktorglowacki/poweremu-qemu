@@ -384,7 +384,18 @@ static void __attribute__((constructor)) tb_jmp_cache_flags_init(void)
 {
     const char *e = getenv("TCG_JC_FLAGS");
 
-    if (e && e[0] == '0') {
+    /*
+     * ponytail: verified on x86-64 hosts only; on an arm64 Mac MorphOS hung
+     * in GfxSpeed with this or the sync change on (TCG_JC_FLAGS=0
+     * PPC_SYNC_EXIT=1 fixed it).  Off elsewhere until that is understood;
+     * TCG_JC_FLAGS=1 forces it on.
+     */
+#ifdef __x86_64__
+    bool on = !(e && e[0] == '0');
+#else
+    bool on = e && e[0] == '1';
+#endif
+    if (!on) {
         tb_jmp_cache_flags_mask = 0;
     }
 }

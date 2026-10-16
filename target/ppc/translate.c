@@ -102,7 +102,12 @@ void ppc_translate_init(void)
     }
     {
         const char *e = getenv("PPC_SYNC_EXIT");
+        /* ponytail: x86-64 hosts only for now, see tb_jmp_cache_flags_init */
+#ifdef __x86_64__
         ppc_sync_exit = e && e[0] == '1';
+#else
+        ppc_sync_exit = !(e && e[0] == '0');
+#endif
     }
 #endif
     p = cpu_reg_names;
