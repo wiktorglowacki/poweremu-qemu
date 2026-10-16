@@ -13902,6 +13902,8 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
     s->pm4_pkt_count = 0;
     s->compositor_valid = false;
     memset(s->tiled_surfaces, 0, sizeof(s->tiled_surfaces));
+    memset(s->r300_surf, 0, sizeof(s->r300_surf));  /* SURFACEn swap ranges */
+    s->r3_zconv = false;        /* its depth mapping went with them */
     s->metal_rt_count = 0;
     s->vb_count = 0;
 
