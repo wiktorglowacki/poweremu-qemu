@@ -1569,20 +1569,21 @@ static void vk_layout_general(VkCommandBuffer cb, VkImage img, uint32_t levels,
 }
 
 /*
- * PPCGPU_VK_RT_GROW=1 (default 0 since the 2026-10-15 host freezes, cause not yet
- * found): a render target is one image however
- * tall the draws into it are.  Its height used to follow each draw's
- * bottom edge (rounded up to 256 rows), so a window's buffer existed as a
- * 256-row and a full-height image side by side, and every switch between
- * short and tall draws wrote one back and reloaded the other: Foobillard
- * made ~1 such upload per 5 draws, TuxRacer one per 2.
+ * A render target is one image however tall the draws into it are
+ * (PPCGPU_VK_RT_GROW=0: the old behaviour).  Its height used to follow
+ * each draw's bottom edge (rounded up to 256 rows), so a window's buffer
+ * existed as a 256-row and a full-height image side by side, and every
+ * switch between short and tall draws wrote one back and reloaded the
+ * other: Foobillard made ~1 such upload per 5 draws, TuxRacer one per 2.
+ * The 2026-10-15 host freezes with it on were the y1 < y0 upload in
+ * vk_img_get, bounded since.
  */
 static bool vk_rt_grow(void)
 {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("PPCGPU_VK_RT_GROW");
-        on = e && e[0] == '1';
+        on = !(e && e[0] == '0');
     }
     return on;
 }
