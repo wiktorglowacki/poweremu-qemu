@@ -39,6 +39,7 @@ typedef union {
 #define FIRST_FP_OP OP_VADDFP
 
 enum {
+    OP_BCOND,
     OP_VPERM, OP_VPERM_DA, OP_VPERM_DC, OP_VPERM_AA, OP_VSLDOI, OP_VSLDOI_DB,
     OP_VMRGHB, OP_VMRGHH, OP_VMRGHW, OP_VMRGLB, OP_VMRGLH, OP_VMRGLW,
     OP_VPKUHUM, OP_VPKUWUM, OP_VPKUHUS, OP_VPKUWUS, OP_VPKSHUS, OP_VPKSWUS,
@@ -270,6 +271,25 @@ static void run_op(int op, V a, V b, V c, int sh, V *got, V *exp,
     memset(&e, 0, sizeof(e));
     clear_sat();
     switch (op) {
+    case OP_BCOND:
+        /*
+         * bc on each of the 32 CR bits, branch-if-true and -if-false
+         * (bit 0 first): the taken-if-false mask must equal CR, the
+         * taken-if-true one ~CR.
+         */
+        asm volatile("mtcr %2\n\tli %0,0\n\tli %1,0\n\t"
+                     ".irp bi,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,"
+                     "16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31\n\t"
+                     "slwi %0,%0,1\n\tslwi %1,%1,1\n\t"
+                     "bc 4,\\bi,1f\n\tori %0,%0,1\n"
+                     "1:\tbc 12,\\bi,2f\n\tori %1,%1,1\n"
+                     "2:\n\t.endr"
+                     : "=&r"(r.w[0]), "=&r"(r.w[1]) : "r"(a.w[0])
+                     : "cr0", "cr1", "cr2", "cr3", "cr4", "cr5", "cr6", "cr7");
+        e.w[0] = a.w[0];
+        e.w[1] = ~a.w[0];
+        r.w[2] = r.w[3] = 0;
+        break;
     case OP_VPERM:
         ASM4("vperm", r, a, b, c);
         goto ref_perm;

@@ -3837,15 +3837,10 @@ static void gen_bcond(DisasContext *ctx, int type)
         /* Test CR */
         uint32_t bi = BI(ctx->opcode);
         uint32_t mask = 0x08 >> (bi & 0x03);
-        TCGv_i32 temp = tcg_temp_new_i32();
 
-        if (bo & 0x8) {
-            tcg_gen_andi_i32(temp, cpu_crf[bi >> 2], mask);
-            tcg_gen_brcondi_i32(TCG_COND_EQ, temp, 0, l1);
-        } else {
-            tcg_gen_andi_i32(temp, cpu_crf[bi >> 2], mask);
-            tcg_gen_brcondi_i32(TCG_COND_NE, temp, 0, l1);
-        }
+        /* to l1 (not taken) if the bit is not as BO wants: test + jcc */
+        tcg_gen_brcondi_i32(bo & 0x8 ? TCG_COND_TSTEQ : TCG_COND_TSTNE,
+                            cpu_crf[bi >> 2], mask, l1);
         bhrb_type |= BHRB_TYPE_COND;
     }
 

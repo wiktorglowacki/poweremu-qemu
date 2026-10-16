@@ -23,7 +23,7 @@ ARGS = [a for a in sys.argv[1:] if not a.startswith('--')]
 QEMU = (ARGS[0] if ARGS else
         os.path.join(HERE, '..', '..', 'build', 'qemu-system-ppc'))
 RESULTS = 0x10000
-OPS = """vperm vperm(d=a) vperm(d=c) vperm(a=b) vsldoi vsldoi(d=b)
+OPS = """bcond vperm vperm(d=a) vperm(d=c) vperm(a=b) vsldoi vsldoi(d=b)
 vmrghb vmrghh vmrghw vmrglb vmrglh vmrglw
 vpkuhum vpkuwum vpkuhus vpkuwus vpkshus vpkswus vpkshss vpkswss
 vupkhsb vupkhsh vupklsb vupklsh
