@@ -385,9 +385,36 @@ void store_40x_sler(CPUPPCState *env, uint32_t val)
     env->spr[SPR_405_SLER] = val;
 }
 
+/* $QEMU_TLB_STATS=1: why the TLB is flushed, once a second on stderr. */
+uint64_t ppc_tlb_flush_why[8];   /* 0 global 1 local 2 pages 3 sr-switch 4 bat 5 sr-store 6 tlbie */
+static void ppc_tlb_flush_report(void)
+{
+    static int on = -1;
+    static int64_t last_ns;
+    if (on < 0) {
+        const char *e = getenv("QEMU_TLB_STATS");
+        on = e && e[0] == '1';
+    }
+    if (!on) {
+        return;
+    }
+    int64_t now = get_clock_realtime();
+    if (now - last_ns < 1000000000ll) {
+        return;
+    }
+    last_ns = now;
+    fprintf(stderr, "tlbflush: global %" PRIu64 " local %" PRIu64 " pages %" PRIu64
+            " sr-switch %" PRIu64 " bat %" PRIu64 " sr-store %" PRIu64 " tlbie %" PRIu64 "\n",
+            ppc_tlb_flush_why[0], ppc_tlb_flush_why[1], ppc_tlb_flush_why[2],
+            ppc_tlb_flush_why[3], ppc_tlb_flush_why[4], ppc_tlb_flush_why[5], ppc_tlb_flush_why[6]);
+    memset(ppc_tlb_flush_why, 0, sizeof(ppc_tlb_flush_why));
+}
+
 void check_tlb_flush(CPUPPCState *env, bool global)
 {
     CPUState *cs = env_cpu(env);
+
+    ppc_tlb_flush_report();
 
     /* Handle global flushes first */
     if (global && (env->tlb_need_flush & TLB_NEED_GLOBAL_FLUSH)) {
@@ -395,6 +422,7 @@ void check_tlb_flush(CPUPPCState *env, bool global)
         env->tlb_need_flush &= ~TLB_NEED_LOCAL_FLUSH;
         env->tlb_need_flush &= ~TLB_NEED_PAGE_FLUSH;
         env->tlb_flush_npages = 0;
+        ppc_tlb_flush_why[0]++;
         tlb_flush_all_cpus_synced(cs);
         ppc_mmu_slots_reset(env);
         return;
@@ -405,6 +433,7 @@ void check_tlb_flush(CPUPPCState *env, bool global)
         env->tlb_need_flush &= ~TLB_NEED_LOCAL_FLUSH;
         env->tlb_need_flush &= ~TLB_NEED_PAGE_FLUSH;
         env->tlb_flush_npages = 0;
+        ppc_tlb_flush_why[1]++;
         tlb_flush(cs);
         ppc_mmu_slots_reset(env);
         return;
@@ -419,6 +448,7 @@ void check_tlb_flush(CPUPPCState *env, bool global)
      */
     if (env->tlb_need_flush & TLB_NEED_PAGE_FLUSH) {
         env->tlb_need_flush &= ~TLB_NEED_PAGE_FLUSH;
+        ppc_tlb_flush_why[2] += env->tlb_flush_npages;
         for (int i = 0; i < env->tlb_flush_npages; i++) {
             for (uint32_t seg = 0; seg < 16; seg++) {
                 tlb_flush_page_by_mmuidx(cs, (seg << 28) |
@@ -431,6 +461,7 @@ void check_tlb_flush(CPUPPCState *env, bool global)
 
     if (env->tlb_need_flush & TLB_NEED_SR_SWITCH) {
         env->tlb_need_flush &= ~TLB_NEED_SR_SWITCH;
+        ppc_tlb_flush_why[3]++;
         ppc_mmu_slot_sync(env);
     }
 }

@@ -173,6 +173,7 @@ static inline void do_invalidate_BAT(CPUPPCState *env, target_ulong BATu,
     if (((end - base) >> TARGET_PAGE_BITS) > 1024) {
         /* Flushing 1024 4K pages is slower than a complete flush */
         qemu_log_mask(CPU_LOG_MMU, "Flush all BATs\n");
+        { extern uint64_t ppc_tlb_flush_why[8]; ppc_tlb_flush_why[4]++; }
         tlb_flush(cs);
         qemu_log_mask(CPU_LOG_MMU, "Flush done\n");
         return;
@@ -340,6 +341,31 @@ void ppc_tlb_invalidate_all(CPUPPCState *env)
  * Called at the context-synchronizing event after the segment registers
  * changed.
  */
+static int ppc_mmu_slots_mode(void);
+
+/*
+ * PPC_SR_SLOTS=2: a set being rewritten one register at a time (MorphOS
+ * flips bit 4 of all sixteen VSIDs on every kernel entry and exit, with an
+ * isync after each mtsr) matches no slot at any of the sixteen syncs, so
+ * the exact mode allocated a slot and flushed at every one of them and the
+ * partial sets evicted the two real views.  In this mode a sync at which
+ * only some of the registers differ from the current slot's set changes
+ * nothing: the current TLB set stays in use until the set is complete (all
+ * sixteen differ, or it equals another slot).  The registers already
+ * rewritten are looked up in the old view meanwhile; the switch code and
+ * its stack are mapped alike in both views, which is what makes this safe
+ * for that guest, and only for guests like it.
+ */
+static bool ppc_mmu_slot_partial(CPUPPCState *env)
+{
+    int cur = env->mmu_slot, n = 0;
+
+    for (int k = 0; k < 16; k++) {
+        n += env->sr[k] != env->mmu_slot_sr[cur][k];
+    }
+    return n > 0 && n < 16;
+}
+
 void ppc_mmu_slot_sync(CPUPPCState *env)
 {
     int i, victim = 0;
@@ -352,6 +378,10 @@ void ppc_mmu_slot_sync(CPUPPCState *env)
         if (env->mmu_slot_used[i] < env->mmu_slot_used[victim]) {
             victim = i;
         }
+    }
+    if (i == PPC_MMU_SLOTS && ppc_mmu_slots_mode() >= 2 &&
+        ppc_mmu_slot_partial(env)) {
+        return;                         /* mid-switch: keep the current set */
     }
     if (i == PPC_MMU_SLOTS) {
         i = victim;
@@ -418,6 +448,7 @@ void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
          * leans on congruence-class behaviour (rather than naming every
          * page it changes, as Darwin and Linux do) needs the default.
          */
+        { extern uint64_t ppc_tlb_flush_why[8]; ppc_tlb_flush_why[6]++; }
         if (ppc_tlbie_flushes_all()) {
             env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
         } else if (env->tlb_flush_npages < PPC_TLB_PENDING_PAGES) {
@@ -448,15 +479,20 @@ void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
  * a folder took up to 7 s and Dashboard managed under 1 fps instead of ~7
  * (measured: 4-6 vs 29-41 distinct frames in 12 s with them off).
  */
+static int ppc_mmu_slots_mode(void)
+{
+    static int mode = -1;
+
+    if (mode < 0) {
+        const char *s = getenv("PPC_SR_SLOTS");
+        mode = s ? atoi(s) : 0;         /* 0 off, 1 exact sets, 2 eager */
+    }
+    return mode;
+}
+
 static bool ppc_mmu_slots_on(void)
 {
-    static int on = -1;
-
-    if (on < 0) {
-        const char *s = getenv("PPC_SR_SLOTS");
-        on = s && !strcmp(s, "1");
-    }
-    return on;
+    return ppc_mmu_slots_mode() > 0;
 }
 target_ulong helper_load_sr(CPUPPCState *env, target_ulong sr_num)
 {
@@ -491,6 +527,16 @@ void helper_store_sr(CPUPPCState *env, target_ulong srnum, target_ulong value)
     } else
 #endif
     if (env->sr[srnum] != value) {
+        { extern uint64_t ppc_tlb_flush_why[8]; ppc_tlb_flush_why[5]++; }
+        {   /* $QEMU_TLB_STATS=1: the first segment-register changes, with the PC */
+            static int on = -1, shown;
+            if (on < 0) { const char *e = getenv("QEMU_TLB_STATS"); on = e && e[0] == '1'; }
+            if (on && shown < 400) {
+                shown++;
+                fprintf(stderr, "srstore: sr%u %08x -> %08x pc=%08x msr=%08x\n", (unsigned)srnum,
+                        (unsigned)env->sr[srnum], (unsigned)value, (unsigned)env->nip, (unsigned)env->msr);
+            }
+        }
         env->sr[srnum] = value;
         /*
          * Invalidating 256MB of virtual memory in 4kB pages is way

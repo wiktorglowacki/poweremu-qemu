@@ -48,6 +48,8 @@
 #endif
 #include "tcg/tcg-ldst.h"
 
+static void tlb_stats_note(CPUState *cpu, bool flush);
+
 /* DEBUG defines, enable DEBUG_TLB_LOG to log to the CPU_LOG_MMU target */
 /* #define DEBUG_TLB */
 /* #define DEBUG_TLB_LOG */
@@ -286,6 +288,7 @@ static void tlb_mmu_flush_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)
 static void tlb_flush_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
                                         int64_t now)
 {
+    tlb_stats_note(cpu, true);
     CPUTLBDesc *desc = &cpu->neg.tlb.d[mmu_idx];
     CPUTLBDescFast *fast = &cpu->neg.tlb.f[mmu_idx];
 
@@ -1034,9 +1037,50 @@ static inline void tlb_set_compare(CPUTLBEntryFull *full, CPUTLBEntry *ent,
  * Called from TCG-generated code, which is under an RCU read-side
  * critical section.
  */
+
+/*
+ * $QEMU_TLB_STATS=1: once a second on stderr, refills and flushes since
+ * the last line and each MMU index's table size and occupancy.  The
+ * dynamic TLB only resizes on a flush; a guest that rarely flushes keeps
+ * whatever size it had, so this shows whether refills are capacity misses.
+ */
+static void tlb_stats_note(CPUState *cpu, bool flush)
+{
+    static int on = -1;
+    static uint64_t fills, flushes, last_ns;
+    if (on < 0) {
+        const char *e = getenv("QEMU_TLB_STATS");
+        on = e && e[0] == '1';
+    }
+    if (!on) {
+        return;
+    }
+    if (flush) {
+        flushes++;
+        return;
+    }
+    if ((++fills & 0x3ff) != 0) {
+        return;
+    }
+    int64_t now = get_clock_realtime();
+    if (now - last_ns < 1000000000ll) {
+        return;
+    }
+    last_ns = now;
+    fprintf(stderr, "tlb: %" PRIu64 " fills %" PRIu64 " flushes;", fills, flushes);
+    for (int i = 0; i < NB_MMU_MODES; i++) {
+        CPUTLBDesc *d = &cpu->neg.tlb.d[i];
+        CPUTLBDescFast *f = &cpu->neg.tlb.f[i];
+        fprintf(stderr, " [%d] %zu/%zu", i, d->n_used_entries, tlb_n_entries(f));
+    }
+    fprintf(stderr, "\n");
+    fills = flushes = 0;
+}
+
 void tlb_set_page_full(CPUState *cpu, int mmu_idx,
                        vaddr addr, CPUTLBEntryFull *full)
 {
+    tlb_stats_note(cpu, false);
     CPUTLB *tlb = &cpu->neg.tlb;
     CPUTLBDesc *desc = &tlb->d[mmu_idx];
     MemoryRegionSection *section;
