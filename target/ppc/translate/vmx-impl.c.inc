@@ -2564,10 +2564,15 @@ static bool trans_VPERM(DisasContext *ctx, arg_VA *a)
     }
     REQUIRE_VECTOR(ctx);
 
-    /* The pick for each byte is the low 5 bits of vC; index 31 - s. */
-    idx = vmx_ld(a->rc);
+    /*
+     * The pick for each byte is the low 5 bits of vC; index 31 - s.
+     * Mask into a new temp: overwriting the loaded vC would drop the
+     * optimizer's env copy of it, and a later vperm with the same vC
+     * would reload it from env.
+     */
+    idx = tcg_temp_new_vec(TCG_TYPE_V128);
     tcg_gen_andc_vec(MO_8, idx, tcg_constant_vec(TCG_TYPE_V128, MO_8, 0x1f),
-                     idx);
+                     vmx_ld(a->rc));
     vmx_st(a->vrt, vmx_permute(vmx_ld(a->vra), vmx_ld(a->vrb), idx));
     return true;
 }
