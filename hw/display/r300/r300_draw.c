@@ -1606,6 +1606,107 @@ static bool gpu_vs_build(const R300State *st, Fetch *f, const R300PVSProgram *pr
 }
 
 /*
+ * MorphOS TinyGL moves vertex arrays from its GART staging buffer into
+ * VRAM by drawing them: a quad textured with unit 0, copied texel for
+ * pixel into a small colour buffer that later draws read as vertex arrays
+ * (and the device reads on the CPU when it builds those draws).  These
+ * two recognise exactly a plain copy, so the device can make it on the
+ * CPU (R300DrawPacket.copy_*): the state first (unit 0 alone, a program
+ * that passes it through, nothing after the shader that changes, drops
+ * or blends a pixel), then the geometry.
+ */
+static bool copy_state(const R300State *st, unsigned *coord)
+{
+    uint32_t cb = r300_reg(st, RB3D_CBLEND);
+
+    return r300_reg(st, TX_ENABLE) == 1 && !(r300_reg(st, ZB_CNTL) & 7) &&
+           !(cb & 1) && !((cb >> 3) & 7) &&
+           !(r300_reg(st, FG_ALPHA_FUNC) & (1u << 11)) &&
+           !(r300_reg(st, FG_FOG_BLEND) & 1) && !(r300_reg(st, RB3D_ROPCNTL) & 4) &&
+           (r300_reg(st, RB3D_COLOR_CHANNEL_MASK) & 0xF) == 0xF &&
+           (r300_reg(st, SC_CLIP_RULE) & 0xFFFF) == 0xFFFF &&
+           !(r300_reg(st, VAP_CLIP_CNTL) & 0x3F) &&     /* user clip planes */
+           r300_us_num_targets(st) == 1 && r300_us_plain_copy(st, coord);
+}
+
+/*
+ * Two triangles covering a pixel-aligned rectangle exactly (they share a
+ * diagonal), w = 1, point-sampled 32-bit texels, and texture coordinates
+ * that put every pixel centre on a texel centre at a fixed offset.
+ */
+static void copy_detect(const R300FSDesc *desc, const Route *route,
+                        unsigned coord, R300DrawPacket *pkt)
+{
+    const R300TexDesc *td = &pkt->tex[0];
+    const R300Vertex *v = pkt->verts;
+    int k = coord < R300_US_NUM_TEMPS ? desc->route[coord] : -1;
+    float lo[2] = { INFINITY, INFINITY }, hi[2] = { -INFINITY, -INFINITY };
+    float xy[6][2], off[2] = { 0, 0 };
+
+    if (k < 0 || !route->vary[k].is_tex || !v || pkt->vs_glsl ||
+        pkt->num_verts != 6 || pkt->num_line_verts || pkt->prim_class ||
+        (pkt->cull & (R300_CULL_FRONT | R300_CULL_BACK)) ||
+        pkt->num_cb != 1 || pkt->aa_samples > 1 || pkt->rt_tiling || pkt->rt_bpp != 4 ||
+        !td->bound || td->kind != R300_TEXK_RGBA8 || td->levels != 1 ||
+        td->dim != R300_TEXDIM_2D || td->tiling || ((td->filter0 >> 9) & 3) != 1 ||
+        ((td->filter0 >> 11) & 3) != 1) {
+        return;
+    }
+    for (int i = 0; i < 6; i++) {
+        const float *p = v[i].pos, *t = v[i].v[k];
+        if (p[3] != 1.0f || !(p[2] >= 0.0f && p[2] <= 1.0f)) {
+            return;
+        }
+        xy[i][0] = (p[0] + 1) * pkt->rt_width * 0.5f;
+        xy[i][1] = (1 - p[1]) * pkt->rt_height * 0.5f;
+        float uv[2] = { t[0] * td->width, t[1] * td->height };
+        for (int c = 0; c < 2; c++) {
+            float d = uv[c] - xy[i][c];
+            if (fabsf(xy[i][c] - rintf(xy[i][c])) > 1e-3f ||
+                fabsf(d - rintf(d)) > 1e-3f || (i && rintf(d) != off[c])) {
+                return;
+            }
+            off[c] = rintf(d);
+            xy[i][c] = rintf(xy[i][c]);
+            lo[c] = fminf(lo[c], xy[i][c]);
+            hi[c] = fmaxf(hi[c], xy[i][c]);
+        }
+    }
+    /* each triangle: three different corners; the two leave out opposite ones */
+    int miss[2];
+    for (int tri = 0; tri < 2; tri++) {
+        unsigned seen = 0;
+        for (int i = 3 * tri; i < 3 * tri + 3; i++) {
+            if ((xy[i][0] != lo[0] && xy[i][0] != hi[0]) ||
+                (xy[i][1] != lo[1] && xy[i][1] != hi[1])) {
+                return;
+            }
+            seen |= 1u << ((xy[i][0] == hi[0]) + 2 * (xy[i][1] == hi[1]));
+        }
+        if (__builtin_popcount(seen) != 3) {
+            return;
+        }
+        miss[tri] = __builtin_ctz(~seen & 15);
+    }
+    if ((miss[0] ^ miss[1]) != 3) {
+        return;
+    }
+    float x0 = fmaxf(lo[0], pkt->scissor[0]), y0 = fmaxf(lo[1], pkt->scissor[1]);
+    float x1 = fminf(hi[0], fminf(pkt->scissor[2], pkt->rt_width));
+    float y1 = fminf(hi[1], fminf(pkt->scissor[3], pkt->rt_height));
+    if (x0 >= x1 || y0 >= y1 || x0 + off[0] < 0 || y0 + off[1] < 0 ||
+        x1 + off[0] > td->width || y1 + off[1] > td->height) {
+        return;
+    }
+    pkt->copy_x = x0;
+    pkt->copy_y = y0;
+    pkt->copy_w = x1 - x0;
+    pkt->copy_h = y1 - y0;
+    pkt->copy_tx = off[0];
+    pkt->copy_ty = off[1];
+}
+
+/*
  * draw_core's working arrays, kept per drawing thread and grown on demand
  * (a malloc/calloc/free set per draw page-faulted on big indexed meshes).
  * ponytail: holds the largest draw's arrays (~0.75 KB a vertex) for the
@@ -1761,7 +1862,9 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     bool rects = prim == 8;
     uint32_t nsrc = rects ? n / 3 * 4 : n;
 
-    if ((st->glsl_flags & R300_GLSL_GPU_VS) && !rects && !bypass) {
+    unsigned copy_coord;
+    bool copy = copy_state(st, &copy_coord);
+    if ((st->glsl_flags & R300_GLSL_GPU_VS) && !rects && !bypass && !copy) {
         bool failed;
         if (gpu_vs_build(st, &f, &prog, &lay, &route, prim, order, n, pkt,
                          &failed, err)) {
@@ -1973,6 +2076,9 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         pkt->prim_class = 0;
     }
     free(order);
+    if (copy) {
+        copy_detect(&desc, &route, copy_coord, pkt);
+    }
 
     pkt->glsl = r300_us_glsl_cached(st, &desc, st->glsl_flags, &pkt->glsl_id, err);
     if (!pkt->glsl) {

@@ -3495,6 +3495,22 @@ static bool r300_read_raw(void *opaque, uint32_t gpu_addr, void *dst,
     uint8_t *out = dst;
 
     if (r300_to_vram(s, &off, len)) {
+        /*
+         * Vertex and index data a draw rendered: MorphOS TinyGL copies
+         * vertex arrays into VRAM with a textured-quad draw, then draws
+         * from them.  That draw must be in VRAM before the CPU builds the
+         * next one, or it reads the previous upload (CroMagRally: white
+         * or green fades, sky dome missing).  r300_cpu_copy makes those
+         * uploads here, so this rarely waits.  PPCGPU_READ_SYNC=0: off.
+         */
+        static int sync = -1;
+        if (sync < 0) {
+            const char *e = getenv("PPCGPU_READ_SYNC");
+            sync = !(e && e[0] == '0');
+        }
+        if (sync) {
+            r200_vram_access(s, off, (uint64_t)off + len, false, 12);
+        }
         memcpy(dst, (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
                     off, len);
         return true;
@@ -4022,6 +4038,147 @@ static void r300_aa_resolve(PPCMacGPUState *s, const R300DrawPacket *pkt)
     }
 }
 
+/*
+ * A draw r300_draw_build found to be a plain copy of GART texels into a
+ * colour buffer (R300DrawPacket.copy_*: TinyGL's vertex upload), made
+ * here on the CPU, so the draws that read the result as vertex arrays
+ * find it in VRAM without a GPU round trip (r300_read_raw).  What it
+ * stores is a fixed reordering of each texel's four bytes that depends on
+ * the formats and swaps involved: learnt per combination from draws the
+ * GPU makes (compared after a flush), and used once exactly one order
+ * explains each of two of them.  PPCGPU_CPU_COPY=0: always on the GPU.
+ */
+static struct {
+    struct { uint32_t key[5]; int8_t perm, cand; uint8_t tries, hits; } k[16];
+    unsigned nk;
+    int learning;                   /* entry being learnt, or -1 */
+    uint64_t dst, pitch;
+    uint32_t w, h;
+    uint8_t *src;                   /* w x h texels as the GART held them */
+} r3cc = { .learning = -1 };
+
+static const uint8_t r3cc_perm[24][4] = {
+    {0,1,2,3},{0,1,3,2},{0,2,1,3},{0,2,3,1},{0,3,1,2},{0,3,2,1},
+    {1,0,2,3},{1,0,3,2},{1,2,0,3},{1,2,3,0},{1,3,0,2},{1,3,2,0},
+    {2,0,1,3},{2,0,3,1},{2,1,0,3},{2,1,3,0},{2,3,0,1},{2,3,1,0},
+    {3,0,1,2},{3,0,2,1},{3,1,0,2},{3,1,2,0},{3,2,0,1},{3,2,1,0},
+};
+
+/* True if the copy was made here (the draw needs nothing else). */
+static bool r300_cpu_copy(PPCMacGPUState *s, const R300DrawPacket *pkt)
+{
+    static int on = -1;
+    const R300TexDesc *td = &pkt->tex[0];
+    uint32_t w = pkt->copy_w, h = pkt->copy_h;
+    uint64_t pitch = (uint64_t)pkt->rt_pitch * 4, tpitch = td->lvl_pitch[0];
+    uint64_t dst = pkt->rt_gpu_addr + (uint64_t)pkt->copy_y * pitch + pkt->copy_x * 4;
+    uint64_t src = (uint64_t)(pkt->copy_y + pkt->copy_ty) * tpitch +
+                   (uint64_t)(pkt->copy_x + pkt->copy_tx) * 4;
+    uint64_t dst_hi = dst + (h - 1) * pitch + w * 4;
+
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_CPU_COPY");
+        on = !(e && e[0] == '0');
+    }
+    if (!on || !w || !td->host_data || s->r3_zpass_active || dst_hi > s->vram_size ||
+        src + (h - 1) * tpitch + w * 4 > td->size_bytes) {
+        return false;
+    }
+    uint32_t key[5] = { r300_reg(s->r3, 0x44C0), r300_reg(s->r3, 0x4540) & 0xF,
+                        r300_reg(s->r3, 0x46A4), r300_reg(s->r3, 0x4E38) & ~0x3FFEu,
+                        s->r300_card_bytes };
+    unsigned i;
+    for (i = 0; i < r3cc.nk && memcmp(r3cc.k[i].key, key, sizeof(key)); i++) {
+    }
+    if (i == r3cc.nk) {
+        if (i == ARRAY_SIZE(r3cc.k)) {
+            return false;
+        }
+        memcpy(r3cc.k[i].key, key, sizeof(key));
+        r3cc.k[i].perm = r3cc.k[i].cand = -1;
+        r3cc.nk++;
+    }
+    const uint8_t *tx = td->host_data + src;
+    if (r3cc.k[i].perm < 0) {
+        /* not known yet: the GPU draws it, r300_cpu_copy_learn compares */
+        if (r3cc.k[i].tries < 64) {
+            r3cc.k[i].tries++;
+            r3cc.learning = i;
+            r3cc.dst = dst;
+            r3cc.pitch = pitch;
+            r3cc.w = w;
+            r3cc.h = h;
+            r3cc.src = g_realloc(r3cc.src, (size_t)w * h * 4);
+            for (uint32_t y = 0; y < h; y++) {
+                memcpy(r3cc.src + (size_t)y * w * 4, tx + y * tpitch, (size_t)w * 4);
+            }
+        }
+        return false;
+    }
+    /* Older rendering into these bytes, or reads of them, go first. */
+    r200_vram_access(s, dst, dst_hi, true, 13);
+    const uint8_t *p = r3cc_perm[r3cc.k[i].perm];
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    for (uint32_t y = 0; y < h; y++) {
+        uint8_t *o = vram + dst + y * pitch;
+        const uint8_t *t = tx + y * tpitch;
+        for (uint32_t x = 0; x < w * 4; x += 4) {
+            o[x] = t[x + p[0]];
+            o[x + 1] = t[x + p[1]];
+            o[x + 2] = t[x + p[2]];
+            o[x + 3] = t[x + p[3]];
+        }
+    }
+    memory_region_set_dirty(&s->vram, dst, dst_hi - dst);
+    return true;
+}
+
+/* After the GPU made a copy r300_cpu_copy is learning from: which byte
+ * order turns the texels into what it stored. */
+static void r300_cpu_copy_learn(PPCMacGPUState *s, bool drawn)
+{
+    int i = r3cc.learning;
+    unsigned match = 0, found = 0;
+
+    r3cc.learning = -1;
+    if (i < 0 || !drawn) {
+        return;
+    }
+    r200_flush_at(s, R200_WHY_TAG(14));
+    const uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    for (unsigned p = 0; p < 24; p++) {
+        const uint8_t *q = r3cc_perm[p];
+        bool ok = true;
+        for (uint32_t y = 0; y < r3cc.h && ok; y++) {
+            const uint8_t *o = vram + r3cc.dst + y * r3cc.pitch;
+            const uint8_t *t = r3cc.src + (size_t)y * r3cc.w * 4;
+            for (uint32_t x = 0; x < r3cc.w * 4 && ok; x += 4) {
+                ok = o[x] == t[x + q[0]] && o[x + 1] == t[x + q[1]] &&
+                     o[x + 2] == t[x + q[2]] && o[x + 3] == t[x + q[3]];
+            }
+        }
+        if (ok) {
+            match++;
+            found = p;
+        }
+    }
+    if (match == 1) {
+        r3cc.k[i].hits = r3cc.k[i].cand == found ? r3cc.k[i].hits + 1 : 1;
+        r3cc.k[i].cand = found;
+        if (r3cc.k[i].hits == 2) {
+            r3cc.k[i].perm = found;
+        }
+    }
+    if (r3cc.k[i].perm >= 0 || r3cc.k[i].tries == 64) {
+        qemu_log("ppc-mac-gpu r300: texel copy %08x/%x/%05x/%08x/%u on the %s "
+                 "(byte order %u%u%u%u)\n", r3cc.k[i].key[0], r3cc.k[i].key[1],
+                 r3cc.k[i].key[2], r3cc.k[i].key[3], r3cc.k[i].key[4],
+                 r3cc.k[i].perm >= 0 ? "CPU" : "GPU: no single byte order matches",
+                 r3cc_perm[found][0], r3cc_perm[found][1], r3cc_perm[found][2],
+                 r3cc_perm[found][3]);
+    }
+}
+
 static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                         uint32_t body_dw, const R300Indices *idx)
 {
@@ -4365,6 +4522,11 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         s->regs.stall_draws++;
         return;
     }
+    if (r300_cpu_copy(s, &pkt)) {
+        r300_draw_free(&pkt);
+        s->regs.stall_draws++;
+        return;
+    }
     if (ns > 1) {
         static bool said;
         if (!said) {
@@ -4395,6 +4557,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         }
         r200_rate.gpu_vs += pkt.vs_glsl != NULL;
         int rr = s->renderer->draw_r300(s->renderer_opaque, vram, s->vram_size, &pkt);
+        r300_cpu_copy_learn(s, rr >= 0);
         if (s->r3_dump && g_r300_arm_rt && pkt.rt_gpu_addr == g_r300_arm_rt) {
             fprintf(s->r3_dump, "   renderer -> %d\n", rr);
         }

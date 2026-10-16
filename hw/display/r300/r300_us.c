@@ -473,6 +473,49 @@ static void us_emit_alu(R300Sb *sb, const R300State *st, unsigned i)
     r300_sb_printf(sb, "    }\n");
 }
 
+/*
+ * The program only copies texture unit 0 to render target A: one node,
+ * one LD from unit 0 into a temporary, one ALU instruction writing that
+ * temporary's RGB and alpha to target A as MAD src0 * 1 + 0 with no
+ * modifiers (the compiler's MOV).  *coord: the temporary the LD reads.
+ */
+/* A MAD (no presub, modifiers or omod) whose result is source 0 as is:
+ * src * 1 + 0, 1 * src + 0, or 0 * (0 or 1) + src. */
+static bool us_mad_is_src0(uint32_t inst, unsigned src, unsigned one, unsigned zero)
+{
+    unsigned a = inst & 0x1F, b = (inst >> 7) & 0x1F, c = (inst >> 14) & 0x1F;
+
+    if ((inst & 0x3FFFFFFFu & ~((0x1Fu) | (0x1Fu << 7) | (0x1Fu << 14))) != 0) {
+        return false;
+    }
+    return (c == zero && ((a == src && b == one) || (a == one && b == src))) ||
+           (c == src && ((a == zero && (b == zero || b == one)) ||
+                         (b == zero && a == one)));
+}
+
+bool r300_us_plain_copy(const R300State *st, unsigned *coord)
+{
+    USNode nd[4];
+
+    if (us_nodes(st, nd) != 1 || nd[0].tex_count != 1 || nd[0].alu_count != 1) {
+        return false;
+    }
+    uint32_t ti = r300_reg(st, US_TEX_INST_0 + 4 * nd[0].tex_start);
+    unsigned t = (ti >> 6) & 0x1F, i = nd[0].alu_start;
+    uint32_t ra = r300_reg(st, US_ALU_RGB_ADDR_0 + 4 * i);
+    uint32_t aa = r300_reg(st, US_ALU_ALPHA_ADDR_0 + 4 * i);
+    uint32_t ri = r300_reg(st, US_ALU_RGB_INST_0 + 4 * i);
+    uint32_t ai = r300_reg(st, US_ALU_ALPHA_INST_0 + 4 * i);
+
+    *coord = ti & 0x1F;
+    /* clamp (bit 30) is harmless: texels of an 8-bit format are in [0, 1] */
+    return ((ti >> 15) & 7) == 1 && ((ti >> 11) & 0xF) == 0 &&
+           (ra & 0x3F) == t && (aa & 0x3F) == t &&
+           us_mad_is_src0(ri, 0, 21, 20) && us_mad_is_src0(ai, 9, 17, 16) &&
+           ((ra >> 26) & 7) == 7 && ((ra >> 29) & 3) == 0 &&
+           ((aa >> 24) & 1) && ((aa >> 25) & 3) == 0 && !((aa >> 27) & 1);
+}
+
 /* Render targets the active program writes (bit n: target n), and
  * whether it writes depth (OMASK_W). */
 static uint32_t us_targets_written(const R300State *st, bool *writes_w)

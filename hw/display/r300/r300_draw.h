@@ -197,6 +197,14 @@ typedef struct R300DrawPacket {
     uint32_t prim_class;        /* 0 triangles, 1 lines (of num_verts) */
 
     uint32_t warn;              /* R300_WARN_* bits for things skipped */
+
+    /*
+     * copy_w != 0: the draw only copies texels of unit 0 into colour
+     * buffer 0, pixel (x, y) of [copy_x, +copy_w) x [copy_y, +copy_h)
+     * taking texel (x + copy_tx, y + copy_ty) (r300_draw.c copy_detect).
+     */
+    uint32_t copy_x, copy_y, copy_w, copy_h;
+    int32_t copy_tx, copy_ty;
 } R300DrawPacket;
 
 #define R300_WARN_PVS           (1u << 0)
