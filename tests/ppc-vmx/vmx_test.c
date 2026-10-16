@@ -47,6 +47,7 @@ enum {
     OP_VMULEUH, OP_VMULOUH, OP_VMULESH, OP_VMULOSH,
     OP_VMSUMUBM, OP_VMSUMMBM, OP_VMSUMUHM, OP_VMSUMSHM,
     OP_LVSL, OP_LVSR, OP_LVX, OP_LDU16, OP_LDU15,
+    OP_VMHRADDSHS, OP_VMHADDSHS, OP_VPERM_DB,
     OP_VADDFP, OP_VSUBFP, OP_VMAXFP, OP_VMINFP, OP_VMADDFP, OP_VNMSUBFP,
     OP_VREFP, OP_VCFSX, OP_VCFUX, OP_VCTSXS, OP_VCTUXS,
     NOPS
@@ -92,6 +93,26 @@ static V rand_vec(uint32_t *s)
     for (i = 0; i < 16; i++) {
         uint32_t x = rnd(s);
         r.b[i] = (x & 7) == 0 ? edge[(x >> 3) & 7] : x >> 8;
+    }
+    return r;
+}
+
+/*
+ * Random halfwords, half of them edge values (vmhraddshs corners); with
+ * all_min every lane is -32768 (the -32768 * -32768 product).
+ */
+static V rand_hvec(uint32_t *s, int all_min)
+{
+    static const int16_t edge[16] = {
+        -32768, -32768, -32767, -16385, -16384, -16383, -1, 0,
+        1, 16383, 16384, 16385, 32766, 32767, 0x4001, -0x4001
+    };
+    V r;
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        uint32_t x = rnd(s);
+        r.sh[i] = all_min ? -32768 : (x & 1) ? edge[(x >> 1) & 15] : x >> 16;
     }
     return r;
 }
@@ -258,6 +279,10 @@ static void run_op(int op, V a, V b, V c, int sh, V *got, V *exp,
     case OP_VPERM_DC:
         r = c;
         asm volatile("vperm %0,%1,%2,%0" : "+v"(r.v) : "v"(a.v), "v"(b.v));
+        goto ref_perm;
+    case OP_VPERM_DB:
+        r = b;
+        asm volatile("vperm %0,%1,%0,%2" : "+v"(r.v) : "v"(a.v), "v"(c.v));
         goto ref_perm;
     case OP_VPERM_AA:
         b = a;
@@ -549,6 +574,20 @@ static void run_op(int op, V a, V b, V c, int sh, V *got, V *exp,
         }
         break;
     }
+    case OP_VMHRADDSHS:
+    case OP_VMHADDSHS:
+        if (op == OP_VMHRADDSHS) {
+            ASM4("vmhraddshs", r, a, b, c);
+        } else {
+            ASM4("vmhaddshs", r, a, b, c);
+        }
+        for (i = 0; i < 8; i++) {
+            int32_t prod = (int32_t)a.sh[i] * b.sh[i]
+                           + (op == OP_VMHRADDSHS ? 0x4000 : 0);
+            e.sh[i] = clamp((int32_t)c.sh[i] + (prod >> 15),
+                            -0x8000, 0x7fff, &sat);
+        }
+        break;
     case OP_VMSUMSHM:
         ASM4("vmsumshm", r, a, b, c);
         for (i = 0; i < 4; i++) {
@@ -637,6 +676,14 @@ static void bench(void)
         }
         res[0x212] = tb() - t0;
     }
+
+    t0 = tb();
+    for (i = 0; i < BENCH_ITERS; i++) {
+        asm volatile("vmhraddshs %0,%0,%1,%2\n\tvmhraddshs %0,%0,%1,%2\n\t"
+                     "vmhraddshs %0,%0,%1,%2\n\tvmhraddshs %0,%0,%1,%2"
+                     : "+v"(a.v) : "v"(b.v), "v"(c.v));
+    }
+    res[0x213] = tb() - t0;
 
     /* 0.5f, 1.0f, 0.25f: stays finite and normal. */
     a.w[0] = a.w[1] = a.w[2] = a.w[3] = 0x3f000000;
@@ -1147,6 +1194,11 @@ int main(void)
             V got, exp;
             int gs, es, bad = 0;
 
+            if (op == OP_VMHRADDSHS || op == OP_VMHADDSHS) {
+                a = rand_hvec(&seed, (it & 7) == 0);
+                b = rand_hvec(&seed, (it & 7) == 0);
+                c = rand_hvec(&seed, 0);
+            }
             if (op >= FIRST_FP_OP) {
                 a = rand_fvec(&seed);
                 b = rand_fvec(&seed);
