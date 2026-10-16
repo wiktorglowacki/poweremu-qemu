@@ -54,7 +54,7 @@
 
 #define VK_PAGE             PPC_MAC_GPU_DIRTY_PAGE
 #define VK_MAX_IMG          128
-#define VK_MAX_TEXFULL      48
+#define VK_MAX_TEXFULL      512
 #define VK_MAX_FB           64
 #define VK_MAX_RP           32
 #define VK_NBATCH           6
@@ -150,6 +150,8 @@ typedef struct VkTexFull {
     VkDeviceMemory mem;
     VkImageView view;
     uint64_t used;
+    uint64_t gen;               /* VRAM texture: page generation it matches */
+    uint32_t size;              /* ... over these bytes from key.addr */
 } VkTexFull;
 
 typedef struct VkRP {
@@ -1098,6 +1100,28 @@ static bool vk_check(void)
         on = e && e[0] == '1';
     }
     return on;
+}
+
+/* PPCGPU_TEXFULL_GEN=0: hash rebuilt VRAM textures on every lookup (A/B). */
+static bool vk_texfull_gen(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_TEXFULL_GEN");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/* PPCGPU_TEXFULL_MAX=48: the old size of the rebuilt-texture cache (A/B). */
+static int vk_texfull_max(void)
+{
+    static int n = -1;
+    if (n < 0) {
+        const char *e = getenv("PPCGPU_TEXFULL_MAX");
+        n = e ? CLAMP(atoi(e), 1, VK_MAX_TEXFULL) : VK_MAX_TEXFULL;
+    }
+    return n;
 }
 
 static bool vk_range_pending(uint64_t lo, uint64_t hi);
@@ -2503,8 +2527,37 @@ static VkImageView vk_texture_full(const R300TexDesc *td)
     VkFormat fmt = vk_tex_format(td->kind);
     VkTexKey key = { td->gpu_addr, td->format, td->kind, td->width, td->height,
                      td->depth, td->dim, td->levels, td->pitch_bytes,
-                     (td->host_data != NULL ? 1u : 0u) | (td->endian << 1) | (td->card_bytes ? 8u : 0u) | (td->tiling << 4), r300_hash_tex(src, td->size_bytes) };
-    int lru = 0;
+                     (td->host_data != NULL ? 1u : 0u) | (td->endian << 1) | (td->card_bytes ? 8u : 0u) | (td->tiling << 4), 0 };
+    int lru = 0, stale = -1;
+    /*
+     * A VRAM texture whose pages are no newer than when an entry was built
+     * or last matched is that entry: no hash.  The caller harvested CPU
+     * writes and flushed pending GPU ones; draws and 2D ops stamp theirs.
+     * GART textures (host_data) have no page generations: always hashed.
+     */
+    uint64_t gen = td->host_data || !vk_texfull_gen() ? 0 :
+                   vk_range_gen(td->gpu_addr, (uint64_t)td->gpu_addr + td->size_bytes);
+
+    V.stat_tf_calls++;
+    for (int i = 0; gen && i < vk_texfull_max(); i++) {
+        VkTexFull *t = &V.texfull[i];
+        if (t->live && t->gen == gen && t->size == td->size_bytes &&
+            !memcmp(&t->key, &key, offsetof(VkTexKey, hash))) {
+            if (vk_check() && r300_hash_tex(src, td->size_bytes) != t->key.hash) {
+                static int n;
+                if (n++ < 200) {
+                    qemu_log("ppc-mac-gpu vulkan CHECK: rebuilt texture %06x %ux%u "
+                             "changed in VRAM without a newer page generation\n",
+                             td->gpu_addr, td->width, td->height);
+                }
+                break;
+            }
+            t->used = ++V.clock;
+            return t->view;
+        }
+    }
+    key.hash = r300_hash_tex(src, td->size_bytes);
+    V.stat_tf_hashed++;
 
     if (dxt && !V.bc) {
         vk_warn(1u << 2, "DXT texture on a GPU without BC formats");
@@ -2514,17 +2567,25 @@ static VkImageView vk_texture_full(const R300TexDesc *td)
         vk_warn(1u << 3, "cube map with non-square faces");
         return VK_NULL_HANDLE;
     }
-    for (int i = 0; i < VK_MAX_TEXFULL; i++) {
+    for (int i = 0; i < vk_texfull_max(); i++) {
         VkTexFull *t = &V.texfull[i];
         if (t->live && !memcmp(&t->key, &key, sizeof(key))) {
             t->used = ++V.clock;
+            t->gen = gen;
+            t->size = td->size_bytes;
             return t->view;
         }
         if (!t->live || (V.texfull[lru].live && t->used < V.texfull[lru].used)) {
             lru = i;
         }
+        /* an older version of these bytes: the one to replace, so a
+         * texture rewritten in place holds one entry, not hundreds */
+        if (t->live && !memcmp(&t->key, &key, offsetof(VkTexKey, hash))) {
+            stale = i;
+        }
     }
-    VkTexFull *t = &V.texfull[lru];
+    VkTexFull *t = &V.texfull[stale >= 0 ? stale : lru];
+    V.stat_tf_built++;
     if (t->live) {
         vk_trash(NULL, TRASH_VIEW, (uint64_t)(uintptr_t)t->view);
         vk_trash(NULL, TRASH_IMAGE, (uint64_t)(uintptr_t)t->img);
@@ -2589,6 +2650,8 @@ static VkImageView vk_texture_full(const R300TexDesc *td)
     t->live = true;
     t->key = key;
     t->used = ++V.clock;
+    t->gen = gen;
+    t->size = td->size_bytes;
     return t->view;
 }
 
