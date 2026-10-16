@@ -14,6 +14,7 @@
 #define have_avx1         (cpuinfo & CPUINFO_AVX1)
 #define have_avx2         (cpuinfo & CPUINFO_AVX2)
 #define have_movbe        (cpuinfo & CPUINFO_MOVBE)
+#define have_fma          (cpuinfo & CPUINFO_FMA)
 
 /*
  * There are interesting instructions in AVX512, so long as we have AVX512VL,
@@ -118,6 +119,13 @@
 #define TCG_TARGET_HAS_bitsel_vec       have_avx512vl
 #define TCG_TARGET_HAS_cmpsel_vec       1
 #define TCG_TARGET_HAS_tst_vec          have_avx512bw
+/* vpshufb: SSSE3, implied by the AVX1 that all vector support needs. */
+#define TCG_TARGET_HAS_tbl_vec          have_avx1
+/*
+ * Scalar SSE arithmetic needs only AVX1 (for the VEX forms), but the
+ * three FP ops are all-or-nothing and ffma_vec needs FMA3.
+ */
+#define TCG_TARGET_HAS_fp_vec           have_fma
 
 #define TCG_TARGET_deposit_valid(type, ofs, len) \
     (((ofs) == 0 && ((len) == 8 || (len) == 16)) || \

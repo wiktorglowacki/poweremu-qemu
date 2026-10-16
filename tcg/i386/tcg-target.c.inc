@@ -409,6 +409,23 @@ static bool tcg_target_const_match(int64_t val, int ct,
 #define OPC_PUNPCKHDQ   (0x6a | P_EXT | P_DATA16)
 #define OPC_PUNPCKHQDQ  (0x6d | P_EXT | P_DATA16)
 #define OPC_PXOR        (0xef | P_EXT | P_DATA16)
+#define OPC_XORPS       (0x57 | P_EXT)
+/* Scalar double (F2) and single (F3) arithmetic. */
+#define OPC_ADDSD       (0x58 | P_EXT | P_SIMDF2)
+#define OPC_ADDSS       (0x58 | P_EXT | P_SIMDF3)
+#define OPC_MULSD       (0x59 | P_EXT | P_SIMDF2)
+#define OPC_MULSS       (0x59 | P_EXT | P_SIMDF3)
+#define OPC_SUBSD       (0x5c | P_EXT | P_SIMDF2)
+#define OPC_SUBSS       (0x5c | P_EXT | P_SIMDF3)
+#define OPC_DIVSD       (0x5e | P_EXT | P_SIMDF2)
+#define OPC_DIVSS       (0x5e | P_EXT | P_SIMDF3)
+#define OPC_CVTSD2SS    (0x5a | P_EXT | P_SIMDF2)
+#define OPC_CVTSS2SD    (0x5a | P_EXT | P_SIMDF3)
+/* FMA3 scalar single; add P_VEXW for double. */
+#define OPC_VFMADD213SS (0xa9 | P_EXT38 | P_DATA16)
+#define OPC_VFMADD231SS (0xb9 | P_EXT38 | P_DATA16)
+#define OPC_VFMSUB213SS (0xab | P_EXT38 | P_DATA16)
+#define OPC_VFMSUB231SS (0xbb | P_EXT38 | P_DATA16)
 #define OPC_POP_r32	(0x58)
 #define OPC_POPCNT      (0xb8 | P_EXT | P_SIMDF3)
 #define OPC_PUSH_r32	(0x50)
@@ -905,6 +922,28 @@ static inline void tcg_out_vex_modrm_pool(TCGContext *s, int opc, int r)
     tcg_out32(s, 0);
 }
 
+/* Output "r = v op m128" with m128 the 64-bit d x 2 from the constant pool. */
+static void tcg_out_vex_pool_q2(TCGContext *s, int opc, int r, int v,
+                                uint64_t d)
+{
+    tcg_out_vex_opc(s, opc, r, v, 0, 0);
+    tcg_out8(s, LOWREGMASK(r) << 3 | 5);
+    tcg_out32(s, 0);
+    if (TCG_TARGET_REG_BITS == 64) {
+        new_pool_l2(s, R_386_PC32, s->code_ptr - 4, -4, d, d);
+    } else {
+        new_pool_l4(s, R_386_32, s->code_ptr - 4, 0,
+                    (uint32_t)d, d >> 32, (uint32_t)d, d >> 32);
+    }
+}
+
+/* Output "r = v op m128" with m128 the byte c x 16 from the constant pool. */
+static void tcg_out_vex_pool_b16(TCGContext *s, int opc, int r, int v,
+                                 uint8_t c)
+{
+    tcg_out_vex_pool_q2(s, opc, r, v, dup_const(MO_8, c));
+}
+
 /* Generate dest op= src.  Uses the same ARITH_* codes as tgen_arithi.  */
 static inline void tgen_arithr(TCGContext *s, int subop, int dest, int src)
 {
@@ -1213,12 +1252,14 @@ static void tcg_out_ld(TCGContext *s, TCGType type, TCGReg ret,
         break;
     case TCG_TYPE_V128:
         /*
-         * The gvec infrastructure is asserts that v128 vector loads
-         * and stores use a 16-byte aligned offset.  Validate that the
-         * final pointer is aligned by using an insn that will SIGSEGV.
+         * The gvec infrastructure only issues 16-byte aligned v128
+         * loads, but the PPC AltiVec translator also loads constant
+         * byte tables from arbitrary host pointers (vsldoi's window
+         * into an index sequence), as AArch64's LDR Q allows.  Use an
+         * unaligned load; it costs the same as MOVDQA when aligned.
          */
         tcg_debug_assert(ret >= 16);
-        tcg_out_vex_modrm_offset(s, OPC_MOVDQA_VxWx, ret, 0, arg1, arg2);
+        tcg_out_vex_modrm_offset(s, OPC_MOVDQU_VxWx, ret, 0, arg1, arg2);
         break;
     case TCG_TYPE_V256:
         /*
@@ -3244,6 +3285,24 @@ static void tcg_out_cmpsel_vec(TCGContext *s, TCGType type, unsigned vece,
     }
 }
 
+/*
+ * One half of tbl_vec: d = table[idx & 15] where idx selects that half
+ * (0-15 for the low table, 16-31 for the high one), else 0.  vpshufb
+ * zeroes a byte whose index has bit 7 set and otherwise uses bits 0-3;
+ * the saturating add of 0x70 sets bit 7 for every index >= 16, after
+ * idx ^ 16 has moved the high half's 16-31 down to 0-15.
+ */
+static void tcg_out_tbl_half(TCGContext *s, TCGReg d, TCGReg table,
+                             TCGReg idx, bool high)
+{
+    if (high) {
+        tcg_out_vex_pool_b16(s, OPC_PXOR, d, idx, 0x10);
+        idx = d;
+    }
+    tcg_out_vex_pool_b16(s, OPC_PADDUB, d, idx, 0x70);
+    tcg_out_vex_modrm(s, OPC_PSHUFB, d, table, d);
+}
+
 static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
                            unsigned vecl, unsigned vece,
                            const TCGArg args[TCG_MAX_OP_ARGS],
@@ -3565,6 +3624,79 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         tcg_out8(s, sub);
         break;
 
+    case INDEX_op_tbl_vec:
+        /*
+         * r[i] = (a:b)[idx[i]], 0 for idx[i] >= 32.  One half is looked
+         * up into TMP_VEC, the other into a0, then OR'd; the half whose
+         * table a0 overwrites goes first.
+         */
+        a3 = args[3];
+        if (a1 == a2) {
+            /* One table: +us 0x60 keeps 0-31 below 0x80, rest above.  */
+            tcg_out_vex_pool_b16(s, OPC_PADDUB, TCG_TMP_VEC, a3, 0x60);
+            tcg_out_vex_modrm(s, OPC_PSHUFB, a0, a1, TCG_TMP_VEC);
+            break;
+        }
+        if (a0 != a2) {
+            tcg_out_tbl_half(s, TCG_TMP_VEC, a1, a3, false);
+            tcg_out_tbl_half(s, a0, a2, a3, true);
+        } else {
+            tcg_out_tbl_half(s, TCG_TMP_VEC, a2, a3, true);
+            tcg_out_tbl_half(s, a0, a1, a3, false);
+        }
+        tcg_out_vex_modrm(s, OPC_POR, a0, a0, TCG_TMP_VEC);
+        break;
+
+    case INDEX_op_fop_vec:
+        /* Scalar VADDSD etc. (SS for MO_32), three-operand. */
+        {
+            static const int fop_insn[4][2] = {
+                { OPC_ADDSS, OPC_ADDSD }, { OPC_SUBSS, OPC_SUBSD },
+                { OPC_MULSS, OPC_MULSD }, { OPC_DIVSS, OPC_DIVSD },
+            };
+            tcg_out_vex_modrm(s, fop_insn[args[3]][vece == MO_64],
+                              a0, a1, a2);
+        }
+        break;
+    case INDEX_op_ffma_vec:
+        /*
+         * r = a*c + b in PowerPC's four forms.  VFMADD231 r, a, c adds
+         * a*c to r, so r must start as b; VFMADD213 r, x, b computes
+         * x*r + b, for r starting as a or c.  PowerPC's negated forms
+         * negate the rounded result (an exact zero sum gives -0), which
+         * VFNMADD/VFNMSUB's operand negation does not, so flip the sign
+         * bit afterwards instead.
+         */
+        {
+            static const int fma_insn[2][2] = {
+                { OPC_VFMADD213SS, OPC_VFMADD231SS },
+                { OPC_VFMSUB213SS, OPC_VFMSUB231SS },
+            };
+            int w = vece == MO_64 ? P_VEXW : 0;
+            int msub = args[4] & 1;
+
+            a3 = args[3];
+            if (a0 == a3) {
+                tcg_out_vex_modrm(s, fma_insn[msub][1] | w, a0, a1, a2);
+            } else if (a0 == a1 || a0 == a2) {
+                tcg_out_vex_modrm(s, fma_insn[msub][0] | w, a0,
+                                  a0 == a1 ? a2 : a1, a3);
+            } else {
+                tcg_out_mov(s, type, a0, a3);
+                tcg_out_vex_modrm(s, fma_insn[msub][1] | w, a0, a1, a2);
+            }
+            if (args[4] & 2) {
+                tcg_out_vex_pool_q2(s, OPC_XORPS, a0, a0,
+                                    vece == MO_64 ? INT64_MIN
+                                    : dup_const(MO_32, 0x80000000));
+            }
+        }
+        break;
+    case INDEX_op_fcvt_vec:
+        /* The untouched high part comes from a1, not a0 (no false dep). */
+        tcg_out_vex_modrm(s, a2 ? OPC_CVTSS2SD : OPC_CVTSD2SS, a0, a1, a1);
+        break;
+
     case INDEX_op_x86_psrldq_vec:
         tcg_out_vex_modrm(s, OPC_GRP14, 3, a0, a1);
         tcg_out8(s, a2);
@@ -3800,6 +3932,7 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_x86_punpckl_vec:
     case INDEX_op_x86_punpckh_vec:
     case INDEX_op_x86_vpshldi_vec:
+    case INDEX_op_fop_vec:
 #if TCG_TARGET_REG_BITS == 32
     case INDEX_op_dup2_vec:
 #endif
@@ -3813,6 +3946,7 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_sari_vec:
     case INDEX_op_rotli_vec:
     case INDEX_op_x86_psrldq_vec:
+    case INDEX_op_fcvt_vec:
         return C_O1_I1(x, x);
 
     case INDEX_op_x86_vpshldv_vec:
@@ -3820,6 +3954,8 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
         return C_O1_I3(x, 0, x, x);
 
     case INDEX_op_bitsel_vec:
+    case INDEX_op_tbl_vec:
+    case INDEX_op_ffma_vec:
         return C_O1_I3(x, x, x, x);
     case INDEX_op_cmpsel_vec:
         return C_O1_I4(x, x, x, xO, x);
@@ -3848,6 +3984,13 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_cmp_vec:
     case INDEX_op_cmpsel_vec:
         return -1;
+    case INDEX_op_tbl_vec:
+        return TCG_TARGET_HAS_tbl_vec && type == TCG_TYPE_V128 && vece == MO_8;
+    case INDEX_op_fop_vec:
+    case INDEX_op_ffma_vec:
+    case INDEX_op_fcvt_vec:
+        return TCG_TARGET_HAS_fp_vec && type == TCG_TYPE_V64
+               && (vece == MO_32 || vece == MO_64);
 
     case INDEX_op_rotli_vec:
         return have_avx512vl && vece >= MO_32 ? 1 : -1;
