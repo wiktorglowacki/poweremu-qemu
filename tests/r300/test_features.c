@@ -5,6 +5,7 @@
  */
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "../../hw/display/r300/r300_draw.h"
 
@@ -320,6 +321,206 @@ static void rendering_completeness(void)
     r300_state_write(&st, 0x4E00, 0);
 }
 
+static void upload_ports(void)
+{
+    R300State state;
+    const uint32_t words[4] = { 0x00100201, 0x00D10002, 0x00D10001, 0x00D10005 };
+    r300_state_reset(&state);
+    r300_state_write(&state, 0x2200, 3);
+    for (int i = 0; i < 4; i++) {
+        r300_state_write(&state, i < 2 ? 0x2204 : 0x2208, words[i]);
+    }
+    CHECK(!memcmp(&state.pvs_mem[12], words, sizeof(words)) && state.pvs_upload_dw == 16,
+          "both PVS upload ports must share the vector index");
+    CHECK(state.pvs_gen == 4, "PVS upload must invalidate cached shaders");
+    r300_state_write(&state, 0x2200, 2047);
+    r300_state_write(&state, 0x2204, 0xdeadbeef);
+    CHECK(!memcmp(&state.pvs_mem[12], words, sizeof(words)), "PVS upload bounds");
+}
+
+static void draw_bounds(void)
+{
+    R300Vertex v[3] = { { .pos = { -0.5f, 0.5f, 0, 1 } },
+                        { .pos = { 0.5f, 0.5f, 0, 1 } },
+                        { .pos = { 0, -0.5f, 0, 1 } } };
+    R300DrawPacket p = { .rt_width = 100, .rt_height = 100,
+                        .scissor = { 0, 0, 100, 100 }, .verts = v, .num_verts = 3 };
+    uint32_t b[4];
+    r300_draw_bounds(&p, b);
+    CHECK(b[0] == 24 && b[1] == 24 && b[2] == 76 && b[3] == 76,
+          "triangle bounds %u,%u-%u,%u", b[0], b[1], b[2], b[3]);
+    p.scissor[0] = 30; p.scissor[3] = 50;
+    r300_draw_bounds(&p, b);
+    CHECK(b[0] == 30 && b[3] == 50, "bounds escaped scissor");
+    v[0].pos[3] = -1;
+    r300_draw_bounds(&p, b);
+    CHECK(b[0] == 30 && b[1] == 0 && b[2] == 100 && b[3] == 50,
+          "eye-plane crossing must retain hardware scissor");
+    v[0].pos[3] = 1; p.vs_glsl = "gpu shader";
+    r300_draw_bounds(&p, b);
+    CHECK(b[1] == 0 && b[2] == 100, "GPU vertex positions cannot be bounded on CPU");
+}
+
+static void bypass_semantics(void)
+{
+    R300Arrays none = { 0 };
+    R300DrawPacket p;
+    const char *err = NULL;
+    uint32_t n;
+    const float xy[4][2] = { { 0, 0 }, { 100, 0 }, { 100, 100 }, { 0, 100 } };
+    uint32_t *d = immd_pkt(13, 4, xy, &n);
+
+    load_state();
+    r300_state_write(&st, 0x2140, 0x102);  /* PVS bypass */
+    r300_state_write(&st, 0x20D0, 0);      /* window coordinates */
+    r300_state_write(&st, 0x2150, 0x02030003); /* position 0, colour 2 */
+    r300_state_write(&st, 0x2154, 0x00002603); /* texture 6, last */
+    CHECK(r300_draw_build(&st, &none, 0x35, d, n, rd, NULL, &p, &err),
+          "bypass: %s", err ? err : "");
+    if (p.verts && p.num_verts >= 3) {
+        CHECK(FEQ(p.verts[0].v[1][1], 0.5f) && FEQ(p.verts[0].v[1][2], 0.25f),
+              "bypass colour must come from input 2");
+        CHECK(FEQ(p.verts[1].v[0][0], 100) && FEQ(p.verts[2].v[0][1], 100),
+              "bypass texture must come from input 6");
+    }
+    r300_draw_free(&p);
+}
+
+static void viewport_ports(void)
+{
+    R300Arrays none = { 0 };
+    R300DrawPacket p;
+    const char *err = NULL;
+    const float xy[4][2] = { { 0, 0 }, { 100, 0 }, { 100, 100 }, { 0, 100 } };
+    const float vp[6] = { 64, 64, -32, 32, 0.5f, 0.25f };
+    uint32_t n, *d = immd_pkt(13, 4, xy, &n);
+
+    load_state();
+    r300_state_write(&st, 0x2140, 0x102);
+    r300_state_write(&st, 0x20B0, 0x13F);
+    for (unsigned i = 0; i < 6; i++) {
+        uint32_t bits;
+        memcpy(&bits, &vp[i], sizeof(bits));
+        r300_state_write(&st, 0x2098 + i * 4, bits);
+        CHECK(r300_reg(&st, 0x1D98 + i * 4) == bits, "native viewport port %u", i);
+    }
+    CHECK(r300_draw_build(&st, &none, 0x35, d, n, rd, NULL, &p, &err),
+          "viewport: %s", err ? err : "");
+    if (p.verts && p.num_verts) {
+        CHECK(FEQ(p.verts[0].pos[0], 128.0f / p.rt_width - 1.0f) &&
+              FEQ(p.verts[0].pos[1], 1.0f - 64.0f / p.rt_height),
+              "native viewport transform ignored");
+    }
+    r300_draw_free(&p);
+    r300_state_write(&st, 0x1D98, 0x3F800000);
+    CHECK(r300_reg(&st, 0x2098) == 0x3F800000, "legacy viewport port");
+}
+
+static void native_texture_bytes(void)
+{
+    R300TexDesc t = { .card_bytes = true, .kind = R300_TEXK_RGBA8,
+        .width = 1, .height = 1, .levels = 1, .lvl_pitch = { 4 } };
+    /* Captured Gears red (.875878,.109485,0,1), US_OUT_FMT=1b00. */
+    const uint8_t bgra[4] = { 0, 28, 223, 255 };
+    uint32_t bpr;
+    for (unsigned mode = 0; mode < 4; mode++) {
+        const unsigned lanes[4] = { 0, 1, 3, 2 };
+        uint8_t card[4];
+        for (unsigned i = 0; i < 4; i++) card[i] = bgra[i ^ lanes[mode]];
+        t.endian = mode;
+        uint8_t *tex = r300_tex_level_bytes(&t, card, 0, 1, 1, &bpr);
+        CHECK(tex && bpr == 4 && !memcmp(tex, bgra, 4), "card texture endian %u", mode);
+        if (tex) {
+            CHECK(tex[2] == 223 && tex[1] == 28 && tex[0] == 0 && tex[3] == 255,
+                  "Gears red texture/scanout roundtrip %u", mode);
+        }
+        free(tex);
+    }
+    t.kind = R300_TEXK_CONVERT16; t.format = 6; t.endian = 0;
+    const uint8_t red565[4] = { 0, 0xf8, 0, 0 };
+    uint8_t *tex = r300_tex_level_bytes(&t, red565, 0, 1, 1, &bpr);
+    CHECK(tex && tex[0] == 0 && tex[1] == 0 && tex[2] == 255, "native 565 texel");
+    free(tex);
+    t.kind = R300_TEXK_RG8; t.endian = 2; t.lvl_pitch[0] = 2;
+    CHECK(!r300_tex_card_swap_valid(&t), "partial swap DWORD accepted");
+    CHECK(!r300_tex_level_bytes(&t, red565, 0, 1, 1, &bpr), "partial swap texture read accepted");
+}
+
+static void morphos_color_profile(void)
+{
+    load_state();
+    for (unsigned k = 0; k < 4; k++) {
+        for (unsigned e = 0; e < 4; e++) {
+            r300_state_write(&st, 0x4E38 + 4 * k, (6u << 21) | (e << 19) | 64);
+            r300_state_write(&st, 0x46A4 + 4 * k, 0x1B00);
+            st.card_bytes = true;
+            st.morphos_color_compat = false;
+            CHECK(r300_color_endian(&st, k) == e, "default RT%u endian%u", k, e);
+            st.morphos_color_compat = true;
+            st.card_bytes = false;
+            CHECK(r300_color_endian(&st, k) == e, "legacy RT%u endian%u", k, e);
+            st.card_bytes = true;
+            CHECK(r300_color_endian(&st, k) == (e == 2 ? 0 : e),
+                  "MorphOS RGBA8 RT%u endian%u", k, e);
+            r300_state_write(&st, 0x46A4 + 4 * k, 0x1B13); /* R32U, not RGBA8. */
+            CHECK(r300_color_endian(&st, k) == e, "typed RT%u endian%u", k, e);
+            r300_state_write(&st, 0x4E38 + 4 * k, (4u << 21) | (e << 19) | 64);
+            CHECK(r300_color_endian(&st, k) == e, "RGB565 RT%u endian%u", k, e);
+        }
+    }
+
+    load_state();
+    r300_state_write(&st, 0x4E00, r300_reg(&st, 0x4E00) | (3u << 5));
+    for (unsigned k = 0; k < 4; k++) {
+        r300_state_write(&st, 0x4E38 + 4 * k, (6u << 21) | (2u << 19) | 64);
+        r300_state_write(&st, 0x46A4 + 4 * k, 0x1B00);
+    }
+    R300Arrays none = { 0 };
+    R300DrawPacket p;
+    const char *build_err = NULL;
+    st.card_bytes = true;
+    for (unsigned enabled = 0; enabled < 2; enabled++) {
+        st.morphos_color_compat = enabled;
+        CHECK(r300_draw_build(&st, &none, 0x35, immd, 49, rd, NULL, &p, &build_err),
+              "profile packet: %s", build_err ? build_err : "");
+        CHECK(p.uniforms.rt_endian == (enabled ? 0 : 2) &&
+              p.uniforms.rt_swap32 == !enabled, "RT0 uniforms did not use the profile");
+        r300_draw_free(&p);
+    }
+    R300FSDesc desc = { 0 };
+    const char *err = NULL;
+    for (unsigned flags = 0; flags < 2; flags++) {
+        uint32_t original_id, legacy_id, compat_id, restored_id;
+        st.card_bytes = true;
+        st.morphos_color_compat = false;
+        char *original = r300_us_glsl_cached(&st, &desc, flags, &original_id, &err);
+        CHECK(original && original_id, "default MRT shader: %s", err ? err : "");
+        st.morphos_color_compat = true;
+        st.card_bytes = false;
+        char *legacy = r300_us_glsl_cached(&st, &desc, flags, &legacy_id, &err);
+        CHECK(legacy && legacy_id == original_id, "legacy handoff changed default cache");
+        st.card_bytes = true;
+        char *compat = r300_us_glsl_cached(&st, &desc, flags, &compat_id, &err);
+        CHECK(compat && compat_id && compat_id != original_id,
+              "native compatibility reused the default MRT shader id");
+        if (original && legacy && compat) {
+            CHECK(!strcmp(original, legacy) && strcmp(original, compat),
+                  "MRT shader text did not separate native compatibility");
+            CHECK(strstr(original, "r300_unpack(fb, uvec4(3u, 2u, 1u, 0u), 1u)") &&
+                  strstr(compat, "r300_unpack(fb, uvec4(3u, 2u, 1u, 0u), 0u)"),
+                  "MRT framebuffer load did not use the effective endian");
+            CHECK(strstr(original, "r300_pack(c, uvec4(3u, 2u, 1u, 0u), 1u)") &&
+                  strstr(compat, "r300_pack(c, uvec4(3u, 2u, 1u, 0u), 0u)"),
+                  "MRT framebuffer store did not use the effective endian");
+        }
+        st.morphos_color_compat = false;
+        char *restored = r300_us_glsl_cached(&st, &desc, flags, &restored_id, &err);
+        CHECK(restored && restored_id == original_id && original &&
+              !strcmp(restored, original), "return to default missed its original shader cache");
+        free(original); free(legacy); free(compat); free(restored);
+    }
+}
+
 int main(void)
 {
     R300Arrays none = { 0 };
@@ -455,6 +656,12 @@ int main(void)
     CHECK(r300_msaa_offset(592, 496, 2, 704, 4, 0) == 0x2b3400, "msaa sample 0 %x",
           r300_msaa_offset(592, 496, 2, 704, 4, 0));
     rendering_completeness();
+    bypass_semantics();
+    viewport_ports();
+    draw_bounds();
+    upload_ports();
+    native_texture_bytes();
+    morphos_color_profile();
     printf(fails ? "test_features: %d FAILED\n" : "test_features: PASS\n", fails);
     return fails != 0;
 }
