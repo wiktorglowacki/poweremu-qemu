@@ -20,6 +20,16 @@ extern bool one_insn_per_tb;
 extern bool icount_align_option;
 
 /*
+ * Guest pcs whose instruction was found doing I/O in the middle of a TB
+ * (see cpu_io_recompile).  The translator ends a TB at such a pc so the
+ * I/O is done where it is allowed, instead of restarting the block on
+ * every execution.  A hint table, direct mapped: a lost entry only costs
+ * one more restart.
+ */
+bool tcg_io_hint_lookup(vaddr pc);
+void tcg_io_hint_add(vaddr pc);
+
+/*
  * Return true if CS is not running in parallel with other cpus, either
  * because there are no other cpus or we are within an exclusive context.
  */

@@ -35,6 +35,8 @@ struct TBContext {
     /* statistics */
     unsigned tb_flush_count;
     unsigned tb_phys_invalidate_count;
+    /* I/O accesses that were not the last insn of their TB (cpu_io_recompile) */
+    unsigned io_recompile_count;
 };
 
 extern TBContext tb_ctx;

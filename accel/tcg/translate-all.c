@@ -605,6 +605,29 @@ void tb_check_watchpoint(CPUState *cpu, uintptr_t retaddr)
     }
 }
 
+/*
+ * Entries hold ~pc so that an untouched slot (0) matches nothing.  Races
+ * between vCPUs are harmless: the worst case is a hint lost or kept.
+ */
+#define TCG_IO_HINT_BITS 13
+static vaddr tcg_io_hints[1 << TCG_IO_HINT_BITS];
+
+static inline vaddr *tcg_io_hint_slot(vaddr pc)
+{
+    return &tcg_io_hints[(pc >> 2 ^ pc >> (2 + TCG_IO_HINT_BITS)) &
+                         ((1 << TCG_IO_HINT_BITS) - 1)];
+}
+
+bool tcg_io_hint_lookup(vaddr pc)
+{
+    return qatomic_read(tcg_io_hint_slot(pc)) == ~pc;
+}
+
+void tcg_io_hint_add(vaddr pc)
+{
+    qatomic_set(tcg_io_hint_slot(pc), ~pc);
+}
+
 #ifndef CONFIG_USER_ONLY
 /*
  * In deterministic execution mode, instructions doing device I/Os
@@ -624,6 +647,19 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
                   (void *)retaddr);
     }
     cpu_restore_state_from_tb(cpu, tb, retaddr);
+    qatomic_inc(&tb_ctx.io_recompile_count);
+
+    /*
+     * Coming here costs a state restore, a longjmp, a one-insn TB and a
+     * continuation TB, and a block that polls a device register from its
+     * middle pays that on every pass.  Remember the pc, so that the next
+     * translation of code containing it ends the TB there (translator_loop),
+     * and drop this block so that it is translated again.  Once the hint is
+     * in, the retranslated block does its I/O on its last insn and never
+     * returns here.
+     */
+    tcg_io_hint_add(cpu->cc->get_pc(cpu));
+    tb_phys_invalidate(tb, -1);
 
     /*
      * Some guests must re-execute the branch when re-executing a delay

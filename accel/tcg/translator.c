@@ -17,6 +17,7 @@
 #include "exec/cpu_ldst.h"
 #include "exec/tswap.h"
 #include "tcg/tcg-op-common.h"
+#include "internal-common.h"
 #include "internal-target.h"
 #include "disas/disas.h"
 #include "tb-internal.h"
@@ -244,6 +245,8 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     db->plugin_enabled = plugin_enabled;
 
     while (true) {
+        bool io_insn;
+
         *max_insns = ++db->num_insns;
         ops->insn_start(db, cpu);
         db->insn_start = tcg_last_op();
@@ -255,6 +258,12 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         if (plugin_enabled) {
             plugin_gen_insn_start(cpu, db);
         }
+
+        /*
+         * An insn known to do I/O (cpu_io_recompile saw it) becomes the
+         * last of the block, where I/O is allowed.
+         */
+        io_insn = tcg_io_hint_lookup(db->pc_next);
 
         /*
          * Disassemble one instruction.  The translate_insn hook should
@@ -284,7 +293,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
 
         /* Stop translation if the output buffer is full,
            or we have executed all of the allowed instructions.  */
-        if (tcg_op_buf_full() || db->num_insns >= db->max_insns) {
+        if (io_insn || tcg_op_buf_full() || db->num_insns >= db->max_insns) {
             db->is_jmp = DISAS_TOO_MANY;
             break;
         }

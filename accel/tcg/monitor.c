@@ -190,6 +190,8 @@ static void dump_exec_info(GString *buf)
                            qatomic_read(&tb_ctx.tb_flush_count));
     g_string_append_printf(buf, "TB invalidate count %u\n",
                            qatomic_read(&tb_ctx.tb_phys_invalidate_count));
+    g_string_append_printf(buf, "IO recompile count  %u\n",
+                           qatomic_read(&tb_ctx.io_recompile_count));
 
     tlb_flush_counts(&flush_full, &flush_part, &flush_elide);
     g_string_append_printf(buf, "TLB full flushes    %zu\n", flush_full);
