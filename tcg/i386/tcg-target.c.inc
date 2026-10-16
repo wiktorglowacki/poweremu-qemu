@@ -110,6 +110,9 @@ static const int tcg_target_reg_alloc_order[] = {
 
 #define TCG_TMP_VEC  TCG_REG_XMM5
 
+/* tbl_vec as vptestnmb + vpermi2b; PPC_VBMI=0 keeps vpshufb (A/B tests). */
+static bool use_vbmi_tbl;
+
 static const int tcg_target_call_iarg_regs[] = {
 #if TCG_TARGET_REG_BITS == 64
 #if defined(_WIN64)
@@ -377,6 +380,7 @@ static bool tcg_target_const_match(int64_t val, int ct,
 #define OPC_VPMULLQ     (0x40 | P_EXT38 | P_DATA16 | P_VEXW | P_EVEX)
 #define OPC_POR         (0xeb | P_EXT | P_DATA16)
 #define OPC_PSHUFB      (0x00 | P_EXT38 | P_DATA16)
+#define OPC_PMULHRSW    (0x0b | P_EXT38 | P_DATA16)
 #define OPC_PSHUFD      (0x70 | P_EXT | P_DATA16)
 #define OPC_PSHUFLW     (0x70 | P_EXT | P_SIMDF2)
 #define OPC_PSHUFHW     (0x70 | P_EXT | P_SIMDF3)
@@ -471,6 +475,8 @@ static bool tcg_target_const_match(int64_t val, int ct,
 #define OPC_VPMOVM2W    (0x28 | P_EXT38 | P_SIMDF3 | P_VEXW | P_EVEX)
 #define OPC_VPMOVM2D    (0x38 | P_EXT38 | P_SIMDF3 | P_EVEX)
 #define OPC_VPMOVM2Q    (0x38 | P_EXT38 | P_SIMDF3 | P_VEXW | P_EVEX)
+#define OPC_VPERMI2B    (0x75 | P_EXT38 | P_DATA16 | P_EVEX)
+#define OPC_VPERMT2B    (0x7d | P_EXT38 | P_DATA16 | P_EVEX)
 #define OPC_VPERMQ      (0x00 | P_EXT3A | P_DATA16 | P_VEXW)
 #define OPC_VPERM2I128  (0x46 | P_EXT3A | P_DATA16 | P_VEXL)
 #define OPC_VPROLVD     (0x15 | P_EXT38 | P_DATA16 | P_EVEX)
@@ -926,7 +932,11 @@ static inline void tcg_out_vex_modrm_pool(TCGContext *s, int opc, int r)
 static void tcg_out_vex_pool_q2(TCGContext *s, int opc, int r, int v,
                                 uint64_t d)
 {
-    tcg_out_vex_opc(s, opc, r, v, 0, 0);
+    if (opc & P_EVEX) {
+        tcg_out_evex_opc(s, opc, r, v, 0, 0, 0, false);
+    } else {
+        tcg_out_vex_opc(s, opc, r, v, 0, 0);
+    }
     tcg_out8(s, LOWREGMASK(r) << 3 | 5);
     tcg_out32(s, 0);
     if (TCG_TARGET_REG_BITS == 64) {
@@ -3624,6 +3634,10 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         tcg_out8(s, sub);
         break;
 
+    case INDEX_op_mulhrs_vec:
+        insn = OPC_PMULHRSW;
+        goto gen_simd;
+
     case INDEX_op_tbl_vec:
         /*
          * r[i] = (a:b)[idx[i]], 0 for idx[i] >= 32.  One half is looked
@@ -3635,6 +3649,27 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
             /* One table: +us 0x60 keeps 0-31 below 0x80, rest above.  */
             tcg_out_vex_pool_b16(s, OPC_PADDUB, TCG_TMP_VEC, a3, 0x60);
             tcg_out_vex_modrm(s, OPC_PSHUFB, a0, a1, TCG_TMP_VEC);
+            break;
+        }
+        if (use_vbmi_tbl) {
+            /*
+             * AVX512-VBMI: k1 = lanes with idx < 32, then one two-table
+             * byte permute (index bits 0-4; bit 4 picks b) zeroing the
+             * other lanes.  vpermi2b overwrites the index register,
+             * vpermt2b the first table (a).
+             */
+            tcg_out_vex_pool_b16(s, OPC_VPTESTNMB, /* k1 */ 1, a3, 0xe0);
+            if (a0 == a1 && a0 != a3) {
+                tcg_out_evex_modrm_type(s, OPC_VPERMT2B, a0, a3, a2,
+                                        /* k1 */ 1, true, type);
+            } else {
+                TCGReg d = a0 == a2 && a0 != a3 ? TCG_TMP_VEC : a0;
+
+                tcg_out_mov(s, type, d, a3);
+                tcg_out_evex_modrm_type(s, OPC_VPERMI2B, d, a1, a2,
+                                        /* k1 */ 1, true, type);
+                tcg_out_mov(s, type, a0, d);
+            }
             break;
         }
         if (a0 != a2) {
@@ -3933,6 +3968,7 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_x86_punpckh_vec:
     case INDEX_op_x86_vpshldi_vec:
     case INDEX_op_fop_vec:
+    case INDEX_op_mulhrs_vec:
 #if TCG_TARGET_REG_BITS == 32
     case INDEX_op_dup2_vec:
 #endif
@@ -3986,6 +4022,8 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
         return -1;
     case INDEX_op_tbl_vec:
         return TCG_TARGET_HAS_tbl_vec && type == TCG_TYPE_V128 && vece == MO_8;
+    case INDEX_op_mulhrs_vec:
+        return TCG_TARGET_HAS_mulhrs_vec && vece == MO_16;
     case INDEX_op_fop_vec:
     case INDEX_op_ffma_vec:
     case INDEX_op_fcvt_vec:
@@ -4521,6 +4559,10 @@ static void tcg_out_nop_fill(tcg_insn_unit *p, int count)
 
 static void tcg_target_init(TCGContext *s)
 {
+    const char *vbmi_env = getenv("PPC_VBMI");
+
+    use_vbmi_tbl = have_avx512vbmi && have_avx512bw
+                   && !(vbmi_env && vbmi_env[0] == '0');
     tcg_target_available_regs[TCG_TYPE_I32] = ALL_GENERAL_REGS;
     if (TCG_TARGET_REG_BITS == 64) {
         tcg_target_available_regs[TCG_TYPE_I64] = ALL_GENERAL_REGS;

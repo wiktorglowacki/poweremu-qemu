@@ -24,6 +24,7 @@
                            (cpuinfo & CPUINFO_AVX512F))
 #define have_avx512bw     ((cpuinfo & CPUINFO_AVX512BW) && have_avx512vl)
 #define have_avx512dq     ((cpuinfo & CPUINFO_AVX512DQ) && have_avx512vl)
+#define have_avx512vbmi   ((cpuinfo & CPUINFO_AVX512VBMI) && have_avx512vl)
 #define have_avx512vbmi2  ((cpuinfo & CPUINFO_AVX512VBMI2) && have_avx512vl)
 
 /* optional instructions */
@@ -121,6 +122,8 @@
 #define TCG_TARGET_HAS_tst_vec          have_avx512bw
 /* vpshufb: SSSE3, implied by the AVX1 that all vector support needs. */
 #define TCG_TARGET_HAS_tbl_vec          have_avx1
+/* vpmulhrsw: SSSE3 as well. */
+#define TCG_TARGET_HAS_mulhrs_vec       have_avx1
 /*
  * Scalar SSE arithmetic needs only AVX1 (for the VEX forms), but the
  * three FP ops are all-or-nothing and ffma_vec needs FMA3.

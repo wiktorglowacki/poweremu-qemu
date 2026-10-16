@@ -68,6 +68,9 @@
 #endif
 
 /* Leaf 7, %ecx */
+#ifndef bit_AVX512VBMI
+#define bit_AVX512VBMI  (1 << 1)
+#endif
 #ifndef bit_AVX512VBMI2
 #define bit_AVX512VBMI2 (1 << 6)
 #endif

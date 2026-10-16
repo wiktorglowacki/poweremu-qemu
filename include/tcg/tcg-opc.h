@@ -286,6 +286,12 @@ DEF(tbl_vec, 1, 3, 0, TCG_OPF_VECTOR)
 DEF(fop_vec, 1, 2, 1, TCG_OPF_VECTOR)
 DEF(ffma_vec, 1, 3, 1, TCG_OPF_VECTOR)
 DEF(fcvt_vec, 1, 1, 1, TCG_OPF_VECTOR)
+/*
+ * MO_16 only: r = (a * b + 0x4000) >> 15, keeping the low 16 bits (the
+ * x86 PMULHRSW definition: -32768 * -32768 wraps to -32768).  Not
+ * AArch64's SQRDMULH, which saturates that case to 32767.
+ */
+DEF(mulhrs_vec, 1, 2, 0, TCG_OPF_VECTOR)
 
 DEF(last_generic, 0, 0, 0, TCG_OPF_NOT_PRESENT)
 

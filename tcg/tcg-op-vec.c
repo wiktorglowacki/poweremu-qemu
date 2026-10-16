@@ -597,6 +597,13 @@ void tcg_gen_mul_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
     do_op3_nofail(vece, r, a, b, INDEX_op_mul_vec);
 }
 
+/* See mulhrs_vec in tcg-opc.h; callers check tcg_can_emit_vec_op. */
+void tcg_gen_mulhrs_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    tcg_debug_assert(vece == MO_16);
+    do_op3_nofail(vece, r, a, b, INDEX_op_mulhrs_vec);
+}
+
 void tcg_gen_ssadd_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
 {
     do_op3_nofail(vece, r, a, b, INDEX_op_ssadd_vec);
