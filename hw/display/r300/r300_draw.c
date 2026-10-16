@@ -587,6 +587,11 @@ void r300_tex_layout(R300TexDesc *td, uint32_t bpp, bool dxt, bool pitch_en)
         } else if (dxt) {
             pitch = (((w + 3) / 4) * bpp + 31) & ~31u;
             rows = (h + 3) / 4;
+            /* micro-tiled DXT1: 2x2-block tiles (as r300_tex_untile reads
+             * them, and Mesa lays them out), so whole 2-block-row bands */
+            if ((td->tiling & 2) && bpp == 8) {
+                rows = (rows + 1) & ~1u;
+            }
         } else {
             pitch = (w * bpp + 31) & ~31u;
             rows = h;
