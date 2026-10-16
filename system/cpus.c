@@ -549,12 +549,61 @@ void rust_bql_mock_lock(void)
  * The BQL is taken from so many places that it is worth profiling the
  * callers directly, instead of funneling them all through a single function.
  */
+/*
+ * QEMU_BQL_STATS=1: once a second, per thread, on stderr: how often the
+ * thread took the BQL, how often it found it held, how long it waited
+ * for it and how long it held it (condition waits not counted).
+ */
+static int bql_stats = -1;
+static __thread struct {
+    uint64_t n, waits;
+    int64_t wait_ns, hold_ns, t_acq, t_print;
+} bql_st;
+
+static bool bql_stats_on(void)
+{
+    if (unlikely(bql_stats < 0)) {
+        const char *e = getenv("QEMU_BQL_STATS");
+        bql_stats = e && e[0] == '1';
+    }
+    return bql_stats;
+}
+
+static void bql_stats_print(int64_t now)
+{
+    if (!bql_st.t_print) {
+        bql_st.t_print = now;
+    } else if (now - bql_st.t_print >= NANOSECONDS_PER_SECOND) {
+        char name[16] = "";
+        pthread_getname_np(pthread_self(), name, sizeof(name));
+        fprintf(stderr, "bql %-15s %8" PRIu64 " locks/s %8" PRIu64 " contended, "
+                "%7.2f ms waited, %7.2f ms held\n", name,
+                bql_st.n, bql_st.waits, bql_st.wait_ns / 1e6, bql_st.hold_ns / 1e6);
+        bql_st.n = bql_st.waits = 0;
+        bql_st.wait_ns = bql_st.hold_ns = 0;
+        bql_st.t_print = now;
+    }
+}
+
 void bql_lock_impl(const char *file, int line)
 {
     QemuMutexLockFunc bql_lock_fn = qatomic_read(&bql_mutex_lock_func);
 
     g_assert(!bql_locked());
-    bql_lock_fn(&bql, file, line);
+    if (unlikely(bql_stats_on())) {
+        int64_t t0 = get_clock();
+        if (qemu_mutex_trylock(&bql)) {
+            bql_lock_fn(&bql, file, line);
+            bql_st.waits++;
+            bql_st.t_acq = get_clock();
+            bql_st.wait_ns += bql_st.t_acq - t0;
+        } else {
+            bql_st.t_acq = t0;
+        }
+        bql_st.n++;
+    } else {
+        bql_lock_fn(&bql, file, line);
+    }
     set_bql_locked(true);
 }
 
@@ -563,17 +612,34 @@ void bql_unlock(void)
     g_assert(bql_locked());
     g_assert(!bql_unlock_blocked);
     set_bql_locked(false);
+    if (unlikely(bql_stats > 0)) {
+        int64_t now = get_clock();
+        bql_st.hold_ns += now - bql_st.t_acq;
+        bql_stats_print(now);
+    }
     qemu_mutex_unlock(&bql);
 }
 
 void qemu_cond_wait_bql(QemuCond *cond)
 {
+    if (unlikely(bql_stats > 0)) {
+        bql_st.hold_ns += get_clock() - bql_st.t_acq;
+    }
     qemu_cond_wait(cond, &bql);
+    if (unlikely(bql_stats > 0)) {
+        bql_st.t_acq = get_clock();
+    }
 }
 
 void qemu_cond_timedwait_bql(QemuCond *cond, int ms)
 {
+    if (unlikely(bql_stats > 0)) {
+        bql_st.hold_ns += get_clock() - bql_st.t_acq;
+    }
     qemu_cond_timedwait(cond, &bql, ms);
+    if (unlikely(bql_stats > 0)) {
+        bql_st.t_acq = get_clock();
+    }
 }
 
 /* signal CPU creation */
