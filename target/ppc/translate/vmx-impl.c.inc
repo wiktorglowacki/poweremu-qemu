@@ -131,22 +131,17 @@ static bool vld_vec_on(void)
  */
 static void set_avr64_pair(int regno, TCGv_i64 hi, TCGv_i64 lo)
 {
-    /* host order (little-endian, as vmx_host_tbl requires): lane 1 = hi */
-    static const uint64_t hi_lane[2] QEMU_ALIGNED(16) = { 0, -1ull };
-    TCGv_vec vlo, vhi;
+    TCGv_vec v;
 
     if (!vld_vec_on()) {
         set_avr64(regno, hi, true);
         set_avr64(regno, lo, false);
         return;
     }
-    vlo = tcg_temp_new_vec(TCG_TYPE_V128);
-    vhi = tcg_temp_new_vec(TCG_TYPE_V128);
-    tcg_gen_dup_i64_vec(MO_64, vlo, lo);
-    tcg_gen_dup_i64_vec(MO_64, vhi, hi);
-    tcg_gen_bitsel_vec(MO_64, vlo, vmx_ld_const((const uint8_t *)hi_lane),
-                       vhi, vlo);
-    vmx_st(regno, vlo);
+    /* host order (little-endian, as vmx_host_tbl requires): lane 1 = hi */
+    v = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_concat_i64_vec(v, lo, hi);
+    vmx_st(regno, v);
 }
 
 static bool trans_LVX(DisasContext *ctx, arg_X *a)

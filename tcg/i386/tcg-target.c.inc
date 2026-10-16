@@ -3687,6 +3687,9 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_mulhrs_vec:
         insn = OPC_PMULHRSW;
         goto gen_simd;
+    case INDEX_op_concat_i64_vec:
+        tcg_out_pair_to_vec(s, TCG_TYPE_I64, a0, a1, a2);
+        break;
 
     case INDEX_op_tbl_vec:
         /*
@@ -3981,6 +3984,9 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_st_vec:
         return C_O0_I2(x, r);
 
+    case INDEX_op_concat_i64_vec:
+        return C_O1_I2(x, r, r);
+
     case INDEX_op_add_vec:
     case INDEX_op_sub_vec:
     case INDEX_op_mul_vec:
@@ -4074,6 +4080,8 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
         return TCG_TARGET_HAS_tbl_vec && type == TCG_TYPE_V128 && vece == MO_8;
     case INDEX_op_mulhrs_vec:
         return TCG_TARGET_HAS_mulhrs_vec && vece == MO_16;
+    case INDEX_op_concat_i64_vec:
+        return TCG_TARGET_HAS_concat_i64_vec && type == TCG_TYPE_V128;
     case INDEX_op_fop_vec:
     case INDEX_op_ffma_vec:
     case INDEX_op_fcvt_vec:

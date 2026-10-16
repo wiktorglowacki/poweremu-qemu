@@ -794,6 +794,33 @@ void tcg_gen_tbl_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec idx)
 }
 
 /*
+ * V128 r = { lo, hi }: lo in the 64-bit element at host byte offset 0,
+ * hi in the one at offset 8.  Without the host op: two dups and a select.
+ */
+void tcg_gen_concat_i64_vec(TCGv_vec r, TCGv_i64 lo, TCGv_i64 hi)
+{
+    static const uint64_t hi_lane[2] QEMU_ALIGNED(16) = { 0, -1ull };
+    TCGTemp *rt = tcgv_vec_temp(r);
+    TCGv_vec t, m;
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    if (tcg_can_emit_vec_op(INDEX_op_concat_i64_vec,
+                            TCG_TYPE_V128, MO_64) > 0) {
+        vec_gen_3(INDEX_op_concat_i64_vec, TCG_TYPE_V128, MO_64, temp_arg(rt),
+                  tcgv_i64_arg(lo), tcgv_i64_arg(hi));
+        return;
+    }
+    t = tcg_temp_new_vec(TCG_TYPE_V128);
+    m = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_ld_vec(m, tcg_constant_ptr(hi_lane), 0);
+    tcg_gen_dup_i64_vec(MO_64, t, hi);
+    tcg_gen_dup_i64_vec(MO_64, r, lo);
+    tcg_gen_bitsel_vec(MO_64, r, m, t, r);
+    tcg_temp_free_vec(t);
+    tcg_temp_free_vec(m);
+}
+
+/*
  * Scalar floating point on V64 temps; see fop_vec/ffma_vec/fcvt_vec in
  * tcg-opc.h.  Callers check
  * tcg_can_emit_vec_op(INDEX_op_fop_vec, TCG_TYPE_V64, vece) (all three

@@ -124,6 +124,8 @@
 #define TCG_TARGET_HAS_tbl_vec          have_avx1
 /* vpmulhrsw: SSSE3 as well. */
 #define TCG_TARGET_HAS_mulhrs_vec       have_avx1
+/* vmovq + vpinsrq */
+#define TCG_TARGET_HAS_concat_i64_vec   (have_avx1 && TCG_TARGET_REG_BITS == 64)
 /*
  * Scalar SSE arithmetic needs only AVX1 (for the VEX forms), but the
  * three FP ops are all-or-nothing and ffma_vec needs FMA3.

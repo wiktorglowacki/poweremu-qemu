@@ -274,6 +274,8 @@ DEF(bitsel_vec, 1, 3, 0, TCG_OPF_VECTOR)
 DEF(cmpsel_vec, 1, 4, 1, TCG_OPF_VECTOR)
 /* r[i] = idx[i] < 16 ? a[idx[i]] : idx[i] < 32 ? b[idx[i] - 16] : 0 */
 DEF(tbl_vec, 1, 3, 0, TCG_OPF_VECTOR)
+/* V128 r = { lo, hi } from two i64: lo at host byte offset 0, hi at 8 */
+DEF(concat_i64_vec, 1, 2, 0, TCG_OPF_VECTOR)
 /*
  * Scalar IEEE binary floating point in the low element of a V64: a double
  * for vece MO_64, a single for MO_32.  Round to nearest even, no
