@@ -22,6 +22,7 @@
 #include "cpu.h"
 #include "internal.h"
 #include "exec/exec-all.h"
+#include "exec/cputlb.h"
 #include "tcg/tcg-op.h"
 #include "tcg/tcg-op-gvec.h"
 #include "qemu/host-utils.h"
@@ -81,12 +82,29 @@ static TCGv cpu_reserve_val2;
 static TCGv cpu_fpscr;
 static TCGv_i32 cpu_access_type;
 
+/* PPC_SYNC_EXIT=1: sync always ends the TB in supervisor mode (old behaviour) */
+static bool ppc_sync_exit;
+
 void ppc_translate_init(void)
 {
     int i;
     char *p;
     size_t cpu_reg_names_size;
 
+#if !defined(CONFIG_USER_ONLY)
+    {
+        /*
+         * PPC_ICBI_SMC=1: translated code is invalidated by the guest's
+         * icbi and HID0[ICFI] instead of by trapping stores to code pages.
+         */
+        const char *e = getenv("PPC_ICBI_SMC");
+        tcg_smc_by_icbi = e && e[0] == '1';
+    }
+    {
+        const char *e = getenv("PPC_SYNC_EXIT");
+        ppc_sync_exit = e && e[0] == '1';
+    }
+#endif
     p = cpu_reg_names;
     cpu_reg_names_size = sizeof(cpu_reg_names);
 
@@ -455,6 +473,15 @@ void spr_write_generic(DisasContext *ctx, int sprn, int gprn)
 {
     gen_store_spr(sprn, cpu_gpr[gprn]);
     spr_store_dump_spr(sprn);
+}
+
+void spr_write_hid0_74xx(DisasContext *ctx, int sprn, int gprn)
+{
+    gen_helper_store_hid0_74xx(tcg_env, cpu_gpr[gprn]);
+    if (tcg_smc_by_icbi) {
+        /* an ICFI tb_flush must not run on into chained, stale TBs */
+        ctx->base.is_jmp = DISAS_EXIT_UPDATE;
+    }
 }
 
 void spr_write_generic32(DisasContext *ctx, int sprn, int gprn)
@@ -2997,12 +3024,20 @@ static inline void gen_check_tlb_flush(DisasContext *ctx, bool global)
     } else {
         gen_helper_check_tlb_flush_local(tcg_env);
     }
-    gen_set_label(l);
-    if (global) {
+    if (global && !ppc_sync_exit) {
         /*
          * Global TLB flush uses async-work which must run before the
-         * next instruction, so this must be the last in the TB.
+         * next instruction: leave the TB, but only when a flush was
+         * pending.  MorphOS runs in supervisor mode and puts a sync in
+         * every atomic add, so ending the TB at each sync cost a main
+         * loop trip per lock operation.
          */
+        gen_update_nip(ctx, ctx->base.pc_next);
+        tcg_gen_exit_tb(NULL, 0);
+    }
+    gen_set_label(l);
+    if (global && ppc_sync_exit) {
+        /* PPC_SYNC_EXIT=1: the old way, always the last in the TB */
         ctx->base.is_jmp = DISAS_EXIT_UPDATE;
     }
 }

@@ -51,12 +51,48 @@ static inline unsigned int tb_jmp_cache_hash_func(vaddr pc)
            | (tmp & TB_JMP_ADDR_MASK));
 }
 
+/*
+ * The slot also depends on cs_base and the TB flags, so that variants of
+ * one pc do not evict each other on every call (MorphOS with PPC_SR_SLOTS:
+ * kernel routines run from the kernel's and the user's segment register
+ * set, cs_base being the set's TLB slot; also MSR[VR] on and off).  Only
+ * the in-page bits change, so tb_jmp_cache_clear_page still covers every
+ * slot of a page.  TCG_JC_FLAGS=0 hashes the pc only.
+ */
+extern unsigned int tb_jmp_cache_flags_mask;
+
+static inline unsigned int tb_jmp_cache_flags_bits(uint64_t cs_base,
+                                                   uint32_t flags)
+{
+    uint32_t x = flags ^ ((uint32_t)cs_base * 0x85EBCA6Bu);
+
+    return ((x * 0x9E3779B1u) >> 24) & tb_jmp_cache_flags_mask;
+}
+
+static inline unsigned int tb_jmp_cache_hash(vaddr pc, uint64_t cs_base,
+                                             uint32_t flags)
+{
+    return tb_jmp_cache_hash_func(pc) ^ tb_jmp_cache_flags_bits(cs_base, flags);
+}
+
 #else
 
 /* In user-mode we can get better hashing because we do not have a TLB */
 static inline unsigned int tb_jmp_cache_hash_func(vaddr pc)
 {
     return (pc ^ (pc >> TB_JMP_CACHE_BITS)) & (TB_JMP_CACHE_SIZE - 1);
+}
+
+static inline unsigned int tb_jmp_cache_flags_bits(uint64_t cs_base,
+                                                   uint32_t flags)
+{
+    return 0;
+}
+
+static inline unsigned int tb_jmp_cache_hash(vaddr pc, uint64_t cs_base,
+                                             uint32_t flags)
+{
+    return tb_jmp_cache_hash_func(pc);
 }
 
 #endif /* CONFIG_SOFTMMU */

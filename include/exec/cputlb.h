@@ -30,6 +30,15 @@ void tlb_protect_code(ram_addr_t ram_addr);
 void tlb_unprotect_code(ram_addr_t ram_addr);
 #endif
 
+/*
+ * Self-modifying code by the guest's cache instructions (set by the target,
+ * PPC: PPC_ICBI_SMC=1).  CPU stores no longer trap on pages that hold
+ * translated code; the target invalidates code itself where the
+ * architecture demands it (PPC icbi, HID0[ICFI]) with tlb_invalidate_code().
+ * DMA writes still invalidate through the DIRTY_MEMORY_CODE bitmap.
+ */
+extern bool tcg_smc_by_icbi;
+
 #ifndef CONFIG_USER_ONLY
 void tlb_reset_dirty(CPUState *cpu, ram_addr_t start1, ram_addr_t length);
 void tlb_reset_dirty_range_all(ram_addr_t start, ram_addr_t length);

@@ -870,6 +870,17 @@ void tlb_flush_page_bits_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
                                               idxmap, bits);
 }
 
+/* Whether CPU stores to this RAM page must take the notdirty path. */
+static inline bool ram_page_is_clean(ram_addr_t ram_addr)
+{
+    if (tcg_smc_by_icbi) {
+        return !(cpu_physical_memory_get_dirty_flag(ram_addr, DIRTY_MEMORY_VGA) &&
+                 cpu_physical_memory_get_dirty_flag(ram_addr,
+                                                    DIRTY_MEMORY_MIGRATION));
+    }
+    return cpu_physical_memory_is_clean(ram_addr);
+}
+
 /* update the TLBs so that writes to code in the virtual page 'addr'
    can be detected */
 void tlb_protect_code(ram_addr_t ram_addr)
@@ -1141,7 +1152,7 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
         if (prot & PAGE_WRITE) {
             if (section->readonly) {
                 write_flags |= TLB_DISCARD_WRITE;
-            } else if (cpu_physical_memory_is_clean(iotlb)) {
+            } else if (ram_page_is_clean(iotlb)) {
                 write_flags |= TLB_NOTDIRTY;
             }
         }
@@ -1397,7 +1408,8 @@ static void notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
 
     trace_memory_notdirty_write_access(mem_vaddr, ram_addr, size);
 
-    if (!cpu_physical_memory_get_dirty_flag(ram_addr, DIRTY_MEMORY_CODE)) {
+    if (!tcg_smc_by_icbi &&
+        !cpu_physical_memory_get_dirty_flag(ram_addr, DIRTY_MEMORY_CODE)) {
         tb_invalidate_phys_range_fast(ram_addr, size, retaddr);
     }
 
@@ -1415,7 +1427,7 @@ static void notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
     }
 
     /* We remove the notdirty callback only if the code has been flushed. */
-    if (!cpu_physical_memory_is_clean(ram_addr)) {
+    if (!ram_page_is_clean(ram_addr)) {
         trace_memory_notdirty_set_dirty(mem_vaddr);
         tlb_set_dirty(cpu, mem_vaddr);
     }
@@ -1473,6 +1485,24 @@ static int probe_access_internal(CPUState *cpu, vaddr addr,
     /* Everything else is RAM. */
     *phost = (void *)((uintptr_t)addr + entry->addend);
     return flags;
+}
+
+/*
+ * Invalidate the translated code on the RAM behind [addr, addr + len) of
+ * a data mapping (len within one page); the caller has already accessed
+ * addr, so this hits the TLB.  The running TB is left to finish.
+ */
+void tlb_invalidate_code(CPUArchState *env, vaddr addr, unsigned len,
+                         int mmu_idx, uintptr_t retaddr)
+{
+    CPUTLBEntryFull *full;
+    void *host;
+    int flags = probe_access_full(env, addr, len, MMU_DATA_LOAD, mmu_idx,
+                                  false, &host, &full, retaddr);
+
+    if (host && !(flags & TLB_MMIO)) {
+        tb_invalidate_phys_range_fast(addr + full->xlat_section, len, 0);
+    }
 }
 
 int probe_access_full(CPUArchState *env, vaddr addr, int size,

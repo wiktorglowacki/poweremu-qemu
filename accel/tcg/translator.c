@@ -176,13 +176,14 @@ void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc)
     a = tcg_temp_new_i32();
     b = tcg_temp_new_i32();
 
-    /* tb_jmp_cache_hash_func(pc) * esz */
+    /* tb_jmp_cache_hash(pc, tb->cs_base, tb->flags) * esz */
     tcg_gen_shri_i64(t, pc, TARGET_PAGE_BITS - TB_JMP_PAGE_BITS);
     tcg_gen_xor_i64(t, t, pc);
     tcg_gen_shri_i64(h, t, TARGET_PAGE_BITS - TB_JMP_PAGE_BITS);
     tcg_gen_andi_i64(h, h, TB_JMP_PAGE_MASK);
     tcg_gen_andi_i64(t, t, TB_JMP_ADDR_MASK);
     tcg_gen_or_i64(h, h, t);
+    tcg_gen_xori_i64(h, h, tb_jmp_cache_flags_bits(tb->cs_base, tb->flags));
     tcg_gen_muli_i64(h, h, esz);
 
     tcg_gen_ld_ptr(jc, tcg_env, offsetof(ArchCPU, parent_obj.tb_jmp_cache) -

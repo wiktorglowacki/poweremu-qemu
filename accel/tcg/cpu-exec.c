@@ -242,7 +242,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc,
     /* we should never be trying to look up an INVALID tb */
     tcg_debug_assert(!(cflags & CF_INVALID));
 
-    hash = tb_jmp_cache_hash_func(pc);
+    hash = tb_jmp_cache_hash(pc, cs_base, flags);
     jc = cpu->tb_jmp_cache;
 
     tb = qatomic_read(&jc->array[hash].tb);
@@ -376,6 +376,19 @@ static inline bool check_for_breakpoints(CPUState *cpu, vaddr pc,
     return unlikely(!QTAILQ_EMPTY(&cpu->breakpoints)) &&
         check_for_breakpoints_slow(cpu, pc, cflags);
 }
+
+#ifdef CONFIG_SOFTMMU
+unsigned int tb_jmp_cache_flags_mask = TB_JMP_ADDR_MASK;
+
+static void __attribute__((constructor)) tb_jmp_cache_flags_init(void)
+{
+    const char *e = getenv("TCG_JC_FLAGS");
+
+    if (e && e[0] == '0') {
+        tb_jmp_cache_flags_mask = 0;
+    }
+}
+#endif
 
 /**
  * helper_lookup_tb_ptr: quick check for next tb
@@ -1000,7 +1013,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                  * We add the TB in the virtual pc hash table
                  * for the fast lookup
                  */
-                h = tb_jmp_cache_hash_func(pc);
+                h = tb_jmp_cache_hash(pc, cs_base, flags);
                 jc = cpu->tb_jmp_cache;
                 jc->array[h].pc = pc;
                 jc->array[h].gen = jc->gen;

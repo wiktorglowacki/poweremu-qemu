@@ -25,6 +25,8 @@
 #include "helper_regs.h"
 #include "exec/cpu_ldst.h"
 #include "internal.h"
+#include "exec/cputlb.h"
+#include "exec/tb-flush.h"
 #include "qemu/atomic128.h"
 
 /* #define DEBUG_OP */
@@ -325,6 +327,22 @@ void helper_dcbzl(CPUPPCState *env, target_ulong addr)
 }
 #endif
 
+void helper_store_hid0_74xx(CPUPPCState *env, target_ulong val)
+{
+#if !defined(CONFIG_USER_ONLY)
+    if (tcg_smc_by_icbi && (val & HID0_74XX_ICFI)) {
+        /*
+         * Instruction cache flash invalidate: with no store tracking, any
+         * code may have changed.  The bit clears itself, as on hardware;
+         * the translator ends the TB after this mtspr.
+         */
+        val &= ~HID0_74XX_ICFI;
+        tb_flush(env_cpu(env));
+    }
+#endif
+    env->spr[SPR_HID0] = val;
+}
+
 void helper_icbi(CPUPPCState *env, target_ulong addr)
 {
     addr &= ~(env->dcache_line_size - 1);
@@ -335,6 +353,12 @@ void helper_icbi(CPUPPCState *env, target_ulong addr)
      * do the load "by hand".
      */
     cpu_ldl_data_ra(env, addr, GETPC());
+#if !defined(CONFIG_USER_ONLY)
+    if (tcg_smc_by_icbi) {
+        tlb_invalidate_code(env, addr, env->dcache_line_size,
+                            ppc_env_mmu_index(env, false), GETPC());
+    }
+#endif
 }
 
 void helper_icbiep(CPUPPCState *env, target_ulong addr)

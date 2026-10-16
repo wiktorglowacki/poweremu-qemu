@@ -2381,6 +2381,7 @@ void ppc_compat_add_property(Object *obj, const char *name,
 #define E500_L2CSR0_L2LFC   (1 << 10)   /* L2 cache lock flash clear */
 
 /* HID0 bits */
+#define HID0_74XX_ICFI      (1 << 11)           /* 7400/74xx I-cache flash invalidate */
 #define HID0_DEEPNAP        (1 << 24)           /* pre-2.06 */
 #define HID0_DOZE           (1 << 23)           /* pre-2.06 */
 #define HID0_NAP            (1 << 22)           /* pre-2.06 */

@@ -875,6 +875,8 @@ void tlb_reset_dirty_range_all(ram_addr_t start, ram_addr_t length)
     }
 }
 
+bool tcg_smc_by_icbi;
+
 /* Note: start and end must be within the same ram block.  */
 bool cpu_physical_memory_test_and_clear_dirty(ram_addr_t start,
                                               ram_addr_t length,
@@ -917,7 +919,8 @@ bool cpu_physical_memory_test_and_clear_dirty(ram_addr_t start,
         memory_region_clear_dirty_bitmap(ramblock->mr, mr_offset, mr_size);
     }
 
-    if (dirty) {
+    /* code protection does not reach the TLB when the guest's icbi does it */
+    if (dirty && !(client == DIRTY_MEMORY_CODE && tcg_smc_by_icbi)) {
         cpu_physical_memory_dirty_bits_cleared(start, length);
     }
 

@@ -107,6 +107,9 @@ int probe_access_full(CPUArchState *env, vaddr addr, int size,
                       bool nonfault, void **phost,
                       CPUTLBEntryFull **pfull, uintptr_t retaddr);
 
+void tlb_invalidate_code(CPUArchState *env, vaddr addr, unsigned len,
+                         int mmu_idx, uintptr_t retaddr);
+
 /**
  * probe_access_full_mmu:
  * Like probe_access_full, except:
