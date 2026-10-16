@@ -593,6 +593,17 @@ static void handle_windowevent(SDL_Event *ev)
         sdl2_redraw(scon);
         break;
     case SDL_WINDOWEVENT_FOCUS_GAINED:
+        /*
+         * Text input only serves text consoles (handle_textinput).  SDL2
+         * starts it by default, and on a Wayland input method (IBus with
+         * --enable-wayland-im on KDE) every key of the graphic window then
+         * went to the IM, which passed only Enter back as a key event.
+         */
+        if (QEMU_IS_TEXT_CONSOLE(scon->dcl.con)) {
+            SDL_StartTextInput();
+        } else {
+            SDL_StopTextInput();
+        }
         /* fall through */
     case SDL_WINDOWEVENT_ENTER:
         if (!gui_grab && (qemu_input_is_absolute(scon->dcl.con) || absolute_enabled)) {
@@ -848,6 +859,7 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
     SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
 #endif
     SDL_SetHint(SDL_HINT_GRAB_KEYBOARD, "1");
+    SDL_StopTextInput();    /* re-enabled per focused text console */
 #ifdef SDL_HINT_ALLOW_ALT_TAB_WHILE_GRABBED
     SDL_SetHint(SDL_HINT_ALLOW_ALT_TAB_WHILE_GRABBED, "0");
 #endif
