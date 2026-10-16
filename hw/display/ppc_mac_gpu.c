@@ -1096,6 +1096,9 @@ static void G_GNUC_PRINTF(1, 2) seq_log(const char *fmt, ...)
 static void blit_path_log(const char *path, const char *fmt, ...)
 {
     static FILE *f = NULL;
+    if (!gpu_diag_on()) {
+        return;     /* PPCGPU_DIAG: CRTC lines alone come with every flip */
+    }
     if (!f) {
         f = fopen("/tmp/gpu_blit_paths.log", "w");
         if (!f) return;
@@ -9255,7 +9258,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                 /* Diagnostic: comprehensive BITBLT_MULTI logging */
                 {
                     static int bbm_log = 0;
-                    if (bbm_log < 200) {
+                    if (gpu_diag_on() && bbm_log < 200) {
                         FILE *f = fopen("/tmp/gpu_blit_diag.txt", "a");
                         if (f) {
                             /* Raw PM4 dwords */
@@ -9813,7 +9816,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                 /* Log PAINT_MULTI diagnostics */
                 {
                     static int paint_log = 0;
-                    if (paint_log < 50) {
+                    if (gpu_diag_on() && paint_log < 50) {
                         FILE *f2 = fopen("/tmp/gpu_blit_diag.txt", "a");
                         if (f2) {
                             fprintf(f2, "\n=== PAINT[%d] gmc=0x%08x rop=0x%02x "
@@ -12058,8 +12061,8 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         {
             static int unhandled_read_count = 0;
             unhandled_read_count++;
-            if (unhandled_read_count <= 100 ||
-                unhandled_read_count % 500 == 0) {
+            if (gpu_diag_on() && (unhandled_read_count <= 100 ||
+                                  unhandled_read_count % 500 == 0)) {
                 qemu_log("[QE_GATE_READ] reg=0x%04x value=0x%08x "
                          "context=unhandled_read sequence_id=%d "
                          "note=UNIMPL_%s_returns_zero\n",
