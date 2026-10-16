@@ -18,6 +18,7 @@
 #include <stdint.h>
 
 #define RESULTS     0x10000u
+#define EXC_SAVE    0x30000u    /* exc_handler in start.S */
 #define ITERS       4000
 #define MAXLOG      8
 #define BENCH_ITERS 2000000
@@ -47,7 +48,7 @@ enum {
     OP_VMULEUH, OP_VMULOUH, OP_VMULESH, OP_VMULOSH,
     OP_VMSUMUBM, OP_VMSUMMBM, OP_VMSUMUHM, OP_VMSUMSHM,
     OP_LVSL, OP_LVSR, OP_LVX, OP_LDU16, OP_LDU15,
-    OP_VMHRADDSHS, OP_VMHADDSHS, OP_VPERM_DB,
+    OP_VMHRADDSHS, OP_VMHADDSHS, OP_VPERM_DB, OP_DEADST_LD, OP_DEADST_CALL,
     OP_VADDFP, OP_VSUBFP, OP_VMAXFP, OP_VMINFP, OP_VMADDFP, OP_VNMSUBFP,
     OP_VREFP, OP_VCFSX, OP_VCFUX, OP_VCTSXS, OP_VCTUXS,
     NOPS
@@ -588,6 +589,45 @@ static void run_op(int op, V a, V b, V c, int sh, V *got, V *exp,
                             -0x8000, 0x7fff, &sat);
         }
         break;
+    case OP_DEADST_LD:
+    case OP_DEADST_CALL: {
+        /*
+         * v19 written twice in one block with a faulting instruction in
+         * between: an unaligned lwarx (alignment interrupt from a guest
+         * load) or a tw that always traps (program interrupt from a
+         * helper).  The handler must see the first value: a store to the
+         * CPU state may only be dropped if nothing can read it before it
+         * is overwritten.  The very first write (vor) is dead.
+         */
+        volatile uint32_t *save = (volatile uint32_t *)EXC_SAVE;
+        uint32_t n = save[4], x, m[2] = { 0, 0 };
+        V f;
+
+        if (op == OP_DEADST_LD) {
+            asm volatile("vor 19,%3,%3\n\tvaddubm 19,%3,%4\n\t"
+                         "lwarx %1,0,%6\n\tvaddubm 19,%4,%5\n\tvor %0,19,19"
+                         : "=v"(f.v), "=&r"(x)
+                         : "m"(m), "v"(a.v), "v"(b.v), "v"(c.v),
+                           "b"((char *)m + 1)
+                         : "v19", "memory");
+        } else {
+            asm volatile("vor 19,%3,%3\n\tvaddubm 19,%3,%4\n\t"
+                         "tw 4,%6,%6\n\tvaddubm 19,%4,%5\n\tvor %0,19,19"
+                         : "=v"(f.v), "=&r"(x)
+                         : "m"(m), "v"(a.v), "v"(b.v), "v"(c.v), "r"(sh)
+                         : "v19", "memory");
+        }
+        for (i = 0; i < 4; i++) {
+            r.w[i] = save[i];
+        }
+        for (i = 0; i < 16; i++) {
+            e.b[i] = a.b[i] + b.b[i];
+            if (f.b[i] != (uint8_t)(b.b[i] + c.b[i]) || save[4] != n + 1) {
+                r.w[0] = ~e.w[0];   /* final value or interrupt count wrong */
+            }
+        }
+        break;
+    }
     case OP_VMSUMSHM:
         ASM4("vmsumshm", r, a, b, c);
         for (i = 0; i < 4; i++) {
@@ -1187,6 +1227,13 @@ int main(void)
 
     for (i = 0; i < 0x300; i++) {
         res[i] = 0;
+    }
+    /* ba exc_handler at the alignment and program interrupt vectors */
+    for (i = 0x600; i <= 0x700; i += 0x100) {
+        extern char exc_handler[];
+        *(volatile uint32_t *)i =
+            0x48000002 | ((uint32_t)exc_handler & 0x03fffffc);
+        asm volatile("dcbst 0,%0\n\tsync\n\ticbi 0,%0\n\tisync" : : "r"(i));
     }
     for (op = 0; op < NOPS; op++) {
         for (it = 0; it < ITERS; it++) {

@@ -29,7 +29,7 @@ vpkuhum vpkuwum vpkuhus vpkuwus vpkshus vpkswus vpkshss vpkswss
 vupkhsb vupkhsh vupklsb vupklsh
 vmuleub vmuloub vmulesb vmulosb vmuleuh vmulouh vmulesh vmulosh
 vmsumubm vmsummbm vmsumuhm vmsumshm
-lvsl lvsr lvx ldu16 ldu15 vmhraddshs vmhaddshs vperm(d=b)
+lvsl lvsr lvx ldu16 ldu15 vmhraddshs vmhaddshs vperm(d=b) deadst-ld deadst-call
 vaddfp vsubfp vmaxfp vminfp vmaddfp vnmsubfp vrefp vcfsx vcfux vctsxs vctuxs
 """.split()
 BENCH = ['vperm x4', 'vmrghb/vmrglh/vsldoi/vpkuhum',

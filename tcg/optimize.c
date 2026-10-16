@@ -2839,6 +2839,135 @@ static bool fold_xor(OptContext *ctx, TCGOp *op)
     return fold_masks_zs(ctx, op, z_mask, s_mask);
 }
 
+/* Bytes accessed by a host load or store op; 0 for any other op. */
+static int ldst_size(TCGOp *op, bool *store)
+{
+    *store = true;
+    switch (op->opc) {
+    CASE_OP_32_64(st8):
+        return 1;
+    CASE_OP_32_64(st16):
+        return 2;
+    case INDEX_op_st_i32:
+    case INDEX_op_st32_i64:
+        return 4;
+    case INDEX_op_st_i64:
+        return 8;
+    case INDEX_op_st_vec:
+        return tcg_type_size(TCGOP_TYPE(op));
+    default:
+        break;
+    }
+    *store = false;
+    switch (op->opc) {
+    CASE_OP_32_64(ld8u):
+    CASE_OP_32_64(ld8s):
+        return 1;
+    CASE_OP_32_64(ld16u):
+    CASE_OP_32_64(ld16s):
+        return 2;
+    case INDEX_op_ld_i32:
+    case INDEX_op_ld32u_i64:
+    case INDEX_op_ld32s_i64:
+        return 4;
+    case INDEX_op_ld_i64:
+        return 8;
+    case INDEX_op_ld_vec:
+        return tcg_type_size(TCGOP_TYPE(op));
+    case INDEX_op_dupm_vec:
+        return 1 << TCGOP_VECE(op);
+    default:
+        return 0;
+    }
+}
+
+/* The register allocator loads globals from env behind the ops' back. */
+static bool env_global_in(TCGContext *s, intptr_t ofs, intptr_t end)
+{
+    TCGTemp *env = tcgv_ptr_temp(tcg_env);
+
+    for (int i = 0; i < s->nb_globals; i++) {
+        TCGTemp *ts = &s->temps[i];
+        if (ts->kind == TEMP_GLOBAL && ts->mem_base == env &&
+            ts->mem_offset < end &&
+            ofs < ts->mem_offset + tcg_type_size(ts->base_type)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Remove a store to env that a later store fully overwrites, with nothing
+ * in between that could read it.  Possible readers end the window: labels
+ * and branches, calls (a helper may read env), guest loads and stores
+ * (they may fault; the exception path reads env), barriers and plugin
+ * callbacks, overlapping loads from env, and loads through any pointer
+ * other than env or a constant (it might point into env; constant
+ * pointers are host tables, as TBs never embed a CPU's address).
+ * Interrupts are only taken at the start of a TB (gen_tb_start).
+ * Indirect globals live in memory reached through a pointer that may
+ * point into env, so targets that have them are left alone.
+ */
+static void remove_dead_env_stores(TCGContext *s)
+{
+    struct { TCGOp *op; intptr_t ofs, end; } pend[32];
+    TCGArg env = tcgv_ptr_arg(tcg_env);
+    TCGOp *op;
+    int n = 0;
+
+    if (s->nb_indirects) {
+        return;
+    }
+    QTAILQ_FOREACH(op, &s->ops, link) {
+        bool store;
+        int size = ldst_size(op, &store), i, j;
+        intptr_t ofs, end;
+
+        if (!size) {
+            if ((tcg_op_defs[op->opc].flags &
+                 (TCG_OPF_BB_END | TCG_OPF_CALL_CLOBBER |
+                  TCG_OPF_SIDE_EFFECTS)) ||
+                op->opc == INDEX_op_mb || op->opc == INDEX_op_plugin_cb ||
+                op->opc == INDEX_op_plugin_mem_cb) {
+                n = 0;
+            }
+            continue;
+        }
+        if (op->args[1] != env) {
+            if (!store && arg_temp(op->args[1])->kind != TEMP_CONST) {
+                n = 0;
+            }
+            continue;
+        }
+        ofs = op->args[2];
+        end = ofs + size;
+        for (i = j = 0; i < n; i++) {
+            if (pend[i].ofs < end && ofs < pend[i].end) {
+                if (!store) {
+                    continue;               /* read: it stays */
+                }
+                if (ofs <= pend[i].ofs && pend[i].end <= end &&
+                    !env_global_in(s, pend[i].ofs, pend[i].end)) {
+                    tcg_op_remove(s, pend[i].op);
+                    continue;
+                }
+            }
+            pend[j++] = pend[i];
+        }
+        n = j;
+        if (store) {
+            if (n == ARRAY_SIZE(pend)) {    /* forget the oldest */
+                memmove(pend, pend + 1, sizeof(pend) - sizeof(pend[0]));
+                n--;
+            }
+            pend[n].op = op;
+            pend[n].ofs = ofs;
+            pend[n++].end = end;
+        }
+    }
+}
+
 /* Propagate constants and copies, fold constant expressions. */
 void tcg_optimize(TCGContext *s)
 {
@@ -3089,4 +3218,7 @@ void tcg_optimize(TCGContext *s)
         }
         tcg_debug_assert(done);
     }
+#if !defined(CONFIG_TCG_THREADED_INTERPRETER) /* as the memcopy folding */
+    remove_dead_env_stores(s);
+#endif
 }
