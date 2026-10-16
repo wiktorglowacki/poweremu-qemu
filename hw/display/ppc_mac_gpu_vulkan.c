@@ -3160,7 +3160,7 @@ static const char vk_compose_glsl[] =
 "    bool vpass = keyfn(p.fn.x, in_range(c, p.key.x, p.key.y));\n"
 "    bool gpass = keyfn(p.fn.y, in_range(dc, p.key.z, p.key.w));\n"
 "    bool both = p.fn.z != 0u;\n"
-"    bool pass = (p.fn.y >= 2u && vpass == both) ? gpass : vpass;\n"
+"    bool pass = both ? (vpass && gpass) : (vpass || gpass);\n"
 "    outb.w[(y * p.fb.z + x * 4u) >> 2u] = pass ? video : d;\n"
 "}\n";
 
