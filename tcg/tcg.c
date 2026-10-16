@@ -106,6 +106,8 @@ struct TCGLabelQemuLdst {
     TCGReg datahi_reg;      /* reg index for high word to be loaded or stored */
     const tcg_insn_unit *raddr;   /* addr of the next IR of qemu_ld/st IR */
     tcg_insn_unit *label_ptr[2]; /* label pointers to be updated */
+    TCGRegSet live_regs;    /* call-clobbered regs holding temps (ldst_record_live) */
+    TCGRegSet live_v256;    /* ... of which hold a TCG_TYPE_V256 value */
     QSIMPLEQ_ENTRY(TCGLabelQemuLdst) next;
 };
 
@@ -657,6 +659,27 @@ static TCGLabelQemuLdst *new_ldst_label(TCGContext *s)
 }
 
 /*
+ * Record the call-clobbered registers that hold a temp while a qemu_ld/st
+ * is being emitted.  Unless the op freed them (TCG_OPF_CALL_CLOBBER without
+ * tcg_ldst_keep), the slow path must preserve them across the helper call;
+ * the outputs of a load are among them and are left out by the backend.
+ */
+__attribute__((unused))
+static void ldst_record_live(TCGContext *s, TCGLabelQemuLdst *l)
+{
+    for (int r = 0; r < TCG_TARGET_NB_REGS; r++) {
+        TCGTemp *ts = s->reg_to_temp[r];
+
+        if (ts && tcg_regset_test_reg(tcg_target_call_clobber_regs, r)) {
+            tcg_regset_set_reg(l->live_regs, r);
+            if (ts->type == TCG_TYPE_V256) {
+                tcg_regset_set_reg(l->live_v256, r);
+            }
+        }
+    }
+}
+
+/*
  * Allocate new constant pool entries.
  */
 
@@ -956,6 +979,39 @@ static const TCGConstraintSet constraint_sets[] = {
 #define C_N1_O1_I4(O1, O2, I1, I2, I3, I4) C_PFX6(c_n1_o1_i4_, O1, O2, I1, I2, I3, I4)
 
 #include "tcg-target.c.inc"
+
+/*
+ * A backend that defines TCG_TARGET_LDST_CLOBBER (the registers its
+ * qemu_ld/st fast path uses as scratch) saves the live call-clobbered
+ * registers in the slow path, so qemu_ld/st need not free them like a
+ * call does.  Globals are still synced (TCG_OPF_SIDE_EFFECTS): the helper
+ * may raise an exception.  PPC_LDST_KEEP=0 restores the full clobber.
+ */
+#ifdef TCG_TARGET_LDST_CLOBBER
+static bool tcg_ldst_keep;
+#else
+#define tcg_ldst_keep            false
+#define TCG_TARGET_LDST_CLOBBER  0
+#endif
+
+/* Registers destroyed by a TCG_OPF_CALL_CLOBBER op. */
+static TCGRegSet op_clobber_regs(TCGOpcode opc)
+{
+    if (tcg_ldst_keep) {
+        switch (opc) {
+        case INDEX_op_qemu_ld_i32:
+        case INDEX_op_qemu_st_i32:
+        case INDEX_op_qemu_ld_i64:
+        case INDEX_op_qemu_st_i64:
+        case INDEX_op_qemu_ld_i128:     /* AltiVec lvx/stvx */
+        case INDEX_op_qemu_st_i128:
+            return TCG_TARGET_LDST_CLOBBER;
+        default:
+            break;
+        }
+    }
+    return tcg_target_call_clobber_regs;
+}
 
 #if !defined(CONFIG_TCG_INTERPRETER) && !defined(CONFIG_TCG_THREADED_INTERPRETER)
 /* Validate CPUTLBDescFast placement. */
@@ -1518,6 +1574,10 @@ static void tcg_context_init(unsigned max_cpus)
 
     tcg_target_init(s);
     process_constraint_sets();
+
+#ifdef TCG_TARGET_LDST_CLOBBER
+    tcg_ldst_keep = g_strcmp0(getenv("PPC_LDST_KEEP"), "0") != 0;
+#endif
 
     /* Reverse the order of the saved registers, assuming they're all at
        the start of tcg_target_reg_alloc_order.  */
@@ -3724,9 +3784,9 @@ static void la_global_kill(TCGContext *s, int ng)
 }
 
 /* liveness analysis: note live globals crossing calls.  */
-static void la_cross_call(TCGContext *s, int nt)
+static void la_cross_call(TCGContext *s, int nt, TCGRegSet clobber)
 {
-    TCGRegSet mask = ~tcg_target_call_clobber_regs;
+    TCGRegSet mask = ~clobber;
     int i;
 
     for (i = 0; i < nt; i++) {
@@ -3897,7 +3957,7 @@ liveness_pass_1(TCGContext *s)
                 }
 
                 /* For all live registers, remove call-clobbered prefs.  */
-                la_cross_call(s, nb_temps);
+                la_cross_call(s, nb_temps, tcg_target_call_clobber_regs);
 
                 /*
                  * Input arguments are live for preceding opcodes.
@@ -4095,7 +4155,7 @@ liveness_pass_1(TCGContext *s)
             } else if (def->flags & TCG_OPF_SIDE_EFFECTS) {
                 la_global_sync(s, nb_globals);
                 if (def->flags & TCG_OPF_CALL_CLOBBER) {
-                    la_cross_call(s, nb_temps);
+                    la_cross_call(s, nb_temps, op_clobber_regs(opc));
                 }
             }
 
@@ -5306,9 +5366,10 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
         tcg_reg_alloc_bb_end(s, i_allocated_regs);
     } else {
         if (def->flags & TCG_OPF_CALL_CLOBBER) {
-            /* XXX: permit generic clobber register list ? */
+            TCGRegSet clobber = op_clobber_regs(op->opc);
+
             for (i = 0; i < TCG_TARGET_NB_REGS; i++) {
-                if (tcg_regset_test_reg(tcg_target_call_clobber_regs, i)) {
+                if (tcg_regset_test_reg(clobber, i)) {
                     tcg_reg_free(s, i, i_allocated_regs);
                 }
             }

@@ -166,6 +166,20 @@ static TCGReg tcg_target_call_oarg_reg(TCGCallReturnKind kind, int slot)
 # define TCG_REG_L1 TCG_REG_EDX
 #endif
 
+/*
+ * The softmmu fast path clobbers only L0/L1; the slow path saves the other
+ * live call-clobbered registers in a frame area (tcg_out_ldst_save), so
+ * qemu_ld/st need not free them (tcg.c op_clobber_regs).
+ */
+#if TCG_TARGET_REG_BITS == 64 && !defined(_WIN64) && !defined(CONFIG_USER_ONLY)
+# define TCG_TARGET_LDST_CLOBBER  ((1u << TCG_REG_L0) | (1u << TCG_REG_L1))
+# define LDST_SAVE_SIZE  (TCG_TARGET_NB_REGS * 32)    /* one ymm per reg */
+#else
+# define LDST_SAVE_SIZE  0
+#endif
+#define LDST_SAVE_OFS \
+    (TCG_STATIC_CALL_ARGS_SIZE + CPU_TEMP_BUF_NLONGS * sizeof(long))
+
 #if TCG_TARGET_REG_BITS == 64
 # define ALL_GENERAL_REGS      0x0000ffffu
 # define ALL_VECTOR_REGS       0xffff0000u
@@ -2084,6 +2098,35 @@ static void tcg_out_pair_to_vec(TCGContext *s, TCGType type,
 }
 
 /*
+ * Save (or restore) the registers recorded live across the qemu_ld/st,
+ * except the outputs of a load.  Done before the helper arguments are set
+ * up and after its result is in place.  The slots sit 16-aligned in the
+ * frame after the TCG temps.
+ */
+static void tcg_out_ldst_save(TCGContext *s, const TCGLabelQemuLdst *l,
+                              bool restore)
+{
+#ifdef TCG_TARGET_LDST_CLOBBER
+    for (int r = 0; r < TCG_TARGET_NB_REGS; r++) {
+        intptr_t ofs = LDST_SAVE_OFS + r * 32;
+        TCGType type = (r < TCG_REG_XMM0 ? TCG_TYPE_I64
+                        : tcg_regset_test_reg(l->live_v256, r) ? TCG_TYPE_V256
+                        : TCG_TYPE_V128);
+
+        if (!tcg_regset_test_reg(l->live_regs, r)
+            || (l->is_ld && (r == l->datalo_reg || r == l->datahi_reg))) {
+            continue;
+        }
+        if (restore) {
+            tcg_out_ld(s, type, r, TCG_REG_CALL_STACK, ofs);
+        } else {
+            tcg_out_st(s, type, r, TCG_REG_CALL_STACK, ofs);
+        }
+    }
+#endif
+}
+
+/*
  * Generate code for the slow path for a load at the end of block
  */
 static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *l)
@@ -2097,9 +2140,11 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *l)
         tcg_patch32(label_ptr[1], s->code_ptr - label_ptr[1] - 4);
     }
 
+    tcg_out_ldst_save(s, l, false);
     tcg_out_ld_helper_args(s, l, &ldst_helper_param);
     tcg_out_branch(s, 1, qemu_ld_helpers[opc & MO_SIZE]);
     tcg_out_ld_helper_ret(s, l, false, &ldst_helper_param);
+    tcg_out_ldst_save(s, l, true);
 
     tcg_out_jmp(s, l->raddr);
     return true;
@@ -2119,8 +2164,10 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *l)
         tcg_patch32(label_ptr[1], s->code_ptr - label_ptr[1] - 4);
     }
 
+    tcg_out_ldst_save(s, l, false);
     tcg_out_st_helper_args(s, l, &ldst_helper_param);
     tcg_out_branch(s, 1, qemu_st_helpers[opc & MO_SIZE]);
+    tcg_out_ldst_save(s, l, true);
 
     tcg_out_jmp(s, l->raddr);
     return true;
@@ -2204,6 +2251,9 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
         ldst->is_ld = is_ld;
         ldst->oi = oi;
         ldst->addr_reg = addr;
+#ifdef TCG_TARGET_LDST_CLOBBER
+        ldst_record_live(s, ldst);
+#endif
 
         if (TCG_TARGET_REG_BITS == 64) {
             ttype = s->addr_type;
@@ -4476,6 +4526,7 @@ static const int tcg_target_callee_save_regs[] = {
     ((PUSH_SIZE \
       + TCG_STATIC_CALL_ARGS_SIZE \
       + CPU_TEMP_BUF_NLONGS * sizeof(long) \
+      + LDST_SAVE_SIZE \
       + TCG_TARGET_STACK_ALIGN - 1) \
      & ~(TCG_TARGET_STACK_ALIGN - 1))
 
