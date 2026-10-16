@@ -1233,7 +1233,10 @@ static bool tri_ccw(const Build *b, uint32_t a, uint32_t c, uint32_t d)
 
 static void emit_tri(Build *b, const uint32_t *ix, const R300Prov *prov)
 {
-    bool front = tri_ccw(b, ix[0], ix[1], ix[2]) == r300_front_ccw(r300_reg(b->st, SU_CULL_MODE));
+    /* Facing matters only to CPU culling, polygon mode and two-sided
+     * colours; plain filled triangles skip the divides. */
+    bool front = !(b->cull || b->poly_mode || b->back_colors) ||
+                 tri_ccw(b, ix[0], ix[1], ix[2]) == r300_front_ccw(r300_reg(b->st, SU_CULL_MODE));
     bool back = !front;
 
     if ((front && (b->cull & R300_CULL_FRONT)) || (back && (b->cull & R300_CULL_BACK))) {
@@ -1603,6 +1606,25 @@ static bool gpu_vs_build(const R300State *st, Fetch *f, const R300PVSProgram *pr
 }
 
 /*
+ * draw_core's working arrays, kept per drawing thread and grown on demand
+ * (a malloc/calloc/free set per draw page-faulted on big indexed meshes).
+ * ponytail: holds the largest draw's arrays (~0.75 KB a vertex) for the
+ * thread's lifetime; trim after huge draws if that memory ever matters.
+ */
+enum { SCR_XV, SCR_OUTS, SCR_HKEY, SCR_HSLOT, SCR_DUP, SCR_LIST, SCR_PROV, SCR_N };
+static __thread struct { void *p; size_t cap; } scr[SCR_N];
+
+static void *scratch(unsigned k, size_t size)
+{
+    if (scr[k].cap < size) {
+        free(scr[k].p);
+        scr[k].cap = size > 2 * scr[k].cap ? size : 2 * scr[k].cap;
+        scr[k].p = malloc(scr[k].cap);
+    }
+    return scr[k].p;
+}
+
+/*
  * Everything after vertex ordering.  order[] (n entries, malloc'd) is
  * taken over; immd is the DRAW_IMMD_2 vertex data or NULL.
  */
@@ -1648,7 +1670,6 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         }
     }
     R300PVSProgram prog;
-    float consts[256][4];
     Build b;
 
     prim = vf & 0xF;
@@ -1718,18 +1739,12 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     f.immd = immd;
     f.immd_dw = immd_dw;
 
-    /* Vertex program */
-    for (int i = 0; i < 256; i++) {
-        memcpy(consts[i], &st->pvs_mem[(R300_PVS_CONST_START + (cc & 0xFF) + i) * 4],
-               sizeof(consts[i]));
-        if (R300_PVS_CONST_START + (cc & 0xFF) + i + 1 >= R300_PVS_MEM_VECS) {
-            break;
-        }
-    }
+    /* Vertex program; its constants are read in place: base + index stay
+     * below 512 + 255 + 255, inside PVS memory. */
     prog.code = &st->pvs_mem[R300_PVS_CODE_START * 4];
     prog.first_inst = cntl0 & 0x3FF;
     prog.last_inst = (cntl0 >> 20) & 0x3FF;
-    prog.consts = (const float (*)[4])consts;
+    prog.consts = (const float (*)[4])&st->pvs_mem[(R300_PVS_CONST_START + (cc & 0xFF)) * 4];
     prog.max_const = (cc >> 16) & 0xFF;
     prog.fc_opc = r300_reg(st, VAP_PVS_FLOW_CNTL_OPC);
     for (int i = 0; i < 16; i++) {
@@ -1767,23 +1782,25 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     }
 
     /* Transform every vertex in draw order (cheap next to the GPU work). */
-    R300Vertex *xv = calloc(nsrc ? nsrc : 1, sizeof(R300Vertex));
-    float (*outs)[R300_PVS_NUM_OUTPUTS][4] = calloc(nsrc ? nsrc : 1, sizeof(*outs));
+    R300Vertex *xv = scratch(SCR_XV, (nsrc ? nsrc : 1) * sizeof(R300Vertex));
+    float (*outs)[R300_PVS_NUM_OUTPUTS][4] = scratch(SCR_OUTS, (nsrc ? nsrc : 1) * sizeof(*outs));
 
     /*
      * Indexed meshes name most vertices several times; the result depends
      * only on the index, so shade each one once (a post-transform cache,
-     * as the hardware has).  Open addressing on order[i] -> slot j.
+     * as the hardware has).  Open addressing on order[i] -> slot j; dup[j]
+     * is the first slot with the same index (j itself on a miss).
      */
-    uint32_t hmask = 0, *hkey = NULL, *hslot = NULL;
+    uint32_t hmask = 0, *hkey = NULL, *hslot = NULL, *dup = NULL;
     if (!rects && n > 3) {
         uint32_t hn = 8;
         while (hn < 2 * n) {
             hn <<= 1;
         }
         hmask = hn - 1;
-        hkey = malloc(hn * sizeof(*hkey));
-        hslot = malloc(hn * sizeof(*hslot));
+        hkey = scratch(SCR_HKEY, hn * sizeof(*hkey));
+        hslot = scratch(SCR_HSLOT, hn * sizeof(*hslot));
+        dup = scratch(SCR_DUP, n * sizeof(*dup));
         memset(hslot, 0xFF, hn * sizeof(*hslot));
     }
     for (uint32_t i = 0, j = 0; i < n && j < nsrc; i++, j++) {
@@ -1796,23 +1813,21 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
             while (hslot[h] != UINT32_MAX && hkey[h] != order[i]) {
                 h = (h + 1) & hmask;
             }
-            if (hslot[h] != UINT32_MAX) {
-                memcpy(out, outs[hslot[h]], sizeof(outs[j]));
+            dup[j] = hslot[h] != UINT32_MAX ? hslot[h] : j;
+            if (dup[j] != j) {
+                memcpy(out, outs[dup[j]], sizeof(outs[j]));
                 continue;
             }
         }
         if (!fetch_vertex(&f, order[i], in)) {
-            free(hkey);
-            free(hslot);
             *err = f.why ? f.why : "vertex data out of range";
-            free(outs);
-            free(xv);
             free(order);
             return false;
         }
         if (bypass) {
             memcpy(out, in, sizeof(outs[j]));
         } else {
+            memset(out, 0, sizeof(outs[j]));    /* outputs the program leaves */
             uint32_t u = r300_pvs_run(&prog, (const float (*)[4])in, out);
             if (u & R300_PVS_UNSUP_FLOW) {
                 pkt->warn |= R300_WARN_FLOW;
@@ -1834,12 +1849,15 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
             }
         }
     }
-    free(hkey);
-    free(hslot);
     for (uint32_t j = 0; j < nsrc; j++) {
         float (*out)[4] = outs[j];
         float cols[4][4];
 
+        if (dup && dup[j] != j) {
+            xv[j] = xv[dup[j]];         /* same input, same result */
+            continue;
+        }
+        memset(&xv[j], 0, sizeof(xv[j]));
         viewport_xform(st, pkt, out[lay.pos], xv[j].pos);
         vtx_colors(&lay, out, cols);
         rs_values(st, &lay, &route, out, (const float (*)[4])cols, NULL, xv[j].v);
@@ -1910,18 +1928,14 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         pkt->cull &= R300_FACE_CW;
     }
 
-    list = malloc(sizeof(uint32_t) * (n * 3 + 6));
-    prov = malloc(sizeof(R300Prov) * (n * 2 + 2));
+    list = scratch(SCR_LIST, sizeof(uint32_t) * (n * 3 + 6));
+    prov = scratch(SCR_PROV, sizeof(R300Prov) * (n * 2 + 2));
     uint32_t cls;
     nidx = r300_assemble_prov(prim, n, list, &cls, prov);
     if (!nidx) {
         if (prim != 0) {
             pkt->warn |= R300_WARN_PRIM;
         }
-        free(prov);
-        free(list);
-        free(outs);
-        free(xv);
         free(order);
         *err = "primitive type not supported";
         return false;
@@ -1958,10 +1972,6 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         pkt->num_line_verts = b.nline;
         pkt->prim_class = 0;
     }
-    free(prov);
-    free(list);
-    free(outs);
-    free(xv);
     free(order);
 
     pkt->glsl = r300_us_glsl_cached(st, &desc, st->glsl_flags, &pkt->glsl_id, err);
