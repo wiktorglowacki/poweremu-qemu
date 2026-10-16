@@ -127,6 +127,15 @@ struct TCGCPUOps {
 #else
     /** @do_interrupt: Callback for interrupt handling.  */
     void (*do_interrupt)(CPUState *cpu);
+    /**
+     * @exception_needs_bql: whether do_interrupt for the pending
+     * cpu->exception_index must run under the BQL.  Absent means yes.
+     * A target whose synchronous exceptions (system calls, faults) touch
+     * only CPU state can answer false and spare a lock round trip per
+     * exception, which matters when another thread holds the BQL for
+     * long stretches.
+     */
+    bool (*exception_needs_bql)(CPUState *cpu);
     /** @cpu_exec_interrupt: Callback for processing interrupts in cpu_exec */
     bool (*cpu_exec_interrupt)(CPUState *cpu, int interrupt_request);
     /**

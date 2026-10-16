@@ -73,7 +73,7 @@ void cpu_reset_interrupt(CPUState *cpu, int mask)
     if (need_lock) {
         bql_lock();
     }
-    cpu->interrupt_request &= ~mask;
+    qatomic_and(&cpu->interrupt_request, ~mask);
     if (need_lock) {
         bql_unlock();
     }

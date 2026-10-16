@@ -7479,6 +7479,29 @@ static const struct SysemuCPUOps ppc_sysemu_ops = {
 #ifdef CONFIG_TCG
 #include "accel/tcg/cpu-ops.h"
 
+/*
+ * Synchronous exceptions raised by translated code (system calls, storage
+ * and program faults, unavailable units) only rewrite CPU registers on the
+ * way in, so they can skip the BQL round trip cpu_handle_exception makes
+ * by default.  Everything else (machine check, reset, external) keeps it.
+ */
+static bool ppc_cpu_exception_needs_bql(CPUState *cs)
+{
+    switch (cs->exception_index) {
+    case POWERPC_EXCP_DSI:
+    case POWERPC_EXCP_ISI:
+    case POWERPC_EXCP_ALIGN:
+    case POWERPC_EXCP_PROGRAM:
+    case POWERPC_EXCP_FPU:
+    case POWERPC_EXCP_SYSCALL:
+    case POWERPC_EXCP_TRACE:
+    case POWERPC_EXCP_VPU:
+        return false;
+    default:
+        return true;
+    }
+}
+
 static const TCGCPUOps ppc_tcg_ops = {
   .initialize = ppc_translate_init,
   .translate_code = ppc_translate_code,
@@ -7491,6 +7514,7 @@ static const TCGCPUOps ppc_tcg_ops = {
   .cpu_exec_interrupt = ppc_cpu_exec_interrupt,
   .cpu_exec_halt = ppc_cpu_has_work,
   .do_interrupt = ppc_cpu_do_interrupt,
+  .exception_needs_bql = ppc_cpu_exception_needs_bql,
   .cpu_exec_enter = ppc_cpu_exec_enter,
   .cpu_exec_exit = ppc_cpu_exec_exit,
   .do_unaligned_access = ppc_cpu_do_unaligned_access,

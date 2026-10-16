@@ -744,10 +744,16 @@ static inline bool cpu_handle_exception(CPUState *cpu, int *ret)
 #else
     if (replay_exception()) {
         const TCGCPUOps *tcg_ops = cpu->cc->tcg_ops;
+        bool bql = !tcg_ops->exception_needs_bql ||
+                   tcg_ops->exception_needs_bql(cpu);
 
-        bql_lock();
+        if (bql) {
+            bql_lock();
+        }
         tcg_ops->do_interrupt(cpu);
-        bql_unlock();
+        if (bql) {
+            bql_unlock();
+        }
         cpu->exception_index = -1;
 
         if (unlikely(cpu->singlestep_enabled)) {
@@ -809,7 +815,7 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
             interrupt_request &= ~CPU_INTERRUPT_SSTEP_MASK;
         }
         if (interrupt_request & CPU_INTERRUPT_DEBUG) {
-            cpu->interrupt_request &= ~CPU_INTERRUPT_DEBUG;
+            qatomic_and(&cpu->interrupt_request, ~CPU_INTERRUPT_DEBUG);
             cpu->exception_index = EXCP_DEBUG;
             bql_unlock();
             return true;
@@ -819,7 +825,7 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
             /* Do nothing */
         } else if (interrupt_request & CPU_INTERRUPT_HALT) {
             replay_interrupt();
-            cpu->interrupt_request &= ~CPU_INTERRUPT_HALT;
+            qatomic_and(&cpu->interrupt_request, ~CPU_INTERRUPT_HALT);
             cpu->halted = 1;
             cpu->exception_index = EXCP_HLT;
             bql_unlock();
@@ -875,7 +881,7 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
         }
 #endif /* !CONFIG_USER_ONLY */
         if (interrupt_request & CPU_INTERRUPT_EXITTB) {
-            cpu->interrupt_request &= ~CPU_INTERRUPT_EXITTB;
+            qatomic_and(&cpu->interrupt_request, ~CPU_INTERRUPT_EXITTB);
             /* ensure that no TB jump will be modified as
                the program flow was changed */
             *last_tb = NULL;

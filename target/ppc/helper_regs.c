@@ -291,6 +291,18 @@ void cpu_interrupt_exittb(CPUState *cs)
      * unless running with TCG.
      */
     if (tcg_enabled()) {
+        if (qemu_cpu_is_self(cs)) {
+            /*
+             * The vCPU asking itself to leave the TB chain (every MSR
+             * write that flips IR/DR: each system call entry and return):
+             * no need for the BQL, the writers of interrupt_request use
+             * atomic RMW.  This is what tcg_handle_interrupt does for the
+             * current CPU minus the lock.
+             */
+            qatomic_or(&cs->interrupt_request, CPU_INTERRUPT_EXITTB);
+            qatomic_set(&cs->neg.icount_decr.u16.high, -1);
+            return;
+        }
         BQL_LOCK_GUARD();
         cpu_interrupt(cs, CPU_INTERRUPT_EXITTB);
     }

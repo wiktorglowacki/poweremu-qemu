@@ -99,7 +99,7 @@ void tcg_handle_interrupt(CPUState *cpu, int mask)
 {
     g_assert(bql_locked());
 
-    cpu->interrupt_request |= mask;
+    qatomic_or(&cpu->interrupt_request, mask);
 
     /*
      * If called from iothread context, wake the target cpu in
