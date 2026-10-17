@@ -2167,7 +2167,17 @@ void ppc_maybe_interrupt(CPUPPCState *env)
      * and CPU_INTERRUPT_HARD already clear there is nothing to change; a
      * source raising an interrupt calls this itself, under the BQL, after
      * setting pending_interrupts.
+     *
+     * That is a store-then-load on each side: the vCPU stores MSR and loads
+     * pending_interrupts here, ppc_set_irq stores pending_interrupts and
+     * loads MSR (ppc_next_unmasked_interrupt).  Without a full barrier
+     * between the two, both can read the old value (store->load reordering,
+     * routine on arm64 hosts): the vCPU sees nothing pending, the source
+     * sees MSR[EE] still clear, and the interrupt stays pending with EE set
+     * and CPU_INTERRUPT_HARD clear until the next MSR write -- forever in a
+     * user-mode loop that waits for the decrementer.
      */
+    smp_mb();
     if (!bql_locked() && !qatomic_read(&env->pending_interrupts) &&
         !(qatomic_read(&cs->interrupt_request) & CPU_INTERRUPT_HARD)) {
         return;
