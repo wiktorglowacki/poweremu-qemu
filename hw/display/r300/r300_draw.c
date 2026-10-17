@@ -1288,7 +1288,7 @@ typedef struct GpuVs {
     unsigned klen;
 } GpuVs;
 
-#define GPU_VS_SLOTS 32
+#define GPU_VS_SLOTS 256
 static GpuVs gpu_vs_memo[GPU_VS_SLOTS];     /* most recently used first */
 static uint32_t gpu_vs_next_id = 1;
 

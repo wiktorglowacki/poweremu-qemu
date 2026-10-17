@@ -175,7 +175,7 @@ typedef struct VkPipeKey {
     VkPrimitiveTopology topo;
     VkCullModeFlags cull;
     VkFrontFace front;
-    uint32_t vs_id;             /* GPU vertex program (pkt->vs_id), 0: the pass-through */
+    VkShaderModule vs_mod;      /* GPU vertex program, NULL: the pass-through */
 } VkPipeKey;
 typedef struct VkProg {
     VkShaderModule mod[3];      /* R300Stage */
@@ -257,7 +257,8 @@ static struct {
     unsigned fb_next;
     GHashTable *progs;
     GHashTable *progs_by_id;     /* GLSL memo id -> VkProg */          /* GLSL -> VkProg */
-    GHashTable *vs_mods;        /* vs_id -> VkShaderModule (GPU vertex programs) */
+    GHashTable *vs_mods;        /* vs_glsl -> VkShaderModule (GPU vertex programs) */
+    GHashTable *vs_mods_by_id;  /* vs_id -> VkShaderModule */
     GHashTable *samplers;       /* key -> VkSampler */
     VkImage dummy_img[3];
     VkDeviceMemory dummy_mem[3];
@@ -589,7 +590,8 @@ static bool vk_ctx_init(void)
     V.free_chunks = g_ptr_array_new();
     V.progs = g_hash_table_new(g_str_hash, g_str_equal);
     V.progs_by_id = g_hash_table_new(g_direct_hash, g_direct_equal);
-    V.vs_mods = g_hash_table_new(g_direct_hash, g_direct_equal);
+    V.vs_mods = g_hash_table_new(g_str_hash, g_str_equal);
+    V.vs_mods_by_id = g_hash_table_new(g_direct_hash, g_direct_equal);
     V.samplers = g_hash_table_new(g_direct_hash, g_direct_equal);
 
     qemu_mutex_init(&V.lock);
@@ -2382,11 +2384,18 @@ static VkShaderModule vk_module(VkProg *pg, const char *glsl, R300Stage stage)
     return pg->mod[stage];
 }
 
-/* The GPU vertex program vs_glsl (id vs_id), compiled once. */
+/* The GPU vertex program vs_glsl (id vs_id), compiled once per distinct text. */
 static VkShaderModule vk_vs_module(const char *vs_glsl, uint32_t vs_id)
 {
     gpointer m;
-    if (g_hash_table_lookup_extended(V.vs_mods, GUINT_TO_POINTER(vs_id), NULL, &m)) {
+    if (vs_id && g_hash_table_lookup_extended(V.vs_mods_by_id,
+                                              GUINT_TO_POINTER(vs_id), NULL, &m)) {
+        return (VkShaderModule)m;
+    }
+    if (g_hash_table_lookup_extended(V.vs_mods, vs_glsl, NULL, &m)) {
+        if (vs_id) {
+            g_hash_table_insert(V.vs_mods_by_id, GUINT_TO_POINTER(vs_id), m);
+        }
         return (VkShaderModule)m;
     }
     size_t nw;
@@ -2407,13 +2416,15 @@ static VkShaderModule vk_vs_module(const char *vs_glsl, uint32_t vs_id)
         }
         free(spv);
     }
-    /* ponytail: vs ids never repeat, so evicted programs leak a module each */
-    g_hash_table_insert(V.vs_mods, GUINT_TO_POINTER(vs_id), (gpointer)mod);
+    g_hash_table_insert(V.vs_mods, g_strdup(vs_glsl), (gpointer)mod);
+    if (vs_id) {
+        g_hash_table_insert(V.vs_mods_by_id, GUINT_TO_POINTER(vs_id), (gpointer)mod);
+    }
     return mod;
 }
 
 static VkPipeline vk_pipeline(const char *glsl, uint32_t glsl_id,
-                              const char *vs_glsl, const VkPipeKey *key)
+                              const VkPipeKey *key)
 {
     /* The GLSL memo's ids never repeat, so a hit by id skips hashing the
      * whole program text on every draw (that was 2-3% of the GPU thread). */
@@ -2454,8 +2465,7 @@ static VkPipeline vk_pipeline(const char *glsl, uint32_t glsl_id,
             return pv->pipe;
         }
     }
-    VkShaderModule vs = key->vs_id ? vk_vs_module(vs_glsl, key->vs_id)
-                                   : vk_module(pg, glsl, R300_STAGE_VS);
+    VkShaderModule vs = key->vs_mod ? key->vs_mod : vk_module(pg, glsl, R300_STAGE_VS);
     VkShaderModule fs = vk_module(pg, glsl, key->z ? R300_STAGE_FS_Z : R300_STAGE_FS);
     if (!vs || !fs) {
         return VK_NULL_HANDLE;
@@ -3043,10 +3053,15 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                                          : VK_FRONT_FACE_CLOCKWISE;
     /* GPU vertex shading (R300_GLSL_GPU_VS): triangles only, no line pass */
     bool gpu_vs = pkt->vs_glsl && pkt->vs_id;
-    pk.vs_id = gpu_vs ? pkt->vs_id : 0;
+    if (gpu_vs) {
+        pk.vs_mod = vk_vs_module(pkt->vs_glsl, pkt->vs_id);
+        if (!pk.vs_mod) {
+            return -1;
+        }
+    }
     VkPipeline pipe = VK_NULL_HANDLE, lpipe = VK_NULL_HANDLE;
     if (pkt->num_verts) {
-        pipe = vk_pipeline(pkt->glsl, pkt->glsl_id, pkt->vs_glsl, &pk);
+        pipe = vk_pipeline(pkt->glsl, pkt->glsl_id, &pk);
         if (!pipe) {
             return -1;
         }
@@ -3055,8 +3070,8 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         VkPipeKey lk = pk;
         lk.topo = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
         lk.cull = VK_CULL_MODE_NONE;    /* polygon-mode edges: never culled */
-        lk.vs_id = 0;                   /* lines: always CPU-shaded R300Vertex */
-        lpipe = vk_pipeline(pkt->glsl, pkt->glsl_id, NULL, &lk);
+        lk.vs_mod = VK_NULL_HANDLE;     /* lines: always CPU-shaded R300Vertex */
+        lpipe = vk_pipeline(pkt->glsl, pkt->glsl_id, &lk);
         if (!lpipe) {
             return -1;
         }
