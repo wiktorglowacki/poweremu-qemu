@@ -211,6 +211,9 @@ static struct {
     VkBuffer vram_buf;
     uint64_t npages;
     uint64_t *page_gen;         /* write generation of each page */
+    /* The page's last draw: its generation, the drawn image's VRAM bytes,
+     * and the page's generation before that image's run of draws. */
+    uint64_t *page_wgen, *page_gprev, (*page_wr)[2];
     uint32_t *page_wseq;        /* batch that last wrote each page (GPU) */
     uint32_t *page_rseq;        /* batch that last read each page (GPU) */
     unsigned long *dirty_bm;
@@ -758,6 +761,9 @@ void *ppc_mac_gpu_vulkan_alloc_vram(uint64_t vram_size, void **opaque_out)
     V.vram_size = vram_size;
     V.npages = DIV_ROUND_UP(vram_size, VK_PAGE);
     V.page_gen = g_new0(uint64_t, V.npages);
+    V.page_wgen = g_new0(uint64_t, V.npages);
+    V.page_gprev = g_new0(uint64_t, V.npages);
+    V.page_wr = g_malloc0(sizeof(*V.page_wr) * V.npages);
     V.page_wseq = g_new0(uint32_t, V.npages);
     V.page_rseq = g_new0(uint32_t, V.npages);
     V.page_src = g_new0(uint8_t, V.npages);
@@ -1039,6 +1045,37 @@ static void vk_harvest(void)
             }
         }
     }
+}
+
+/*
+ * PPCGPU_VK_PAGE_OWNER=0: an image is stale whenever a page it touches is
+ * newer (A/B).  By default a page whose newest write is a draw into an
+ * image that does not overlap [lo, hi) counts with the generation it had
+ * before that image's draws.  The guest packs buffers 2 KB apart, so in
+ * RTCW at 800x600x32 the colour buffer's last row shares a page with the
+ * depth buffer's first, and every draw wrote the colour buffer back and
+ * reloaded its last row: a pass, a write-back and an upload per 3 draws.
+ * Any other write to the page (CPU, 2D) moves page_gen past page_wgen and
+ * counts as before.
+ */
+static bool vk_page_owner(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_VK_PAGE_OWNER");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/* Page p's generation as far as VRAM bytes [lo, hi) are concerned. */
+static uint64_t vk_page_gen_for(uint64_t p, uint64_t lo, uint64_t hi)
+{
+    if (V.page_wgen[p] == V.page_gen[p] &&
+        (V.page_wr[p][1] <= lo || V.page_wr[p][0] >= hi) && vk_page_owner()) {
+        return V.page_gprev[p];
+    }
+    return V.page_gen[p];
 }
 
 static uint64_t vk_range_gen(uint64_t lo, uint64_t hi)
@@ -1584,6 +1621,24 @@ static void vk_layout_general(VkCommandBuffer cb, VkImage img, uint32_t levels,
  * The 2026-10-15 host freezes with it on were the y1 < y0 upload in
  * vk_img_get, bounded since.
  */
+/*
+ * PPCGPU_VK_ZPITCH=0: drop the depth buffer when its pitch is narrower
+ * than the colour buffer's (the old behaviour).  The driver pads each
+ * pitch to 256 bytes on its own, so at 800 pixels a 16-bit colour buffer
+ * is 896 wide and its 32-bit depth buffer 832: RTCW at 800x600x16 drew
+ * with no depth test at all.  By default the depth image is its own pitch
+ * wide and the pass stops there; nothing past it is on screen.
+ */
+static bool vk_zpitch(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_VK_ZPITCH");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
 static bool vk_rt_grow(void)
 {
     static int on = -1;
@@ -1683,7 +1738,19 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
     im->used = ++V.clock;
 
     uint64_t hi = vk_img_hi(im);
+    /*
+     * Plain page generations first (every lookup, every texture): only when
+     * a page looks newer than the image ask whether its last writer was a
+     * draw into another image sharing the page.  vk_page_gen_for is never
+     * above page_gen, so the shortcut gives the same answer.
+     */
     uint64_t gen = vk_range_gen(addr, hi);
+    if (gen > im->gen) {
+        gen = 0;
+        for (uint64_t p = vk_pg(addr); p <= vk_pg(hi - 1) && p < V.npages; p++) {
+            gen = MAX(gen, vk_page_gen_for(p, addr, hi));
+        }
+    }
     if (vk_check() && cls == IMG_TEX && im->valid && gen <= im->gen && im->hash &&
         !vk_range_pending(addr, hi) &&
         vk_img_hash(addr, w, h, pitch, bpp) != im->hash) {
@@ -1705,7 +1772,7 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
         if (im->valid) {
             uint64_t lo_p = UINT64_MAX, hi_p = 0;
             for (uint64_t p = vk_pg(addr); p <= vk_pg(hi - 1) && p < V.npages; p++) {
-                if (V.page_gen[p] > im->gen) {
+                if (vk_page_gen_for(p, addr, hi) > im->gen) {
                     lo_p = MIN(lo_p, p);
                     hi_p = p;
                 }
@@ -1826,8 +1893,16 @@ static void vk_img_written(VkImg *im, uint32_t x0, uint32_t y0,
      */
     uint64_t lo = im->addr + (uint64_t)y0 * im->pitch + (uint64_t)x0 * im->bpp;
     uint64_t hi = im->addr + (uint64_t)(y1 - 1) * im->pitch + (uint64_t)x1 * im->bpp;
+    uint64_t wlo = im->addr, whi = vk_img_hi(im);
     V.gen++;
     for (uint64_t p = vk_pg(lo); p <= vk_pg(hi - 1) && p < V.npages; p++) {
+        if (V.page_wgen[p] != V.page_gen[p] || V.page_wr[p][0] != wlo ||
+            V.page_wr[p][1] != whi) {
+            V.page_gprev[p] = V.page_gen[p];    /* another writer came before */
+            V.page_wr[p][0] = wlo;
+            V.page_wr[p][1] = whi;
+        }
+        V.page_wgen[p] = V.gen;
         V.page_gen[p] = V.gen;
         V.page_wseq[p] = s;
         V.page_src[p] = 2;
@@ -2766,7 +2841,14 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     }
     const R300DepthDesc *zd = &pkt->depth;
     bool want_z = zd->attach;
-    if (want_z && (zd->pitch < pkt->rt_width || zd->gpu_addr % 4)) {
+    bool z_narrow = want_z && zd->pitch < pkt->rt_width && ns == 1 && vk_zpitch();
+    if (z_narrow) {
+        sx1 = MIN(sx1, zd->pitch);      /* the columns the depth buffer has */
+        if (sx0 >= sx1) {
+            return 0;
+        }
+    }
+    if (want_z && ((zd->pitch < pkt->rt_width && !z_narrow) || zd->gpu_addr % 4)) {
         vk_warn(1u << 5, "depth buffer not usable");
         want_z = false;
     }
@@ -2905,11 +2987,11 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     bool z16 = zd->bpp == 2;
     if (want_z) {
         VkFormat zf = z16 ? VK_FORMAT_R16_UINT : VK_FORMAT_R32_UINT;
-        uint32_t zw = ns > 1 ? ns * zd->pitch : pkt->rt_width;
+        uint32_t zw = ns > 1 ? ns * zd->pitch : MIN(pkt->rt_width, zd->pitch);
         att[ncb] = vk_img_get(IMG_RT, zd->gpu_addr, zw, fbh,
                               ns * zd->pitch * zd->bpp, zf, zd->bpp, zd->tiling,
                               rt_max_h);
-        if (att[ncb] && zw == fbw) {
+        if (att[ncb] && (zw == fbw || z_narrow)) {
             fmt[ncb] = zf;
             natt++;
             att[ncb]->z = true;
@@ -2919,7 +3001,8 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         }
     }
     /* Keep the open pass's depth buffer bound for depth-less draws. */
-    if (!want_z && V.in_pass && V.pass_z && V.pass_n == ncb + 1) {
+    if (!want_z && V.in_pass && V.pass_z && V.pass_n == ncb + 1 &&
+        sx1 <= V.pass_img[ncb]->width) {
         bool same = true;
         for (uint32_t k = 0; k < ncb; k++) {
             same &= V.pass_img[k] == att[k];
@@ -2940,6 +3023,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
      * the same size whichever draw opened it. */
     for (uint32_t k = 0; k < natt; k++) {
         fbh = k ? MIN(fbh, att[k]->height) : att[k]->height;
+        fbw = MIN(fbw, att[k]->width);  /* a narrower depth buffer (vk_zpitch) */
     }
 
     VkRenderPass rp = vk_render_pass(natt, fmt);
