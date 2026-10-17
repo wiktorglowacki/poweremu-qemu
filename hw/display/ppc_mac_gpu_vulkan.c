@@ -2750,8 +2750,20 @@ static VkImageView vk_texture_full(const R300TexDesc *td)
         }
     }
     VkTexFull *t = &V.texfull[stale >= 0 ? stale : lru];
+    /*
+     * New bytes at the same address, size and format: copy them into the
+     * old image instead of allocating a new one per call.  The barrier
+     * below orders the copy after every earlier read of the old texels.
+     * PPCGPU_VK_TEX_REUSE=0: always a new image.
+     */
+    static int reuse_on = -1;
+    if (reuse_on < 0) {
+        const char *e = getenv("PPCGPU_VK_TEX_REUSE");
+        reuse_on = !(e && e[0] == '0');
+    }
+    bool reuse = stale >= 0 && reuse_on;
     V.stat_tf_built++;
-    if (t->live) {
+    if (t->live && !reuse) {
         vk_trash(NULL, TRASH_VIEW, (uint64_t)(uintptr_t)t->view);
         vk_trash(NULL, TRASH_IMAGE, (uint64_t)(uintptr_t)t->img);
         vk_trash(NULL, TRASH_MEM, (uint64_t)(uintptr_t)t->mem);
@@ -2760,7 +2772,7 @@ static VkImageView vk_texture_full(const R300TexDesc *td)
     uint32_t w = dxt ? (td->width + 3) & ~3u : td->width;
     uint32_t h = dxt ? (td->height + 3) & ~3u : td->height;
     bool cube = td->dim == R300_TEXDIM_CUBE, vol = td->dim == R300_TEXDIM_3D;
-    if (!vk_image(vol ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D,
+    if (!reuse && !vk_image(vol ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D,
                   vol ? VK_IMAGE_VIEW_TYPE_3D : cube ? VK_IMAGE_VIEW_TYPE_CUBE
                                                      : VK_IMAGE_VIEW_TYPE_2D,
                   fmt, w, h, vol ? td->depth : 1, td->levels, cube ? 6 : 1,
@@ -2770,7 +2782,11 @@ static VkImageView vk_texture_full(const R300TexDesc *td)
     }
     VkCommandBuffer cb = vk_batch()->cb;
     vk_end_pass();
-    vk_layout_general(cb, t->img, td->levels, cube ? 6 : 1);
+    if (reuse) {
+        vk_full_barrier(cb);
+    } else {
+        vk_layout_general(cb, t->img, td->levels, cube ? 6 : 1);
+    }
     for (uint32_t l = 0; l < td->levels; l++) {
         uint32_t lw, lh, n, bpr;
         r300_tex_level_dims(td, l, &lw, &lh, &n);
