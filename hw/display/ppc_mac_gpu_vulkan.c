@@ -1641,6 +1641,23 @@ static bool vk_zpitch(void)
     return on;
 }
 
+/*
+ * PPCGPU_VK_LAZY_Z=0: write dirty depth buffers back to VRAM at every
+ * commit (the old behaviour).  By default a depth image stays on the GPU
+ * across commits and is only written back when something touches its
+ * VRAM range (vk_writeback_range, vk_range_busy_r200) or when the CPU
+ * drains the engine (vk_flush_r200).
+ */
+static bool vk_lazy_z(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_VK_LAZY_Z");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
 static bool vk_rt_grow(void)
 {
     static int on = -1;
@@ -1914,8 +1931,17 @@ static void vk_img_written(VkImg *im, uint32_t x0, uint32_t y0,
 
 /* ---- commit / flush --------------------------------------------------- */
 
-static uint32_t vk_commit(void (*done)(void *, uint32_t), void *arg)
+static uint32_t vk_commit_ex(void (*done)(void *, uint32_t), void *arg,
+                             bool writeback_z)
 {
+    if (writeback_z && vk_lazy_z()) {
+        for (int i = 0; i < VK_MAX_IMG; i++) {
+            if (V.img[i].live && V.img[i].dirty && V.img[i].z) {
+                V.stat_wb_z += V.img[i].ndr > 0;
+                vk_copy_to_vram(&V.img[i]);
+            }
+        }
+    }
     if (!V.cur) {
         return 0;
     }
@@ -1929,7 +1955,8 @@ static uint32_t vk_commit(void (*done)(void *, uint32_t), void *arg)
     vk_end_pass();
     uint64_t wb0 = V.stat_writebacks;
     for (int i = 0; i < VK_MAX_IMG; i++) {
-        if (V.img[i].live && V.img[i].dirty) {
+        if (V.img[i].live && V.img[i].dirty &&
+            (writeback_z || !V.img[i].z || !vk_lazy_z())) {
             V.stat_wb_z += V.img[i].z && V.img[i].ndr;
             vk_copy_to_vram(&V.img[i]);
         }
@@ -1968,6 +1995,11 @@ static uint32_t vk_commit(void (*done)(void *, uint32_t), void *arg)
     qemu_cond_signal(&V.wake);
     qemu_mutex_unlock(&V.lock);
     return b->seq;
+}
+
+static uint32_t vk_commit(void (*done)(void *, uint32_t), void *arg)
+{
+    return vk_commit_ex(done, arg, false);
 }
 
 static uint32_t vk_submit_r200(void *opaque, void (*done)(void *, uint32_t), void *arg)
@@ -2033,7 +2065,7 @@ static bool vk_flush_r200(void *opaque)
 {
     VkBatch *newest;
 
-    vk_commit(NULL, NULL);
+    vk_commit_ex(NULL, NULL, true);
     newest = vk_newest_pending();
     if (!newest) {
         return false;
@@ -2049,7 +2081,7 @@ static bool vk_wait_busy_r200(void *opaque, uint32_t us)
 {
     VkBatch *newest;
 
-    vk_commit(NULL, NULL);
+    vk_commit_ex(NULL, NULL, true);
     newest = vk_newest_pending();
     if (!newest) {
         return false;
@@ -2077,6 +2109,15 @@ static bool vk_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi, bool writ
         return false;
     }
     hi = MIN(hi, V.vram_size);
+    if (vk_lazy_z()) {
+        for (int i = 0; i < VK_MAX_IMG; i++) {
+            VkImg *im = &V.img[i];
+            if (im->live && im->dirty && im->z &&
+                lo < vk_img_hi(im) && im->addr < hi) {
+                return true;
+            }
+        }
+    }
     for (uint64_t p = vk_pg(lo); p <= vk_pg(hi - 1) && p < V.npages; p++) {
         if (vk_page_pending_write(p)) {
             return true;
@@ -2795,6 +2836,15 @@ static VkFormat vk_rt_format(uint32_t view)
 
 static bool vk_range_pending(uint64_t lo, uint64_t hi)
 {
+    if (vk_lazy_z()) {
+        for (int i = 0; i < VK_MAX_IMG; i++) {
+            VkImg *im = &V.img[i];
+            if (im->live && im->dirty && im->z &&
+                lo < vk_img_hi(im) && im->addr < hi) {
+                return true;
+            }
+        }
+    }
     for (uint64_t p = vk_pg(lo); p <= vk_pg(hi - 1) && p < V.npages; p++) {
         if (vk_page_pending_write(p)) {
             return true;
