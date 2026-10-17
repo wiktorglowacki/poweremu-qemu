@@ -560,13 +560,21 @@ static void ftb_init(void)
     const char *e = getenv("PPC_FAST_TB");
 
     ftb_stats = getenv("PPC_TB_STATS") && getenv("PPC_TB_STATS")[0] == '1';
-    /* A kernel on the TSC means synchronised, invariant TSCs (x86 only). */
+    /*
+     * A kernel on the TSC means synchronised, invariant TSCs on x86; on
+     * arm64, cntvct_el0 is an architected fixed-frequency system counter
+     * (24 MHz on Apple Silicon), avoiding mach_absolute_time/clock_gettime.
+     */
     ftb_on = !(e && e[0] == '0') && !kvm_enabled() && !icount_enabled() &&
              replay_mode == REPLAY_MODE_NONE &&
+#if defined(__aarch64__)
+             true;
+#else
              g_file_get_contents("/sys/devices/system/clocksource/"
                                  "clocksource0/current_clocksource",
                                  &cs, NULL, NULL) &&
              g_str_has_prefix(cs, "tsc");
+#endif
 }
 
 static int64_t ftb_resync(uint64_t t1)
@@ -594,6 +602,16 @@ static int64_t ftb_resync(uint64_t t1)
         if (!ftb_cal_rt) {
             ftb_cal_tsc = tsc_rt;
             ftb_cal_rt = rt;
+#if defined(__aarch64__)
+            if (!ftb_window) {
+                uint64_t frq = 0;
+                asm volatile("mrs %0, cntfrq_el0" : "=r"(frq));
+                if (frq) {
+                    ftb_mult = ((__uint128_t)NANOSECONDS_PER_SECOND << 32) / frq;
+                    ftb_window = ((__uint128_t)FTB_WINDOW_NS << 32) / ftb_mult;
+                }
+            }
+#endif
         } else if (rt - ftb_cal_rt >= FTB_CALIB_NS) {
             ftb_mult = ((__uint128_t)(rt - ftb_cal_rt) << 32) /
                        (tsc_rt - ftb_cal_tsc);

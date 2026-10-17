@@ -326,9 +326,42 @@ void qemu_sem_wait(QemuSemaphore *sem)
 #ifdef __linux__
 #include "qemu/futex.h"
 #else
+#if defined(__APPLE__) && defined(__has_include)
+#if __has_include(<os/sync_wait_on_address.h>)
+#include <os/sync_wait_on_address.h>
+#define HAVE_MAC_ULOCK 1
+#endif
+#endif
+
+#ifdef HAVE_MAC_ULOCK
+static inline bool mac_ulock_on(void)
+{
+    static int on = -1;
+    if (unlikely(on < 0)) {
+        const char *e = getenv("QEMU_MAC_ULOCK");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+#endif
+
 static inline void qemu_futex_wake(QemuEvent *ev, int n)
 {
     assert(ev->initialized);
+#ifdef HAVE_MAC_ULOCK
+    if (mac_ulock_on()) {
+        if (__builtin_available(macOS 14.4, *)) {
+            if (n == 1) {
+                os_sync_wake_by_address_any(&ev->value, sizeof(ev->value),
+                                            OS_SYNC_WAKE_BY_ADDRESS_NONE);
+            } else {
+                os_sync_wake_by_address_all(&ev->value, sizeof(ev->value),
+                                            OS_SYNC_WAKE_BY_ADDRESS_NONE);
+            }
+            return;
+        }
+    }
+#endif
     pthread_mutex_lock(&ev->lock);
     if (n == 1) {
         pthread_cond_signal(&ev->cond);
@@ -341,6 +374,16 @@ static inline void qemu_futex_wake(QemuEvent *ev, int n)
 static inline void qemu_futex_wait(QemuEvent *ev, unsigned val)
 {
     assert(ev->initialized);
+#ifdef HAVE_MAC_ULOCK
+    if (mac_ulock_on()) {
+        if (__builtin_available(macOS 14.4, *)) {
+            os_sync_wait_on_address(&ev->value, (uint64_t)val,
+                                    sizeof(ev->value),
+                                    OS_SYNC_WAIT_ON_ADDRESS_NONE);
+            return;
+        }
+    }
+#endif
     pthread_mutex_lock(&ev->lock);
     if (ev->value == val) {
         pthread_cond_wait(&ev->cond, &ev->lock);
