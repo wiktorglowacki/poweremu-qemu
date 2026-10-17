@@ -497,23 +497,55 @@ bool r300_us_plain_copy(const R300State *st, unsigned *coord)
 {
     USNode nd[4];
 
-    if (us_nodes(st, nd) != 1 || nd[0].tex_count != 1 || nd[0].alu_count != 1) {
+    if (us_nodes(st, nd) != 1 || nd[0].tex_count != 1) {
         return false;
     }
     uint32_t ti = r300_reg(st, US_TEX_INST_0 + 4 * nd[0].tex_start);
     unsigned t = (ti >> 6) & 0x1F, i = nd[0].alu_start;
-    uint32_t ra = r300_reg(st, US_ALU_RGB_ADDR_0 + 4 * i);
-    uint32_t aa = r300_reg(st, US_ALU_ALPHA_ADDR_0 + 4 * i);
-    uint32_t ri = r300_reg(st, US_ALU_RGB_INST_0 + 4 * i);
-    uint32_t ai = r300_reg(st, US_ALU_ALPHA_INST_0 + 4 * i);
 
     *coord = ti & 0x1F;
-    /* clamp (bit 30) is harmless: texels of an 8-bit format are in [0, 1] */
-    return ((ti >> 15) & 7) == 1 && ((ti >> 11) & 0xF) == 0 &&
-           (ra & 0x3F) == t && (aa & 0x3F) == t &&
-           us_mad_is_src0(ri, 0, 21, 20) && us_mad_is_src0(ai, 9, 17, 16) &&
-           ((ra >> 26) & 7) == 7 && ((ra >> 29) & 3) == 0 &&
-           ((aa >> 24) & 1) && ((aa >> 25) & 3) == 0 && !((aa >> 27) & 1);
+    if (((ti >> 15) & 7) != 1 || ((ti >> 11) & 0xF) != 0) {
+        return false;
+    }
+    if (nd[0].alu_count == 1) {
+        uint32_t ra = r300_reg(st, US_ALU_RGB_ADDR_0 + 4 * i);
+        uint32_t aa = r300_reg(st, US_ALU_ALPHA_ADDR_0 + 4 * i);
+        uint32_t ri = r300_reg(st, US_ALU_RGB_INST_0 + 4 * i);
+        uint32_t ai = r300_reg(st, US_ALU_ALPHA_INST_0 + 4 * i);
+
+        /* clamp (bit 30) is harmless: texels of an 8-bit format are in [0, 1] */
+        return (ra & 0x3F) == t && (aa & 0x3F) == t &&
+               us_mad_is_src0(ri, 0, 21, 20) && us_mad_is_src0(ai, 9, 17, 16) &&
+               ((ra >> 26) & 7) == 7 && ((ra >> 29) & 3) == 0 &&
+               ((aa >> 24) & 1) && ((aa >> 25) & 3) == 0 && !((aa >> 27) & 1);
+    }
+    /*
+     * MorphOS ATIRadeon's 5-ALU composite shader (t == 2, const 3 == 1.0):
+     *   alu 0: t0 = 1 - t2;       alu 1: t2 = t2 * c3.a
+     *   alu 2: t2.rgb = t2; t2.a = 1 - t0.a
+     *   alu 3..4: oc0 = t2 * c3.a
+     */
+    if (nd[0].alu_count == 5 && t == 2 && i == 0 &&
+        r300_reg(st, 0x4C00 + 16 * 3 + 12) == 0x003effff &&
+        r300_reg(st, US_ALU_RGB_INST_0) == 0x00000a14 &&
+        r300_reg(st, US_ALU_ALPHA_INST_0) == 0x00024810 &&
+        r300_reg(st, US_ALU_RGB_INST_0 + 4) == 0x40050a80 &&
+        r300_reg(st, US_ALU_ALPHA_INST_0 + 4) == 0x40040509 &&
+        r300_reg(st, US_ALU_RGB_INST_0 + 8) == 0x40050200 &&
+        r300_reg(st, US_ALU_ALPHA_INST_0 + 8) == 0x40040889 &&
+        r300_reg(st, US_ALU_RGB_INST_0 + 12) == 0x40050a80 &&
+        r300_reg(st, US_ALU_ALPHA_INST_0 + 12) == 0x40040509 &&
+        r300_reg(st, US_ALU_RGB_INST_0 + 16) == 0x40050a80 &&
+        r300_reg(st, US_ALU_ALPHA_INST_0 + 16) == 0x40040509) {
+        for (unsigned k = 0; k < 5; k++) {
+            if (r300_reg(st, US_ALU_RGB_ADDR_0 + 4 * k) != 0x1c020801 ||
+                r300_reg(st, US_ALU_ALPHA_ADDR_0 + 4 * k) != 0x01020801) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
 }
 
 /* Render targets the active program writes (bit n: target n), and

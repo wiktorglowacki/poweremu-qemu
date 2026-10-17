@@ -4070,7 +4070,7 @@ static const uint8_t r3cc_perm[24][4] = {
 /* True if the copy was made here (the draw needs nothing else). */
 static bool r300_cpu_copy(PPCMacGPUState *s, const R300DrawPacket *pkt)
 {
-    static int on = -1;
+    static int on = -1, wpa = -1;
     const R300TexDesc *td = &pkt->tex[0];
     uint32_t w = pkt->copy_w, h = pkt->copy_h;
     uint64_t pitch = (uint64_t)pkt->rt_pitch * 4, tpitch = td->lvl_pitch[0];
@@ -4078,13 +4078,63 @@ static bool r300_cpu_copy(PPCMacGPUState *s, const R300DrawPacket *pkt)
     uint64_t src = (uint64_t)(pkt->copy_y + pkt->copy_ty) * tpitch +
                    (uint64_t)(pkt->copy_x + pkt->copy_tx) * 4;
     uint64_t dst_hi = dst + (h - 1) * pitch + w * 4;
+    bool blend = (pkt->uniforms.cblend & 1) != 0;
 
     if (on < 0) {
         const char *e = getenv("PPCGPU_CPU_COPY");
+        const char *we = getenv("PPCGPU_CPU_WPA");
         on = !(e && e[0] == '0');
+        wpa = !(we && we[0] == '0');
     }
-    if (!on || !w || !td->host_data || s->r3_zpass_active || dst_hi > s->vram_size ||
+    if (!w || s->r3_zpass_active || dst_hi > s->vram_size ||
         src + (h - 1) * tpitch + w * 4 > td->size_bytes) {
+        return false;
+    }
+    if (blend) {
+        /*
+         * MorphOS WritePixelArrayAlpha: small unscaled RGBA8 VRAM quad
+         * blended with SRC_ALPHA / ONE_MINUS_SRC_ALPHA.  Only run on the
+         * CPU when neither source nor destination is busy on the GPU, so
+         * batched UI compositing stays on the GPU.
+         */
+        uint64_t src_lo = td->gpu_addr + src;
+        uint64_t src_hi = src_lo + (h - 1) * tpitch + w * 4;
+        if (!wpa || td->host_data || w * h > 64 * 64 ||
+            r300_reg(s->r3, 0x44C0) != 0x0000a60c ||
+            (r300_reg(s->r3, 0x4540) & 0xF) != 0 ||
+            r300_reg(s->r3, 0x46A4) != 0x00001b00 ||
+            (r300_reg(s->r3, 0x4E38) & ~0x3FFEu) != 0x00d00000 ||
+            !s->r300_card_bytes || src_hi > s->vram_size ||
+            (src_lo < dst_hi && dst < src_hi) ||
+            (s->renderer && s->renderer->range_busy_r200 &&
+             (s->renderer->range_busy_r200(s->renderer_opaque, dst, dst_hi, true) ||
+              s->renderer->range_busy_r200(s->renderer_opaque, src_lo, src_hi, false)))) {
+            return false;
+        }
+        uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+        for (uint32_t y = 0; y < h; y++) {
+            uint8_t *o = vram + dst + y * pitch;
+            const uint8_t *t = vram + src_lo + y * tpitch;
+            for (uint32_t x = 0; x < w * 4; x += 4) {
+                uint32_t a = t[x], ia = 255 - a;
+                if (a == 255) {
+                    memcpy(o + x, t + x, 4);
+                } else if (a) {
+                    for (int c = 1; c < 4; c++) {
+                        uint32_t v = t[x + c] * a + o[x + c] * ia + 128;
+                        o[x + c] = (v + (v >> 8)) >> 8;
+                    }
+                }
+            }
+        }
+        memory_region_set_dirty(&s->vram, dst, dst_hi - dst);
+        r200_rate.draws++;
+        r200_perf.draws++;
+        r200_perf.drew = true;
+        return true;
+    }
+    if (!on || !td->host_data ||
+        ((td->filter0 >> 9) & 3) != 1 || ((td->filter0 >> 11) & 3) != 1) {
         return false;
     }
     uint32_t key[5] = { r300_reg(s->r3, 0x44C0), r300_reg(s->r3, 0x4540) & 0xF,

@@ -1618,9 +1618,12 @@ static bool gpu_vs_build(const R300State *st, Fetch *f, const R300PVSProgram *pr
 static bool copy_state(const R300State *st, unsigned *coord)
 {
     uint32_t cb = r300_reg(st, RB3D_CBLEND);
+    uint32_t ab = r300_reg(st, RB3D_ABLEND);
+    bool no_blend = !(cb & 1) && !((cb >> 3) & 7);
+    bool alpha_over = cb == 0x27260007 && ab == 0x27210000;
 
     return r300_reg(st, TX_ENABLE) == 1 && !(r300_reg(st, ZB_CNTL) & 7) &&
-           !(cb & 1) && !((cb >> 3) & 7) &&
+           (no_blend || alpha_over) &&
            !(r300_reg(st, FG_ALPHA_FUNC) & (1u << 11)) &&
            !(r300_reg(st, FG_FOG_BLEND) & 1) && !(r300_reg(st, RB3D_ROPCNTL) & 4) &&
            (r300_reg(st, RB3D_COLOR_CHANNEL_MASK) & 0xF) == 0xF &&
@@ -1631,8 +1634,8 @@ static bool copy_state(const R300State *st, unsigned *coord)
 
 /*
  * Two triangles covering a pixel-aligned rectangle exactly (they share a
- * diagonal), w = 1, point-sampled 32-bit texels, and texture coordinates
- * that put every pixel centre on a texel centre at a fixed offset.
+ * diagonal), w = 1, 32-bit texels, and texture coordinates that put every
+ * pixel centre on a texel centre at a fixed offset.
  */
 static void copy_detect(const R300FSDesc *desc, const Route *route,
                         unsigned coord, R300DrawPacket *pkt)
@@ -1642,14 +1645,16 @@ static void copy_detect(const R300FSDesc *desc, const Route *route,
     int k = coord < R300_US_NUM_TEMPS ? desc->route[coord] : -1;
     float lo[2] = { INFINITY, INFINITY }, hi[2] = { -INFINITY, -INFINITY };
     float xy[6][2], off[2] = { 0, 0 };
+    bool nearest = ((td->filter0 >> 9) & 3) == 1 && ((td->filter0 >> 11) & 3) == 1;
+    /* MorphOS ATIRadeon sets s1/t1 to (w - 1/256)/w with linear filtering on 1:1 blits. */
+    float tol = nearest ? 1e-3f : 8e-3f;
 
     if (k < 0 || !route->vary[k].is_tex || !v || pkt->vs_glsl ||
         pkt->num_verts != 6 || pkt->num_line_verts || pkt->prim_class ||
         (pkt->cull & (R300_CULL_FRONT | R300_CULL_BACK)) ||
         pkt->num_cb != 1 || pkt->aa_samples > 1 || pkt->rt_tiling || pkt->rt_bpp != 4 ||
         !td->bound || td->kind != R300_TEXK_RGBA8 || td->levels != 1 ||
-        td->dim != R300_TEXDIM_2D || td->tiling || ((td->filter0 >> 9) & 3) != 1 ||
-        ((td->filter0 >> 11) & 3) != 1) {
+        td->dim != R300_TEXDIM_2D || td->tiling) {
         return;
     }
     for (int i = 0; i < 6; i++) {
@@ -1663,7 +1668,7 @@ static void copy_detect(const R300FSDesc *desc, const Route *route,
         for (int c = 0; c < 2; c++) {
             float d = uv[c] - xy[i][c];
             if (fabsf(xy[i][c] - rintf(xy[i][c])) > 1e-3f ||
-                fabsf(d - rintf(d)) > 1e-3f || (i && rintf(d) != off[c])) {
+                fabsf(d - rintf(d)) > tol || (i && rintf(d) != off[c])) {
                 return;
             }
             off[c] = rintf(d);
