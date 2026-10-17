@@ -432,6 +432,8 @@ static struct {
     bool running;               /* the thread has taken (or is taking) a run */
     bool steal;                 /* RPTR polls catch an idle ring up */
     uint32_t steal_max;         /* ... when at most this many dwords wait */
+    bool wptr_sync;             /* small kicks after an RPTR poll run inline */
+    bool polled;                /* the guest polled RPTR since the last kick */
     unsigned epoch;             /* bumped whenever the ring changes hands */
     bool aborted;               /* the replay was taken over mid-segment */
     uint32_t seg_rptr;          /* where the segment being replayed began */
@@ -10926,6 +10928,40 @@ static void ppc_mac_gpu_cp_kick(PPCMacGPUState *s, uint32_t wptr)
     }
     if (cp.started) {
         qatomic_inc(&cp.kicks);
+        /*
+         * When the guest polled RPTR after the previous submit (WritePixel
+         * and small 2D ops submit 16-32 dwords and immediately poll RPTR),
+         * carry a small ring update out right here on the vCPU instead of
+         * waking ppc-gpu-cp (a futex syscall that cost ~10% of the vCPU's
+         * time to wake a thread that then found the ring empty).  Unlike
+         * skipping the wake and leaving the dwords for a later RPTR poll,
+         * running them now never strands an unpolled submit in the ring.
+         * PPCGPU_CP_WPTR_SYNC=0: always wake the thread.
+         */
+        if (cp.wptr_sync && qatomic_read(&cp.polled) &&
+            !qatomic_read(&cp.running)) {
+            uint32_t rptr = qatomic_read(&s->regs.cp_rb_rptr);
+            uint32_t pending = (wptr - rptr) &
+                               ((2u << (s->regs.cp_rb_cntl & 0x3f)) - 1);
+
+            qatomic_set(&cp.polled, false);
+            if (pending && pending <= cp.steal_max) {
+                bool locked = bql_locked();
+
+                if (!locked) {
+                    bql_lock();
+                }
+                ppc_mac_gpu_cp_sync(s, R200_CP_RB_WPTR);
+                cps.kick_ns = 0;
+                if (!locked) {
+                    bql_unlock();
+                }
+                if (qatomic_read(&s->regs.cp_rb_wptr) ==
+                    qatomic_read(&s->regs.cp_rb_rptr)) {
+                    return;
+                }
+            }
+        }
         qemu_event_set(&cp.kick);
     } else {
         ppc_mac_gpu_cp_run(s);
@@ -11024,6 +11060,7 @@ static uint64_t ppc_mac_gpu_cp_rptr_read(void *opaque, hwaddr addr,
     uint32_t rptr = qatomic_read(&s->regs.cp_rb_rptr);
 
     cps_count(cps.rd, R200_CP_RB_RPTR);
+    qatomic_set(&cp.polled, true);
     uint32_t pending = (qatomic_read(&s->regs.cp_rb_wptr) - rptr) &
                        ((2u << (s->regs.cp_rb_cntl & 0x3f)) - 1);
 
@@ -11080,6 +11117,8 @@ static void ppc_mac_gpu_cp_start(PPCMacGPUState *s)
     cp.steal = !(e && e[0] == '0');
     e = getenv("PPCGPU_CP_STEAL_MAX");
     cp.steal_max = e ? strtoul(e, NULL, 0) : 64;
+    e = getenv("PPCGPU_CP_WPTR_SYNC");
+    cp.wptr_sync = cp.steal && !(e && e[0] == '0');
     qemu_event_init(&cp.kick, false);
     cp.started = true;
     qemu_thread_create(&cp.thread, "ppc-gpu-cp", ppc_mac_gpu_cp_thread, s,
