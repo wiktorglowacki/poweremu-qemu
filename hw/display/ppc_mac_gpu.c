@@ -434,6 +434,7 @@ static struct {
     uint32_t steal_max;         /* ... when at most this many dwords wait */
     bool wptr_sync;             /* small kicks after an RPTR poll run inline */
     bool polled;                /* the guest polled RPTR since the last kick */
+    bool synced_wptr;           /* the last kick was carried out by WPTR */
     unsigned epoch;             /* bumped whenever the ring changes hands */
     bool aborted;               /* the replay was taken over mid-segment */
     uint32_t seg_rptr;          /* where the segment being replayed began */
@@ -10958,10 +10959,12 @@ static void ppc_mac_gpu_cp_kick(PPCMacGPUState *s, uint32_t wptr)
                 }
                 if (qatomic_read(&s->regs.cp_rb_wptr) ==
                     qatomic_read(&s->regs.cp_rb_rptr)) {
+                    qatomic_set(&cp.synced_wptr, true);
                     return;
                 }
             }
         }
+        qatomic_set(&cp.synced_wptr, false);
         qemu_event_set(&cp.kick);
     } else {
         ppc_mac_gpu_cp_run(s);
@@ -11060,18 +11063,20 @@ static uint64_t ppc_mac_gpu_cp_rptr_read(void *opaque, hwaddr addr,
     uint32_t rptr = qatomic_read(&s->regs.cp_rb_rptr);
 
     cps_count(cps.rd, R200_CP_RB_RPTR);
-    qatomic_set(&cp.polled, true);
     uint32_t pending = (qatomic_read(&s->regs.cp_rb_wptr) - rptr) &
                        ((2u << (s->regs.cp_rb_cntl & 0x3f)) - 1);
 
-    if (cp.steal && pending && pending <= cp.steal_max &&
-        !qatomic_read(&cp.running)) {
+    if (!pending && qatomic_read(&cp.synced_wptr)) {
+        qatomic_set(&cp.polled, true);
+    } else if (cp.steal && pending && pending <= cp.steal_max &&
+               !qatomic_read(&cp.running)) {
         bool locked = bql_locked();
 
         if (!locked) {
             bql_lock();
         }
         ppc_mac_gpu_cp_sync(s, R200_CP_RB_RPTR);
+        qatomic_set(&cp.polled, true);
         cps.kick_ns = 0;
         if (!locked) {
             bql_unlock();
@@ -12793,8 +12798,25 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         ppc_mac_gpu_update_irq(s);
         break;
     case R200_GEN_INT_STATUS:
-        /* Writing 1 to a bit acknowledges/clears it */
+        /*
+         * Bit 26 (SW_INT_FIRE) is a trigger that raises bit 25 (SW_INT)
+         * in GEN_INT_STATUS (re-3.20/report-radeon.md: MorphOS fences
+         * write 0x04000000 via PACKET0 or MMIO, and the interrupt server
+         * checks bit 25); all other 1-bits acknowledge/clear.
+         * PPCGPU_SW_INT=0 keeps the plain write-1-to-clear.
+         */
         tl_log("int_ack 0x%x status 0x%x", (unsigned)val, s->regs.gen_int_status);
+        {
+            static int sw_int_on = -1;
+            if (unlikely(sw_int_on < 0)) {
+                const char *e = getenv("PPCGPU_SW_INT");
+                sw_int_on = !(e && e[0] == '0');
+            }
+            if (sw_int_on && (val & (1u << 26))) {
+                s->regs.gen_int_status |= 1u << 25;
+                val &= ~(1u << 26);
+            }
+        }
         s->regs.gen_int_status &= ~val;
         ppc_mac_gpu_update_irq(s);
         break;
