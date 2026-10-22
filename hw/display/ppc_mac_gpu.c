@@ -339,6 +339,26 @@ static bool ppc_gpu_env_diag(void)
     return cached;
 }
 
+static bool vp_trace_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("POWEREMU_VP_TRACE") != NULL;
+    }
+    return on;
+}
+
+static bool noflush_int_cntl(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = ppc_gpu_env_on("PPCGPU_NOFLUSH_INT_CNTL");
+    }
+    return on;
+}
+
 /*
  * Running totals for PowerEmu's performance overlay (the "perf" property):
  * a frame is a flip or a write into the scanout that follows 3D drawing;
@@ -1023,7 +1043,10 @@ static void pe_window_saw_blit(uint32_t surface, uint32_t pitch,
                                uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                                uint32_t scr_w, uint32_t scr_h)
 {
-    const char *on = getenv("PPCGPU_WINDOWS");
+    static const char *on;
+    if (!on) {
+        on = getenv("PPCGPU_WINDOWS") ?: "";
+    }
     if (!w || !h) {
         return;
     }
@@ -8059,7 +8082,7 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
     if (vertex_program) {
         static uint32_t last_cntl[2];
         uint32_t c1 = R3D(0x22D0), c2 = R3D(0x22D4);
-        if ((c1 != last_cntl[0] || c2 != last_cntl[1]) && getenv("POWEREMU_VP_TRACE")) {
+        if ((c1 != last_cntl[0] || c2 != last_cntl[1]) && vp_trace_on()) {
             uint32_t first = c1 & 0x3FF, last = (c1 >> 20) & 0x3FF;
             last_cntl[0] = c1; last_cntl[1] = c2;
             fprintf(stderr, "ppc-mac-gpu vp inputs: fmt0=0x%08x fmt1=0x%08x arrays=%u "
@@ -8532,7 +8555,7 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
                 st.out_tex[t][3] = 1.0f;
             }
             ppc_mac_gpu_vp_run(&st, vp_prog, vp_count);
-            if (getenv("POWEREMU_VP_TRACE")) {
+            if (vp_trace_on()) {
                 static int shown; static uint32_t shown_for;
                 if (vp_count != shown_for) { shown_for = vp_count; shown = 0; }
                 if (shown++ < 3) {
@@ -11826,7 +11849,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         /* fence poll: answered without flushing later work */
     } else if (!async_status && addr != R200_CP_CSQ_CNTL && addr != R200_CP_CSQ_STAT &&
         addr != R200_CRTC_VLINE_CRNT_VLINE && addr != R200_GEN_INT_STATUS &&
-        (addr != R200_GEN_INT_CNTL || !ppc_gpu_env_on("PPCGPU_NOFLUSH_INT_CNTL"))) {
+        (addr != R200_GEN_INT_CNTL || !noflush_int_cntl())) {
         r200_flush_at(s, R200_WHY_REG(addr));
     }
     if (unlikely(gpu_debug_enabled())) {
@@ -12770,7 +12793,7 @@ static void ppc_mac_gpu_tcl_port_write(PPCMacGPUState *s, hwaddr addr,
         s->regs.tcl_scalar_stride = (val >> 16) & 0xff;
         break;
     case 0x220C:    /* SE_TCL_SCALAR_DATA_REG */
-        if (getenv("POWEREMU_VP_TRACE")) {
+        if (vp_trace_on()) {
             static uint8_t seen_scalar[0x200];
             uint32_t sa = s->regs.tcl_scalar_addr & 0x1ff;
             if (!seen_scalar[sa]) {
