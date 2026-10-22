@@ -1595,9 +1595,25 @@ char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
         "%s"
         "    float ow = gl_FragCoord.z;\n"
         "#ifndef R300_FS_Z\n"
+        "%s"
         "    R300FOut c = r300_shade(%s, ow);\n"
+        "%s"
         "    if (u.zpass_count != 0u) atomicAdd(zpass, 1u);\n",
-        nt, R300_BIND_FB0 + nt, nt, fbin.buf, fbarg.buf + 2);
+        nt, R300_BIND_FB0 + nt, nt, fbin.buf,
+        flags & R300_GLSL_HW_Z ?
+        "    float slope = max(abs(dFdx(gl_FragCoord.z)), abs(dFdy(gl_FragCoord.z)));\n" : "",
+        fbarg.buf + 2,
+        flags & R300_GLSL_HW_Z ?
+        "    {\n"
+        "        bool front = gl_FrontFacing;\n"
+        "        float fz = (u.depth_src != 0u && R300_WRITES_W) ? ow : gl_FragCoord.z;\n"
+        "        if (front ? (u.poly_en & 1u) != 0u : (u.poly_en & 2u) != 0u)\n"
+        "            fz += front ? u.poly_offset.x * slope + u.poly_offset.y\n"
+        "                        : u.poly_offset.z * slope + u.poly_offset.w;\n"
+        "        fz = clamp(fz, 0.0, 1.0);\n"
+        "        gl_FragDepth = (u.zinfo.w & 8u) != 0u ?\n"
+        "                       roundEven(fz * 16777215.0) * (1.0 / 16777216.0) : fz;\n"
+        "    }\n" : "");
     for (unsigned k = 0; k < nt; k++) {
         r300_sb_printf(&sb, "    o_c%u = R300_CB%u_OUT(c.c%u);\n", k, k, k);
     }

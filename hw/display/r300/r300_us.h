@@ -81,6 +81,8 @@ typedef struct R300FSUniforms {
 
 #define R300_ZFMT_ENDIAN_MASK   3u            /* ZB_DEPTHPITCH.DEPTHENDIAN */
 #define R300_ZFMT_Z16           (1u << 2)     /* 16-bit Z, no stencil */
+#define R300_ZFMT_F32           (1u << 3)     /* R300_GLSL_HW_Z: a float attachment that
+                                                 holds Z24 / 2^24 (exact both ways) */
 
 /* What the translator needs besides the US registers themselves. */
 typedef struct R300FSDesc {
@@ -129,6 +131,9 @@ enum {
 #define R300_GLSL_TEXT_BY_ID    (1u << 2)   /* r300_us_glsl_cached() hits return
                                                "" and the renderer fetches the
                                                text with r300_us_glsl_by_id() */
+#define R300_GLSL_HW_Z          (1u << 3)   /* R300_FS also writes the depth
+                                               R300_FS_Z would test, for a depth/
+                                               stencil attachment */
 
 /*
  * Build the GLSL source for the current US program.  It compiles as three
