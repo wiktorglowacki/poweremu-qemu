@@ -32,13 +32,26 @@ static void set_can_do_io(DisasContextBase *db, bool val)
                     offsetof(ArchCPU, env));
 }
 
+/* QEMU_IO_START_EXIT=1: also ends the TB without icount (old behaviour) */
+static bool io_start_exit_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("QEMU_IO_START_EXIT");
+        on = e && e[0] == '1';
+    }
+    return on;
+}
+
 bool translator_io_start(DisasContextBase *db)
 {
     /*
-     * Ensure that this instruction will be the last in the TB.
+     * With icount, ensure that this instruction will be the last in the TB.
      * The target may override this to something more forceful.
      */
-    if (db->is_jmp == DISAS_NEXT) {
+    if (db->is_jmp == DISAS_NEXT &&
+        ((tb_cflags(db->tb) & CF_USE_ICOUNT) || io_start_exit_on())) {
         db->is_jmp = DISAS_TOO_MANY;
     }
     return true;
