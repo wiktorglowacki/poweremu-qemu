@@ -380,9 +380,11 @@ void ppc_mmu_slot_sync(CPUPPCState *env)
         }
     }
     if (i == PPC_MMU_SLOTS && ppc_mmu_slots_mode() >= 2 &&
-        ppc_mmu_slot_partial(env)) {
+        ppc_mmu_slot_partial(env) && env->mmu_slot_partial_n++ < 32) {
+        env->tlb_need_flush |= TLB_NEED_SR_SWITCH;
         return;                         /* mid-switch: keep the current set */
     }
+    env->mmu_slot_partial_n = 0;
     if (i == PPC_MMU_SLOTS) {
         i = victim;
         memcpy(env->mmu_slot_sr[i], env->sr, sizeof(env->mmu_slot_sr[i]));

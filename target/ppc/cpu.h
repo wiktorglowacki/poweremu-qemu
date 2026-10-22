@@ -1309,6 +1309,7 @@ struct CPUArchState {
     uint64_t mmu_slot_used[PPC_MMU_SLOTS];
     uint64_t mmu_slot_clock;
     int mmu_slot; /* the current set's slot */
+    int mmu_slot_partial_n;
 #endif
 
     /* Other registers */
