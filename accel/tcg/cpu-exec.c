@@ -819,7 +819,10 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
      */
     qatomic_set_mb(&cpu->neg.icount_decr.u16.high, 0);
 
-    if (unlikely(qatomic_read(&cpu->interrupt_request))) {
+    if (unlikely(qatomic_read(&cpu->interrupt_request) == CPU_INTERRUPT_EXITTB)) {
+        qatomic_and(&cpu->interrupt_request, ~CPU_INTERRUPT_EXITTB);
+        *last_tb = NULL;
+    } else if (unlikely(qatomic_read(&cpu->interrupt_request))) {
         int interrupt_request;
         bql_lock();
         interrupt_request = cpu->interrupt_request;
