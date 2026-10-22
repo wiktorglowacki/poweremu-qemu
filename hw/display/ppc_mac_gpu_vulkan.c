@@ -276,6 +276,9 @@ static struct {
     VkBuffer comp_buf, par_buf;
     VkDeviceMemory comp_mem, par_mem;
     void *comp_map, *par_map;
+    VkBuffer comp_old_buf;
+    VkDeviceMemory comp_old_mem;
+    void *comp_old_map;
     size_t comp_size;
     VkDescriptorSetLayout comp_dsl;
     VkPipelineLayout comp_pl;
@@ -3544,6 +3547,12 @@ static void vk_compose_drop_set(void)
 
 static void vk_scanout_free(void *opaque, void *ptr)
 {
+    if (ptr && ptr == V.comp_old_map) {
+        vkDestroyBuffer(V.dev, V.comp_old_buf, NULL);
+        vkFreeMemory(V.dev, V.comp_old_mem, NULL);
+        V.comp_old_map = NULL;
+        return;
+    }
     if (!ptr || ptr != V.comp_map) {
         return;
     }
@@ -3567,7 +3576,14 @@ static void *vk_scanout_alloc(void *opaque, size_t size)
         return NULL;
     }
     if (V.comp_map) {
-        vk_scanout_free(opaque, V.comp_map);
+        if (V.comp_fence) {
+            vkWaitForFences(V.dev, 1, &V.comp_fence, VK_TRUE, UINT64_MAX);
+        }
+        vk_scanout_free(opaque, V.comp_old_map);
+        V.comp_old_buf = V.comp_buf;
+        V.comp_old_mem = V.comp_mem;
+        V.comp_old_map = V.comp_map;
+        V.comp_map = NULL;
     }
     /* Host-cached: the CPU copies rows into it and GL uploads from it. */
     if (!vk_buffer(size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
