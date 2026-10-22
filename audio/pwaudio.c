@@ -100,6 +100,7 @@ playback_on_process(void *data)
     buf = b->buffer;
     p = buf->datas[0].data;
     if (p == NULL) {
+        pw_stream_queue_buffer(v->stream, b);
         return;
     }
     /* calculate the total no of bytes to read data from buffer */
