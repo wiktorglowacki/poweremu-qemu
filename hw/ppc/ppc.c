@@ -505,13 +505,8 @@ static uint64_t ns_to_tb(uint32_t freq, int64_t clock)
      * rounds down, so the result is at most one tick below the exact
      * value and never ahead of what the division would give.
      */
-    static uint32_t cached_freq;
-    static uint64_t mult;
+    uint64_t mult = ((__uint128_t)freq * 9903520314283042199ULL) >> 29;
 
-    if (unlikely(freq != cached_freq)) {
-        cached_freq = freq;
-        mult = (uint64_t)(((__uint128_t)freq << 64) / NANOSECONDS_PER_SECOND);
-    }
     return (uint64_t)(((__uint128_t)(uint64_t)clock * mult) >> 64);
 }
 
