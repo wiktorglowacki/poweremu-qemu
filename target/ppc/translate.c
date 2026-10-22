@@ -4424,6 +4424,8 @@ static void gen_mtmsr(DisasContext *ctx)
         tcg_gen_brcondi_tl(TCG_COND_NE, diff, 0, slow);
 
         tcg_gen_mov_tl(cpu_msr, t0);
+        tcg_gen_andi_tl(diff, t0, 1ULL << MSR_EE);
+        tcg_gen_brcondi_tl(TCG_COND_EQ, diff, 0, done);
         tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);
         pend = tcg_temp_new_i32();
         tcg_gen_ld_i32(pend, tcg_env, offsetof(CPUPPCState, pending_interrupts));
