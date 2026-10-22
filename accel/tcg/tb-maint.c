@@ -197,16 +197,16 @@ struct PageDesc {
      * bits are only cleared once the page has no TB left, so a stale bit
      * costs a walk, never a missed invalidation.
      */
-    uint32_t code_bitmap;
+    uint64_t code_bitmap;
 };
 
-#define CODE_GRANULE_BITS (TARGET_PAGE_BITS - 5)
+#define CODE_GRANULE_BITS (TARGET_PAGE_BITS - 6)
 
 /* The granule bits covering byte offsets [start, last] of a page. */
-static uint32_t code_bitmap_mask(tb_page_addr_t start, tb_page_addr_t last)
+static uint64_t code_bitmap_mask(tb_page_addr_t start, tb_page_addr_t last)
 {
     unsigned lo = start >> CODE_GRANULE_BITS, hi = last >> CODE_GRANULE_BITS;
-    return (uint32_t)(((uint64_t)2 << hi) - ((uint64_t)1 << lo));
+    return ((uint64_t)2 << hi) - ((uint64_t)1 << lo);
 }
 
 void page_table_config_init(void)
