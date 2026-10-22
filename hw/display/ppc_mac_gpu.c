@@ -3979,7 +3979,7 @@ static void r300_aa_resolve(PPCMacGPUState *s, const R300DrawPacket *pkt)
     int iy1 = MIN((int)floorf(y1 + 0.5f), (int)MIN(pkt->scissor[3], pkt->rt_height));
     uint32_t w = ix1 > ix0 ? ix1 - ix0 : 0, h = iy1 > iy0 ? iy1 - iy0 : 0;
 
-    if (!w || !h || !dpitch || (uint32_t)ix1 * 4 > dpitch) {
+    if (!w || !h || !dpitch || (uint32_t)ix1 * pkt->rt_bpp > dpitch) {
         return;
     }
     if (!r300_to_vram(s, &dst, (uint64_t)dpitch * iy1)) {
@@ -4013,9 +4013,9 @@ static void r300_aa_resolve(PPCMacGPUState *s, const R300DrawPacket *pkt)
     }
     if (!avg) {
         for (int y = iy0; y < iy1; y++) {
-            memmove(vram + dst + (uint64_t)y * dpitch + ix0 * 4,
-                    vram + pkt->rt_gpu_addr + (uint64_t)y * srow + ix0 * 4,
-                    (size_t)w * 4);
+            memmove(vram + dst + (uint64_t)y * dpitch + ix0 * pkt->rt_bpp,
+                    vram + pkt->rt_gpu_addr + (uint64_t)y * srow + ix0 * pkt->rt_bpp,
+                    (size_t)w * pkt->rt_bpp);
         }
     } else {
         static float degamma[256];
