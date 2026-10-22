@@ -302,8 +302,8 @@ static struct {
     VkFence comp_fence;
     bool comp_failed, comp_logged;
     /* tiled render targets: a staging buffer and a tile/untile compute pass */
-    VkBuffer tile_buf;
-    VkDeviceMemory tile_mem;
+    VkBuffer tile_buf, zs_buf;
+    VkDeviceMemory tile_mem, zs_mem;
     VkDeviceSize tile_size;
     VkDescriptorSetLayout tile_dsl;
     VkPipelineLayout tile_pl;
@@ -1554,14 +1554,19 @@ static bool vk_tile_staging(VkDeviceSize need)
         vkDestroyDescriptorPool(V.dev, V.tile_pool, NULL);
         vkDestroyBuffer(V.dev, V.tile_buf, NULL);
         vkFreeMemory(V.dev, V.tile_mem, NULL);
+        vkDestroyBuffer(V.dev, V.zs_buf, NULL);
+        vkFreeMemory(V.dev, V.zs_mem, NULL);
         V.tile_pool = VK_NULL_HANDLE;
         V.tile_set = VK_NULL_HANDLE;
         V.tile_buf = VK_NULL_HANDLE;
     }
     VkDeviceSize size = MAX(need, (VkDeviceSize)16 << 20);
-    if (!vk_buffer(size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                   VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
-                   &V.tile_buf, &V.tile_mem, NULL)) {
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (!vk_buffer(size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
+                   &V.tile_buf, &V.tile_mem, NULL) ||
+        !vk_buffer(size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
+                   &V.zs_buf, &V.zs_mem, NULL)) {
         V.tile_buf = VK_NULL_HANDLE;
         V.tile_failed = true;
         return false;
@@ -1589,7 +1594,7 @@ static bool vk_tile_staging(VkDeviceSize need)
         return false;
     }
     VkDescriptorBufferInfo bi[2] = {
-        { V.vram_buf, 0, VK_WHOLE_SIZE },
+        { V.zs_buf, 0, VK_WHOLE_SIZE },
         { V.tile_buf, 0, VK_WHOLE_SIZE },
     };
     VkWriteDescriptorSet w[2];
@@ -1605,6 +1610,21 @@ static bool vk_tile_staging(VkDeviceSize need)
     }
     vkUpdateDescriptorSets(V.dev, 2, w, 0, NULL);
     return true;
+}
+
+static uint64_t vk_zs_copy(VkCommandBuffer cb, const VkImg *im, uint32_t y, uint32_t h,
+                           uint32_t band, bool to_vram)
+{
+    uint64_t lo = im->addr + (uint64_t)(y / band) * band * im->pitch;
+    uint64_t hi = MIN(im->addr + (uint64_t)ROUND_UP(y + h, band) * im->pitch, V.vram_size);
+    VkBufferCopy c = { to_vram ? 0 : lo, to_vram ? lo : 0, hi - lo };
+
+    if (hi > lo) {
+        vkCmdCopyBuffer(cb, to_vram ? V.zs_buf : V.vram_buf,
+                        to_vram ? V.vram_buf : V.zs_buf, 1, &c);
+        vk_full_barrier(cb);
+    }
+    return lo;
 }
 
 /*
@@ -1665,7 +1685,8 @@ static bool vk_tile_copy(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0
     uint32_t w = x1 - x0;
     uint32_t w_pad = ROUND_UP(x1, align) - x0;
     uint32_t rows_max = MAX((uint32_t)(((VkDeviceSize)16 << 20) / ((VkDeviceSize)w_pad * im->bpp)), 1u);
-    if (!vk_tile_staging((VkDeviceSize)w_pad * im->bpp * MIN(y1 - y0, rows_max))) {
+    if (!vk_tile_staging(MAX((VkDeviceSize)w_pad * im->bpp * MIN(y1 - y0, rows_max),
+                             (VkDeviceSize)(MIN(y1 - y0, rows_max) + 32) * im->pitch))) {
         return false;
     }
     if (!V.tile_logged) {
@@ -1682,7 +1703,8 @@ static bool vk_tile_copy(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0
             .imageOffset = { (int32_t)x0, (int32_t)y, 0 },
             .imageExtent = { w, h, 1 },
         };
-        uint32_t pc[9] = { im->addr, im->pitch, x0, y, w_pad, h, im->bpp, im->tiling,
+        uint64_t lo = vk_zs_copy(cb, im, y, h, 32, false);
+        uint32_t pc[9] = { im->addr - lo, im->pitch, x0, y, w_pad, h, im->bpp, im->tiling,
                            to_vram ? 0 : 1 };
         uint32_t words = w_pad * im->bpp / 4 * h;
         if (to_vram) {
@@ -1695,7 +1717,9 @@ static bool vk_tile_copy(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0
         vkCmdPushConstants(cb, V.tile_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
         vkCmdDispatch(cb, DIV_ROUND_UP(words, 64), 1, 1);
         vk_full_barrier(cb);
-        if (!to_vram) {
+        if (to_vram) {
+            vk_zs_copy(cb, im, y, h, 32, true);
+        } else {
             vkCmdCopyBufferToImage(cb, V.tile_buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
             vk_full_barrier(cb);
         }
@@ -1716,12 +1740,16 @@ static void vk_zconv(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0,
     uint32_t rows_max = MAX((16u << 20) / (wp * 5), 1u);
     uint32_t mode = (im->tiling & 12) | (im->fmt == VK_FORMAT_D32_SFLOAT_S8_UINT ? 16 : 0) |
                     (vk_tiled_rt_enabled() && vk_tile_fits(im) ? im->tiling & 3 : 0);
-    if (!vk_tile_init() || !vk_tile_staging((VkDeviceSize)wp * 5 * MIN(y1 - y0, rows_max))) {
+    uint32_t band = mode & 3 ? 32 : 1;
+    if (!vk_tile_init() ||
+        !vk_tile_staging(MAX((VkDeviceSize)wp * 5 * MIN(y1 - y0, rows_max),
+                             (VkDeviceSize)(MIN(y1 - y0, rows_max) + band) * im->pitch))) {
         vk_warn(1u << 11, "no depth buffer conversion pass: depth lost");
         return;
     }
     for (uint32_t y = y0; y < y1; y += rows_max) {
         uint32_t h = MIN(y1 - y, rows_max);
+        uint64_t lo = vk_zs_copy(cb, im, y, h, band, false);
         VkBufferImageCopy r[2] = {
             { 0, wp, 0, { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
               { (int32_t)x0, (int32_t)y, 0 }, { w, h, 1 } },
@@ -1729,7 +1757,7 @@ static void vk_zconv(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0,
               { (int32_t)x0, (int32_t)y, 0 }, { w, h, 1 } },
         };
         uint32_t nr = im->bpp == 4 ? 2 : 1;
-        uint32_t pc[9] = { im->addr, im->pitch, x0, y, w, h, im->bpp, mode, to_vram ? 0 : 1 };
+        uint32_t pc[9] = { im->addr - lo, im->pitch, x0, y, w, h, im->bpp, mode, to_vram ? 0 : 1 };
         if (to_vram) {
             vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, V.tile_buf, nr, r);
             vk_full_barrier(cb);
@@ -1740,7 +1768,9 @@ static void vk_zconv(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0,
         vkCmdPushConstants(cb, V.tile_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
         vkCmdDispatch(cb, DIV_ROUND_UP(wp / 4 * h, 64), 1, 1);
         vk_full_barrier(cb);
-        if (!to_vram) {
+        if (to_vram) {
+            vk_zs_copy(cb, im, y, h, band, true);
+        } else {
             vkCmdCopyBufferToImage(cb, V.tile_buf, im->img, VK_IMAGE_LAYOUT_GENERAL, nr, r);
             vk_full_barrier(cb);
         }
