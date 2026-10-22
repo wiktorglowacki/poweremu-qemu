@@ -723,7 +723,7 @@ static inline void cpu_ppc_store_tb(ppc_tb_t *tb_env, uint64_t vmclk,
 void cpu_ppc_store_tbl (CPUPPCState *env, uint32_t value)
 {
     ppc_tb_t *tb_env = env->tb_env;
-    int64_t clock = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t clock = tb_read_clock(0);
     uint64_t tb;
 
     tb = cpu_ppc_get_tb(tb_env, clock, tb_env->tb_offset);
@@ -734,7 +734,7 @@ void cpu_ppc_store_tbl (CPUPPCState *env, uint32_t value)
 static inline void _cpu_ppc_store_tbu(CPUPPCState *env, uint32_t value)
 {
     ppc_tb_t *tb_env = env->tb_env;
-    int64_t clock = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t clock = tb_read_clock(1);
     uint64_t tb;
 
     tb = cpu_ppc_get_tb(tb_env, clock, tb_env->tb_offset);
@@ -1083,7 +1083,7 @@ void cpu_ppc_store_decr(CPUPPCState *env, target_ulong value)
         nr_bits = pcc->lrg_decr_bits;
     }
 
-    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    now = tb_read_clock(2);
     decr = _cpu_ppc_load_decr(env, now);
     _cpu_ppc_store_decr(cpu, now, decr, value, nr_bits);
 }
