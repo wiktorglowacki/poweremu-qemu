@@ -84,6 +84,8 @@ static TCGv_i32 cpu_access_type;
 
 /* PPC_SYNC_EXIT=1: sync always ends the TB in supervisor mode (old behaviour) */
 static bool ppc_sync_exit;
+/* PPC_MTMSR_EE=0: mtmsr always ends the TB (old behaviour) */
+static bool ppc_mtmsr_ee;
 
 void ppc_translate_init(void)
 {
@@ -103,6 +105,10 @@ void ppc_translate_init(void)
     {
         const char *e = getenv("PPC_SYNC_EXIT");
         ppc_sync_exit = e && e[0] == '1';
+    }
+    {
+        const char *e = getenv("PPC_MTMSR_EE");
+        ppc_mtmsr_ee = !(e && e[0] == '0');
     }
 #endif
     p = cpu_reg_names;
@@ -4395,6 +4401,44 @@ static void gen_mtmsr(DisasContext *ctx)
     tcg_gen_andi_tl(t0, cpu_gpr[rS(ctx->opcode)], mask);
     tcg_gen_andi_tl(t1, cpu_msr, ~mask);
     tcg_gen_or_tl(t0, t0, t1);
+
+    if (ppc_mtmsr_ee && !(ctx->singlestep_enabled & CPU_SINGLE_STEP)) {
+        /*
+         * MorphOS's Exec kernel toggles MSR[EE] with mtmsr around every
+         * Disable()/Enable() pair.  When no bit outside EE/RI changes and
+         * POW is clear, hflags are unchanged; only leave the TB if an
+         * interrupt is now pending and unmasked.
+         */
+        target_ulong ee_ri = (1ULL << MSR_EE) | (1ULL << MSR_RI);
+        TCGLabel *slow = gen_new_label();
+        TCGLabel *done = gen_new_label();
+        TCGv diff = tcg_temp_new();
+        TCGv_i32 pend;
+
+        tcg_gen_ld_tl(diff, tcg_env, offsetof(CPUPPCState, msr_mask));
+        tcg_gen_and_tl(t0, t0, diff);
+        tcg_gen_xor_tl(diff, t0, cpu_msr);
+        tcg_gen_andi_tl(diff, diff, ~ee_ri);
+        tcg_gen_brcondi_tl(TCG_COND_NE, diff, 0, slow);
+        tcg_gen_andi_tl(diff, t0, 1ULL << MSR_POW);
+        tcg_gen_brcondi_tl(TCG_COND_NE, diff, 0, slow);
+
+        tcg_gen_mov_tl(cpu_msr, t0);
+        tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);
+        pend = tcg_temp_new_i32();
+        tcg_gen_ld_i32(pend, tcg_env, offsetof(CPUPPCState, pending_interrupts));
+        tcg_gen_brcondi_i32(TCG_COND_EQ, pend, 0, done);
+
+        gen_set_label(slow);
+        if (ctx->opcode & 0x00010000) {
+            gen_update_nip(ctx, ctx->base.pc_next);
+        }
+        gen_helper_store_msr(tcg_env, t0);
+        tcg_gen_exit_tb(NULL, 0);
+
+        gen_set_label(done);
+        return;
+    }
 
     gen_helper_store_msr(tcg_env, t0);
 
