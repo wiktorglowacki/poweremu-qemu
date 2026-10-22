@@ -801,6 +801,7 @@ struct PPCMacGPUState {
     uint64_t scanout_offset;      /* crtc_offset the shadow buffer mirrors */
     bool scanout_dirty_valid;     /* shadow_buf/dirty log are in sync */
     uint64_t scanout_vram_generation;
+    uint64_t scanout_ov_generation;   /* all of VRAM's, at that copy */
     bool scanout_generation_valid;
     bool scanout_log_owner;       /* this device consumes the VGA dirty log */
     int scanout_defers;           /* deferrals of the frame we are after */

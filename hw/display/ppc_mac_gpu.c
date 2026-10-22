@@ -3002,6 +3002,13 @@ static void ppc_mac_gpu_display_update_inner(void *opaque)
      */
     bool ov_on = s->regs.ov0_active[OV0(R200_OV0_SCALE_CNTL)] & BIT(30);
     bool ov_changed = ov_on;
+    /*
+     * Against all of VRAM's generation at the last copy: the frame's own
+     * stops at the newest desktop write, and planes written after that
+     * looked changed on every refresh (150 composes/s for 30 fps video).
+     */
+    uint64_t ov_generation = ov_on && use_generation ?
+        s->renderer->vram_generation(s->renderer_opaque, 0, s->vram_size) : 0;
     if (ov_on && s->renderer && s->renderer->vram_changed_since &&
         s->scanout_generation_valid) {
         uint32_t pbase[3];
@@ -3013,7 +3020,7 @@ static void ppc_mac_gpu_display_update_inner(void *opaque)
             uint64_t first, last;
             ov_changed = s->renderer->vram_changed_since(
                              s->renderer_opaque, pbase[p], pbase[p] + plen[p],
-                             s->scanout_vram_generation, &first, &last);
+                             s->scanout_ov_generation, &first, &last);
         }
     }
     bool cursor_only = use_generation && !force_copy && s->r300_cursor_dirty &&
@@ -3177,6 +3184,7 @@ static void ppc_mac_gpu_display_update_inner(void *opaque)
     s->r300_cursor_dirty = false;
     s->scanout_offset = s->disp.offset;
     s->scanout_vram_generation = vram_generation;
+    s->scanout_ov_generation = ov_generation;
     s->scanout_generation_valid = use_generation;
     s->scanout_dirty_valid = s->scanout_log_owner;
     s->scanout_defers = 0;
