@@ -13347,7 +13347,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
 
     /* CP - command processor */
     case R200_CP_RB_BASE:
-        s->regs.cp_rb_base = val;
+        s->regs.cp_rb_base = val & ~3u;
         gpu_debug_log("CP_SETUP RB_BASE=0x%08x", val);
         trace_ppc_mac_gpu_cp_ring_setup(val, s->regs.cp_rb_cntl);
         break;
