@@ -171,7 +171,7 @@ typedef struct VkFB {
 typedef struct VkPipeKey {
     VkRenderPass rp;
     uint32_t ncb;
-    bool z;
+    bool z, zw;
     VkPrimitiveTopology topo;
     VkCullModeFlags cull;
     VkFrontFace front;
@@ -2574,7 +2574,8 @@ static VkPipeline vk_pipeline(const char *glsl, uint32_t glsl_id,
     uint32_t natt = key->ncb + (key->z ? 1 : 0);
     for (uint32_t k = 0; k < natt; k++) {
         cba[k] = (VkPipelineColorBlendAttachmentState){
-            .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+            .colorWriteMask = k == key->ncb && !key->zw ? 0 :
+                              VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                               VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
         };
     }
@@ -3158,7 +3159,8 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     pk.rp = rp;
     pk.ncb = ncb;
     pk.z = pass_z;
-    pk.topo = pkt->prim_class == 1 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST
+    pk.zw = u.zinfo[0] & 5;
+    pk.topo =pkt->prim_class == 1 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST
                                    : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     pk.cull = (pkt->cull & R300_CULL_FRONT) ? VK_CULL_MODE_FRONT_BIT :
               (pkt->cull & R300_CULL_BACK) ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
