@@ -9585,7 +9585,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                     bbm_clip_br = pm4_next(d, &hdr_dw, body_dw);
                 }
 
-                if (hdr_dw <= ARRAY_SIZE(bbm_hdr)) {
+                if (hdr_dw <= ARRAY_SIZE(bbm_hdr) && hdr_dw <= body_dw) {
                     memcpy(bbm_hdr, d, hdr_dw * 4);     /* for 0x1B */
                     bbm_hdr_n = hdr_dw;
                 }
