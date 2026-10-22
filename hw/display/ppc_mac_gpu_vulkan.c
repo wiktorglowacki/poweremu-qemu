@@ -124,7 +124,8 @@ typedef struct VkImg {
     uint32_t addr, width, height, pitch;    /* the key, with fmt and cls */
     VkFormat fmt;
     uint32_t bpp;
-    uint32_t tiling;            /* VRAM layout: bit 1 micro, bit 0 macro tiled (key) */
+    uint32_t tiling;            /* VRAM layout: bit 1 micro, bit 0 macro tiled,
+                                   bits 3:2 a depth image's DEPTHENDIAN (key) */
     VkImage img;
     VkDeviceMemory mem;
     VkImageView view;
@@ -295,7 +296,7 @@ static struct {
     VkDeviceSize tile_size;
     VkDescriptorSetLayout tile_dsl;
     VkPipelineLayout tile_pl;
-    VkPipeline tile_pipe;
+    VkPipeline tile_pipe, zconv_pipe;
     VkDescriptorPool tile_pool;
     VkDescriptorSet tile_set;
     bool tile_failed, tile_logged;
@@ -719,6 +720,13 @@ fail:
     return false;
 }
 
+static VkImageAspectFlags vk_aspect(VkFormat f)
+{
+    return f == VK_FORMAT_D16_UNORM ? VK_IMAGE_ASPECT_DEPTH_BIT :
+           f == VK_FORMAT_D24_UNORM_S8_UINT || f == VK_FORMAT_D32_SFLOAT_S8_UINT ?
+           VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+}
+
 static bool vk_image(VkImageType type, VkImageViewType vtype, VkFormat fmt,
                      uint32_t w, uint32_t h, uint32_t d, uint32_t levels,
                      uint32_t layers, VkImageUsageFlags usage,
@@ -761,7 +769,7 @@ static bool vk_image(VkImageType type, VkImageViewType vtype, VkFormat fmt,
         .image = *img,
         .viewType = vtype,
         .format = fmt,
-        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, layers },
+        .subresourceRange = { vk_aspect(fmt), 0, levels, 0, layers },
     };
     VKCHECK(vkCreateImageView(V.dev, &vci, NULL, view), "vkCreateImageView");
     return true;
@@ -1248,6 +1256,7 @@ static uint32_t vk_tile_band(int cls, uint32_t tiling, uint32_t bpp)
 {
     uint32_t th = bpp == 1 ? 4 : 2;
 
+    tiling &= 3;
     if (!tiling || (cls == IMG_RT && !vk_tiled_rt_enabled())) {
         return 1;
     }
@@ -1351,7 +1360,9 @@ static const char vk_tile_glsl[] =
 "               ((y % th) * tw + (x % tw)) * p.bpp;\n"
 "    }\n"
 "    return p.addr + (y / 8u) * p.pitch * 8u + (xb / 256u) * 2048u + (y % 8u) * 256u + (xb % 256u);\n"
-"}\n"
+"}\n";
+
+static const char vk_tile_main[] =
 "void main() {\n"
 "    uint wpr = (p.w * p.bpp) / 4u;\n"
 "    uint i = gl_GlobalInvocationID.x;\n"
@@ -1362,6 +1373,66 @@ static const char vk_tile_glsl[] =
 "    if (p.dir == 0u) vram.w[t] = stg.w[i]; else stg.w[i] = vram.w[t];\n"
 "}\n";
 
+/*
+ * A depth image's texels to (dir 0) or from the guest's Z words, which
+ * r300_ztest reads: Z16, or Z24S8 with Z in bits 31:8, swapped by
+ * DEPTHENDIAN (mode bits 3:2; bits 1:0 the tiling, bit 4 a float depth
+ * attachment holding Z24 / 2^24).  The staging buffer is the image copy
+ * layout of the w x h rectangle at x0, y0 in rows of w rounded up to 4
+ * texels: the depth aspect (16 or 32 bits a texel), then for Z24S8 the
+ * stencil aspect (8 bits).  One thread per 4 texels; a Z16 x0 is even, so
+ * no two threads share a word.
+ */
+static const char vk_zconv_main[] =
+"uint zaddr(uint x, uint y) {\n"
+"    return (p.mode & 3u) != 0u ? tiled(x, y) : p.addr + y * p.pitch + x * p.bpp;\n"
+"}\n"
+"uint zswap(uint v) {\n"
+"    uint e = (p.mode >> 2) & 3u;\n"
+"    if (p.bpp == 2u) return e == 1u || e == 2u ? ((v >> 8) & 0xffu) | ((v & 0xffu) << 8) : v;\n"
+"    switch (e) {\n"
+"    case 1u: return ((v & 0x00ff00ffu) << 8) | ((v >> 8) & 0x00ff00ffu);\n"
+"    case 2u: return (v >> 24) | ((v >> 8) & 0xff00u) | ((v << 8) & 0xff0000u) | (v << 24);\n"
+"    case 3u: return (v << 16) | (v >> 16);\n"
+"    default: return v;\n"
+"    }\n"
+"}\n"
+"void main() {\n"
+"    uint wp = (p.w + 3u) & ~3u, g = gl_GlobalInvocationID.x % (wp / 4u);\n"
+"    uint row = gl_GlobalInvocationID.x / (wp / 4u), y = p.y0 + row;\n"
+"    if (row >= p.h) return;\n"
+"    if (p.bpp == 2u) {\n"
+"        for (uint k = 0u; k < 2u && 4u * g + 2u * k < p.w; k++) {\n"
+"            uint c = 4u * g + 2u * k, i = row * wp / 2u + 2u * g + k;\n"
+"            uint a = zaddr(p.x0 + c, y) >> 2, v = vram.w[a];\n"
+"            if (p.dir != 0u) {\n"
+"                stg.w[i] = zswap(v & 0xffffu) | (zswap(v >> 16) << 16);\n"
+"                continue;\n"
+"            }\n"
+"            uint s = stg.w[i];\n"
+"            v = (v & 0xffff0000u) | zswap(s & 0xffffu);\n"
+"            if (c + 1u < p.w) v = (v & 0xffffu) | (zswap(s >> 16) << 16);\n"
+"            vram.w[a] = v;\n"
+"        }\n"
+"        return;\n"
+"    }\n"
+"    uint si = wp * p.h + row * wp / 4u + g, s = p.dir != 0u ? 0u : stg.w[si];\n"
+"    for (uint j = 0u; j < 4u && 4u * g + j < p.w; j++) {\n"
+"        uint i = row * wp + 4u * g + j, a = zaddr(p.x0 + 4u * g + j, y) >> 2;\n"
+"        if (p.dir != 0u) {\n"
+"            uint v = zswap(vram.w[a]);\n"
+"            stg.w[i] = (p.mode & 16u) != 0u ? floatBitsToUint(float(v >> 8) * (1.0 / 16777216.0))\n"
+"                                            : v >> 8;\n"
+"            s |= (v & 0xffu) << (8u * j);\n"
+"        } else {\n"
+"            uint z = (p.mode & 16u) != 0u ? min(uint(uintBitsToFloat(stg.w[i]) * 16777216.0), 0xffffffu)\n"
+"                                          : stg.w[i] & 0xffffffu;\n"
+"            vram.w[a] = zswap((z << 8) | ((s >> (8u * j)) & 0xffu));\n"
+"        }\n"
+"    }\n"
+"    if (p.dir != 0u) stg.w[si] = s;\n"
+"}\n";
+
 static bool vk_tile_init(void)
 {
     if (V.tile_pipe) {
@@ -1370,23 +1441,6 @@ static bool vk_tile_init(void)
     if (V.tile_failed) {
         return false;
     }
-    size_t nw;
-    char *err = NULL;
-    uint32_t *spv = r300_glsl_to_spirv(vk_tile_glsl, R300_STAGE_CS, &nw, &err);
-    if (!spv) {
-        qemu_log("ppc-mac-gpu vulkan: tile shader: %s\n", err ? err : "?");
-        free(err);
-        V.tile_failed = true;
-        return false;
-    }
-    VkShaderModuleCreateInfo mci = {
-        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = nw * 4,
-        .pCode = spv,
-    };
-    VkShaderModule mod = VK_NULL_HANDLE;
-    VkResult r = vkCreateShaderModule(V.dev, &mci, NULL, &mod);
-    free(spv);
     VkDescriptorSetLayoutBinding b[2] = {
         { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
         { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
@@ -1404,27 +1458,45 @@ static bool vk_tile_init(void)
         .pushConstantRangeCount = 1,
         .pPushConstantRanges = &pcr,
     };
-    VkComputePipelineCreateInfo cpi = {
-        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage = {
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-            .module = mod,
-            .pName = "main",
-        },
-    };
-    if (r == VK_SUCCESS) {
-        r = vkCreateDescriptorSetLayout(V.dev, &dli, NULL, &V.tile_dsl);
-    }
+    VkResult r = vkCreateDescriptorSetLayout(V.dev, &dli, NULL, &V.tile_dsl);
     if (r == VK_SUCCESS) {
         r = vkCreatePipelineLayout(V.dev, &pli, NULL, &V.tile_pl);
     }
-    if (r == VK_SUCCESS) {
-        cpi.layout = V.tile_pl;
-        r = vkCreateComputePipelines(V.dev, VK_NULL_HANDLE, 1, &cpi, NULL, &V.tile_pipe);
-    }
-    if (mod) {
-        vkDestroyShaderModule(V.dev, mod, NULL);
+    const char *mains[2] = { vk_tile_main, vk_zconv_main };
+    VkPipeline *pipes[2] = { &V.tile_pipe, &V.zconv_pipe };
+    for (int i = 0; i < 2 && r == VK_SUCCESS; i++) {
+        g_autofree char *glsl = g_strconcat(vk_tile_glsl, mains[i], NULL);
+        size_t nw;
+        char *err = NULL;
+        uint32_t *spv = r300_glsl_to_spirv(glsl, R300_STAGE_CS, &nw, &err);
+        if (!spv) {
+            qemu_log("ppc-mac-gpu vulkan: tile shader: %s\n", err ? err : "?");
+            free(err);
+            r = VK_ERROR_UNKNOWN;
+            break;
+        }
+        VkShaderModuleCreateInfo mci = {
+            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .codeSize = nw * 4,
+            .pCode = spv,
+        };
+        VkShaderModule mod = VK_NULL_HANDLE;
+        r = vkCreateShaderModule(V.dev, &mci, NULL, &mod);
+        free(spv);
+        VkComputePipelineCreateInfo cpi = {
+            .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .stage = {
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                .module = mod,
+                .pName = "main",
+            },
+            .layout = V.tile_pl,
+        };
+        if (r == VK_SUCCESS) {
+            r = vkCreateComputePipelines(V.dev, VK_NULL_HANDLE, 1, &cpi, NULL, pipes[i]);
+            vkDestroyShaderModule(V.dev, mod, NULL);
+        }
     }
     if (r != VK_SUCCESS) {
         qemu_log("ppc-mac-gpu vulkan: tile pass setup failed (VkResult %d)\n", (int)r);
@@ -1516,6 +1588,18 @@ static bool vk_tiled_rt_enabled(void)
     return on;
 }
 
+/*
+ * The pass addresses whole tiles: a pitch that does not hold whole
+ * tiles (micro: 32 bytes / th; macro: 256 bytes, 2 KB per 8 micro
+ * rows) would reach past vk_img_hi, maybe past VRAM.  Linear instead.
+ */
+static bool vk_tile_fits(const VkImg *im)
+{
+    uint32_t th = im->bpp == 1 ? 4 : 2, t = im->tiling & 3;
+
+    return !(im->pitch % (t == 1 ? 256 : t == 2 ? 32 / th : 256 / th));
+}
+
 static bool vk_tile_copy(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0,
                          uint32_t x1, uint32_t y1, bool to_vram)
 {
@@ -1526,16 +1610,8 @@ static bool vk_tile_copy(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0
      * linear), so VRAM stays linear for everything.  PPCGPU_TILED_RT=1
      * writes the card's tiled layout instead.
      */
-    if ((im->cls == IMG_RT && !vk_tiled_rt_enabled()) || !vk_tile_init()) {
-        return false;
-    }
-    /*
-     * The pass addresses whole tiles: a pitch that does not hold whole
-     * tiles (micro: 32 bytes / th; macro: 256 bytes, 2 KB per 8 micro
-     * rows) would reach past vk_img_hi, maybe past VRAM.  Linear instead.
-     */
-    uint32_t th = im->bpp == 1 ? 4 : 2;
-    if (im->pitch % (im->tiling == 1 ? 256 : im->tiling == 2 ? 32 / th : 256 / th)) {
+    if ((im->cls == IMG_RT && !vk_tiled_rt_enabled()) || !vk_tile_init() ||
+        !vk_tile_fits(im)) {
         return false;
     }
     /*
@@ -1591,6 +1667,50 @@ static bool vk_tile_copy(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0
     return true;
 }
 
+/* Columns [x0, x1) of rows [y0, y1) of depth image im to or from VRAM. */
+static void vk_zconv(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0,
+                     uint32_t x1, uint32_t y1, bool to_vram)
+{
+    x0 &= ~(4 / im->bpp - 1);
+    x1 = MIN(x1, im->width);
+    if (x1 <= x0 || y1 <= y0) {
+        return;
+    }
+    uint32_t w = x1 - x0, wp = ROUND_UP(w, 4);
+    uint32_t rows_max = MAX((16u << 20) / (wp * 5), 1u);
+    uint32_t mode = (im->tiling & 12) | (im->fmt == VK_FORMAT_D32_SFLOAT_S8_UINT ? 16 : 0) |
+                    (vk_tiled_rt_enabled() && vk_tile_fits(im) ? im->tiling & 3 : 0);
+    if (!vk_tile_init() || !vk_tile_staging((VkDeviceSize)wp * 5 * MIN(y1 - y0, rows_max))) {
+        vk_warn(1u << 11, "no depth buffer conversion pass: depth lost");
+        return;
+    }
+    for (uint32_t y = y0; y < y1; y += rows_max) {
+        uint32_t h = MIN(y1 - y, rows_max);
+        VkBufferImageCopy r[2] = {
+            { 0, wp, 0, { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
+              { (int32_t)x0, (int32_t)y, 0 }, { w, h, 1 } },
+            { (VkDeviceSize)wp * h * 4, wp, 0, { VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1 },
+              { (int32_t)x0, (int32_t)y, 0 }, { w, h, 1 } },
+        };
+        uint32_t nr = im->bpp == 4 ? 2 : 1;
+        uint32_t pc[9] = { im->addr, im->pitch, x0, y, w, h, im->bpp, mode, to_vram ? 0 : 1 };
+        if (to_vram) {
+            vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, V.tile_buf, nr, r);
+            vk_full_barrier(cb);
+        }
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, V.zconv_pipe);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, V.tile_pl, 0, 1,
+                                &V.tile_set, 0, NULL);
+        vkCmdPushConstants(cb, V.tile_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+        vkCmdDispatch(cb, DIV_ROUND_UP(wp / 4 * h, 64), 1, 1);
+        vk_full_barrier(cb);
+        if (!to_vram) {
+            vkCmdCopyBufferToImage(cb, V.tile_buf, im->img, VK_IMAGE_LAYOUT_GENERAL, nr, r);
+            vk_full_barrier(cb);
+        }
+    }
+}
+
 static void vk_copy_to_vram_nb(VkImg *im)
 {
     VkCommandBuffer cb = vk_batch()->cb;
@@ -1600,15 +1720,18 @@ static void vk_copy_to_vram_nb(VkImg *im)
         r[i] = vk_region(im, im->dr[i][0], im->dr[i][1], im->dr[i][2], im->dr[i][3]);
     }
     if (im->ndr) {
-        bool tiled_done = false;
-        if (im->tiling) {
-            tiled_done = true;
-            for (uint32_t i = 0; i < im->ndr && tiled_done; i++) {
-                tiled_done = vk_tile_copy(cb, im, im->dr[i][0], im->dr[i][1],
-                                          im->dr[i][2], im->dr[i][3], true);
+        bool done = vk_aspect(im->fmt) != VK_IMAGE_ASPECT_COLOR_BIT;
+        for (uint32_t i = 0; done && i < im->ndr; i++) {
+            vk_zconv(cb, im, im->dr[i][0], im->dr[i][1], im->dr[i][2], im->dr[i][3], true);
+        }
+        if (im->tiling && !done) {
+            done = true;
+            for (uint32_t i = 0; i < im->ndr && done; i++) {
+                done = vk_tile_copy(cb, im, im->dr[i][0], im->dr[i][1],
+                                    im->dr[i][2], im->dr[i][3], true);
             }
         }
-        if (!tiled_done) {
+        if (!done) {
             vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, V.vram_buf,
                                    im->ndr, r);
         }
@@ -1659,7 +1782,7 @@ static void vk_img_free(VkImg *im)
 }
 
 static void vk_layout_general(VkCommandBuffer cb, VkImage img, uint32_t levels,
-                              uint32_t layers)
+                              uint32_t layers, VkImageAspectFlags aspect)
 {
     VkImageMemoryBarrier ib = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -1670,7 +1793,7 @@ static void vk_layout_general(VkCommandBuffer cb, VkImage img, uint32_t levels,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .image = img,
-        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, layers },
+        .subresourceRange = { aspect, 0, levels, 0, layers },
     };
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
@@ -1798,9 +1921,11 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
         }
         VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                   VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                                  (cls == IMG_RT ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                                                   VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT
-                                                 : VK_IMAGE_USAGE_SAMPLED_BIT);
+                                  (cls == IMG_TEX ? VK_IMAGE_USAGE_SAMPLED_BIT :
+                                   vk_aspect(fmt) != VK_IMAGE_ASPECT_COLOR_BIT ?
+                                   VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT :
+                                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                   VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
         if (!vk_image(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, fmt, w, h, 1, 1, 1, usage,
                       &im->img, &im->mem, &im->view)) {
             return NULL;
@@ -1815,7 +1940,7 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
         im->bpp = bpp;
         im->tiling = tiling;
         vk_end_pass();
-        vk_layout_general(vk_batch()->cb, im->img, 1, 1);
+        vk_layout_general(vk_batch()->cb, im->img, 1, 1, vk_aspect(fmt));
     }
     im->used = ++V.clock;
 
@@ -1883,7 +2008,9 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
         VkBufferImageCopy r = vk_region(im, 0, y0, w, y1);
         vk_end_pass();
         vk_full_barrier(cb);
-        if (!(im->tiling && vk_tile_copy(cb, im, 0, y0, w, y1, false))) {
+        if (vk_aspect(fmt) != VK_IMAGE_ASPECT_COLOR_BIT) {
+            vk_zconv(cb, im, 0, y0, w, y1, false);
+        } else if (!(im->tiling && vk_tile_copy(cb, im, 0, y0, w, y1, false))) {
             vkCmdCopyBufferToImage(cb, V.vram_buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
         }
         vk_full_barrier(cb);
@@ -2761,7 +2888,7 @@ static bool vk_dummies(void)
                       &V.dummy_img[i], &V.dummy_mem[i], &V.dummy_view[i])) {
             return false;
         }
-        vk_layout_general(cb, V.dummy_img[i], 1, layers);
+        vk_layout_general(cb, V.dummy_img[i], 1, layers, VK_IMAGE_ASPECT_COLOR_BIT);
         VkImageSubresourceRange sr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers };
         vkCmdClearColorImage(cb, V.dummy_img[i], VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &sr);
     }
@@ -2892,7 +3019,7 @@ static VkImageView vk_texture_full(const R300TexDesc *td)
     if (reuse) {
         vk_full_barrier(cb);
     } else {
-        vk_layout_general(cb, t->img, td->levels, cube ? 6 : 1);
+        vk_layout_general(cb, t->img, td->levels, cube ? 6 : 1, VK_IMAGE_ASPECT_COLOR_BIT);
     }
     for (uint32_t l = 0; l < td->levels; l++) {
         uint32_t lw, lh, n, bpr;
