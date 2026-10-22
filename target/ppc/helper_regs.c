@@ -447,9 +447,21 @@ void check_tlb_flush(CPUPPCState *env, bool global)
      * translations don't depend on the page table.
      */
     if (env->tlb_need_flush & TLB_NEED_PAGE_FLUSH) {
+        /* PPC_TLBIE_FAST=0: one flush per segment (old behaviour) */
+        static int fast = -1;
+
+        if (fast < 0) {
+            const char *e = getenv("PPC_TLBIE_FAST");
+            fast = !(e && e[0] == '0');
+        }
         env->tlb_need_flush &= ~TLB_NEED_PAGE_FLUSH;
         ppc_tlb_flush_why[2] += env->tlb_flush_npages;
         for (int i = 0; i < env->tlb_flush_npages; i++) {
+            if (fast) {
+                tlb_flush_page_bits_by_mmuidx(cs, env->tlb_flush_pages[i],
+                                              0x3333, 28);
+                continue;
+            }
             for (uint32_t seg = 0; seg < 16; seg++) {
                 tlb_flush_page_by_mmuidx(cs, (seg << 28) |
                                          (env->tlb_flush_pages[i] & 0x0fffffff),
