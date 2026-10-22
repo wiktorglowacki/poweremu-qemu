@@ -7,6 +7,17 @@ mkdir -p "$B"
 R=../../hw/display/r300
 SRC="$R/r300_state.c $R/r300_pvs.c $R/r300_us.c $R/r300_draw.c"
 
+for t in test_pvs test_us test_draw test_features; do
+    cc -O1 -Wall -Wno-unused-function -o "$B/$t" $t.c $SRC -lm
+done
+if [ "$(uname)" != Darwin ]; then
+    "$B/test_pvs"
+    "$B/test_draw"
+    "$B/test_features"
+    echo "R300 C tests passed (the shader and Metal tests need macOS)"
+    exit 0
+fi
+
 # The shader toolchain: shaderc (GLSL -> SPIR-V) and SPIRV-Cross (-> MSL).
 BREW=$(brew --prefix 2>/dev/null || echo /opt/local)   # Homebrew, else MacPorts
 export PKG_CONFIG_PATH="$BREW/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
@@ -14,9 +25,6 @@ SPV="$R/r300_spirv.c $(pkg-config --cflags --libs shaderc spirv-cross-c)"
 SPV="$SPV -lspirv-cross-msl -lspirv-cross-hlsl -lspirv-cross-cpp -lspirv-cross-reflect"
 SPV="$SPV -lspirv-cross-glsl -lspirv-cross-util -lspirv-cross-core -lc++"
 
-for t in test_pvs test_us test_draw test_features; do
-    cc -O1 -Wall -Wno-unused-function -o "$B/$t" $t.c $SRC -lm
-done
 cc -O1 -Wall -o "$B/glsl2msl" glsl2msl.c $SPV
 clang -fobjc-arc -framework Metal -framework Foundation mslcheck.m -o "$B/mslcheck"
 for t in test_zs test_fmt test_raster test_gpuvs; do
