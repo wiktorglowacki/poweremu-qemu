@@ -3344,7 +3344,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
          * too: without it blending read stale destination pixels (shadows,
          * translucent menus, text left garbage behind). */
         int bmode = vk_draw_barrier_mode();
-        bool reads_fb = pass_z || ncb > 1 || (u.cblend & 1) || (u.rop & 4) ||
+        bool reads_fb = (u.zinfo[0] & 3) || ncb > 1 || (u.cblend & 1) || (u.rop & 4) ||
                         (u.chanmask & 0xF) != 0xF;
         if (bmode == 1 || (bmode == 2 && reads_fb)) {
             VkMemoryBarrier mb = {

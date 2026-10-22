@@ -5970,6 +5970,17 @@ static bool r200_gpu2d_on(void)
     return on;
 }
 
+static bool r200_gpu2d_clean_dirty(PPCMacGPUState *s)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_2D_CLEAN_DIRTY");
+        on = !(e && e[0] == '0');
+    }
+    return on && s->renderer && s->renderer->set_dirty_source;
+}
+
 /* The accounting r200_vram_access does for a CPU-side write of [lo, hi). */
 static void r200_gpu2d_done(PPCMacGPUState *s, uint64_t lo, uint64_t hi)
 {
@@ -5980,7 +5991,9 @@ static void r200_gpu2d_done(PPCMacGPUState *s, uint64_t lo, uint64_t hi)
         r200_rate.presents++;
         r200_perf_present();
     }
-    memory_region_set_dirty(&s->vram, lo, hi - lo);
+    if (!r200_gpu2d_clean_dirty(s)) {
+        memory_region_set_dirty(&s->vram, lo, hi - lo);
+    }
 }
 
 /* The 2D engine's SRCCOPY on the GPU: true if recorded (nothing left to do). */
@@ -6553,8 +6566,10 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
             }
         }
         /* Mark display dirty */
-        vram_rect_dirty(s, dst_offset, dst_pitch, dst_x, dst_y,
-                        blit_w, blit_h, bpp);
+        if (!gpu_done || !r200_gpu2d_clean_dirty(s)) {
+            vram_rect_dirty(s, dst_offset, dst_pitch, dst_x, dst_y,
+                            blit_w, blit_h, bpp);
+        }
 
         /*
          * SRT write-through: if this 2D BLIT wrote to a VRAM offset
@@ -6672,8 +6687,10 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
             fill_vram_rect(s, vram, dst_offset, dst_pitch, dst_x, dst_y,
                            blit_w, blit_h, color, bpp);
         }
-        vram_rect_dirty(s, dst_offset, dst_pitch, dst_x, dst_y,
-                        blit_w, blit_h, bpp);
+        if (!gpu_done || !r200_gpu2d_clean_dirty(s)) {
+            vram_rect_dirty(s, dst_offset, dst_pitch, dst_x, dst_y,
+                            blit_w, blit_h, bpp);
+        }
         r200_fill_notify(s, dst_offset, dst_pitch, dst_x, dst_y,
                          blit_w, blit_h, bpp, color);
     }
@@ -7018,8 +7035,10 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
         }
 
         /* Mark dirty */
-        vram_rect_dirty(s, dst_offset, dst_pitch, dst_x, dst_y,
-                        blit_w, blit_h, bpp);
+        if (!gpu_done || !r200_gpu2d_clean_dirty(s)) {
+            vram_rect_dirty(s, dst_offset, dst_pitch, dst_x, dst_y,
+                            blit_w, blit_h, bpp);
+        }
         s->display_invalid = true;
 
         /*
@@ -7066,8 +7085,10 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
             fill_vram_rect(s, vram, dst_offset, dst_pitch, dst_x, dst_y,
                            blit_w, blit_h, color, bpp);
         }
-        vram_rect_dirty(s, dst_offset, dst_pitch, dst_x, dst_y,
-                        blit_w, blit_h, bpp);
+        if (!gpu_done || !r200_gpu2d_clean_dirty(s)) {
+            vram_rect_dirty(s, dst_offset, dst_pitch, dst_x, dst_y,
+                            blit_w, blit_h, bpp);
+        }
         r200_fill_notify(s, dst_offset, dst_pitch, dst_x, dst_y,
                          blit_w, blit_h, bpp, color);
         s->display_invalid = true;
@@ -9971,8 +9992,10 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                             }
                         }
                     blit_mark_dirty:
-                        vram_rect_dirty(s, dst_offset, dst_pitch, dst_x, dst_y,
-                                        blit_w, blit_h, bpp);
+                        if (!gpu_done || !r200_gpu2d_clean_dirty(s)) {
+                            vram_rect_dirty(s, dst_offset, dst_pitch, dst_x, dst_y,
+                                            blit_w, blit_h, bpp);
+                        }
 
                         /* SRT write-through for BBM path */
                         if (!r200_direct_enabled() && s->renderer && s->renderer->srt_write_through &&
@@ -10251,8 +10274,10 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                             fill_vram_rect(s, vram, offset, pitch, dst_x, dst_y,
                                            blit_w, blit_h, color, bpp);
                         }
-                        vram_rect_dirty(s, offset, pitch, dst_x, dst_y,
-                                        blit_w, blit_h, bpp);
+                        if (!gpu_done || !r200_gpu2d_clean_dirty(s)) {
+                            vram_rect_dirty(s, offset, pitch, dst_x, dst_y,
+                                            blit_w, blit_h, bpp);
+                        }
                         r200_fill_notify(s, offset, pitch, dst_x, dst_y,
                                          blit_w, blit_h, bpp, color);
                     }
@@ -11796,7 +11821,8 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         r200_direct_enabled() && r200_scratch_read_wait(s, (addr - R200_SCRATCH_REG0) / 4)) {
         /* fence poll: answered without flushing later work */
     } else if (!async_status && addr != R200_CP_CSQ_CNTL && addr != R200_CP_CSQ_STAT &&
-        addr != R200_CRTC_VLINE_CRNT_VLINE && addr != 0x0044) {
+        addr != R200_CRTC_VLINE_CRNT_VLINE && addr != R200_GEN_INT_STATUS &&
+        (addr != R200_GEN_INT_CNTL || !ppc_gpu_env_on("PPCGPU_NOFLUSH_INT_CNTL"))) {
         r200_flush_at(s, R200_WHY_REG(addr));
     }
     if (unlikely(gpu_debug_enabled())) {
