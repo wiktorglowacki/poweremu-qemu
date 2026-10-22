@@ -1301,7 +1301,7 @@ void tb_invalidate_phys_range_fast(ram_addr_t ram_addr,
                 page_unlock(p);
             }
         }
-        if (!hit) {
+        if (!hit && (!p || qatomic_read(&p->first_tb))) {
             return;
         }
     }
