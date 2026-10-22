@@ -2587,7 +2587,8 @@ static void ppc_mac_gpu_display_update_inner(void *opaque)
              * back to the synchronous flush, so a busy queue can never
              * starve the display.
              */
-            if (ppc_gpu_async_present && s->renderer->submit_r200 &&
+            if (s->renderer->draw_queue_async && s->scanout_log_owner &&
+                ppc_gpu_async_present && s->renderer->submit_r200 &&
                 s->scanout_defers < 4) {
                 s->scanout_defers++;
                 r200_rate.co_defers++;
