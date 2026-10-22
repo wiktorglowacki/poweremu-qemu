@@ -203,6 +203,8 @@ static struct {
     bool moltenvk;
     bool depth_clamp, aniso, bc, mirror_clamp;
     VkDeviceSize align;         /* arena allocation alignment */
+    bool hwz;                   /* depth/stencil attachments (vk_hwz) */
+    VkFormat zf24;              /* ... for Z24S8: D24S8, else D32S8 */
     bool eds;                   /* VK_EXT_extended_dynamic_state */
     PFN_vkCmdSetDepthTestEnableEXT vkCmdSetDepthTestEnableEXT;
     PFN_vkCmdSetDepthWriteEnableEXT vkCmdSetDepthWriteEnableEXT;
@@ -309,7 +311,7 @@ static struct {
     VkDescriptorSet tile_set;
     bool tile_failed, tile_logged;
 
-    uint64_t stat_draws, stat_passes, stat_barriers, stat_uploads, stat_writebacks, stat_flushes, stat_2d;
+    uint64_t stat_draws, stat_hwz, stat_passes, stat_barriers, stat_uploads, stat_writebacks, stat_flushes, stat_2d;
     /* why: commits, write-backs made at commit, uploads of new images and
      * of images whose newest page came from the CPU, a draw, a 2D op */
     uint64_t stat_commits, stat_wb_commit, stat_up_new, stat_up_src[4], stat_up_rt;
@@ -474,6 +476,14 @@ static bool vk_ctx_init(void)
     pd = NULL;
     vkGetPhysicalDeviceProperties(V.pdev, &V.props);
     vkGetPhysicalDeviceMemoryProperties(V.pdev, &V.memprops);
+    {
+        const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT |
+            VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(V.pdev, VK_FORMAT_D24_UNORM_S8_UINT, &fp);
+        V.zf24 = (fp.optimalTilingFeatures & need) == need ? VK_FORMAT_D24_UNORM_S8_UINT
+                                                           : VK_FORMAT_D32_SFLOAT_S8_UINT;
+    }
 
     n = 0;
     vkEnumerateDeviceExtensionProperties(V.pdev, NULL, &n, NULL);
@@ -1869,6 +1879,23 @@ static bool vk_lazy_z(void)
     return on;
 }
 
+/*
+ * PPCGPU_VK_HWZ=0: test depth and stencil in the fragment shader, the Z
+ * buffer a uint attachment it reads (the old behaviour): a barrier between
+ * any two depth-tested draws, which on MoltenVK ends the Metal render pass.
+ * By default the Z buffer is a depth/stencil attachment tested in hardware;
+ * draws that count Z-pass samples (ZB_ZPASS_*) still test in the shader.
+ */
+static bool vk_hwz(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_VK_HWZ");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
 static bool vk_rt_grow(void)
 {
     static int on = -1;
@@ -3139,8 +3166,8 @@ static VkImageView vk_texture_full(const R300TexDesc *td)
  *   0  never emit an in-pass barrier between draws (test MoltenVK tile resolve)
  *   1  emit on every draw in an open pass (old behaviour)
  *   2  (default) emit only when the draw reads a colour attachment (blending,
- *      ROP, partial channel mask, or multiple render targets) or depth/stencil
- *      is active in the pass
+ *      ROP, partial channel mask, or multiple render targets) or tests
+ *      depth/stencil in the shader
  */
 static int vk_draw_barrier_mode(void)
 {
@@ -3375,11 +3402,14 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     }
     uint32_t natt = ncb;
     bool z16 = zd->bpp == 2;
+    bool hz = V.hwz && !u.zpass_count;
     if (want_z) {
-        VkFormat zf = z16 ? VK_FORMAT_R16_UINT : VK_FORMAT_R32_UINT;
+        VkFormat zf = hz ? (z16 ? VK_FORMAT_D16_UNORM : V.zf24)
+                         : z16 ? VK_FORMAT_R16_UINT : VK_FORMAT_R32_UINT;
         uint32_t zw = ns > 1 ? ns * zd->pitch : MIN(pkt->rt_width, zd->pitch);
         att[ncb] = vk_img_get(IMG_RT, zd->gpu_addr, zw, fbh,
-                              ns * zd->pitch * zd->bpp, zf, zd->bpp, zd->tiling,
+                              ns * zd->pitch * zd->bpp, zf, zd->bpp,
+                              zd->tiling | (hz ? (u.zinfo[3] & R300_ZFMT_ENDIAN_MASK) << 2 : 0),
                               rt_max_h);
         if (att[ncb] && (zw == fbw || z_narrow)) {
             fmt[ncb] = zf;
@@ -3408,6 +3438,10 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         }
     }
     bool pass_z = natt > ncb;
+    hz = pass_z && vk_aspect(fmt[ncb]) != VK_IMAGE_ASPECT_COLOR_BIT;
+    if (hz && fmt[ncb] == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+        u.zinfo[3] |= R300_ZFMT_F32;
+    }
     /* Images may be taller than this draw needs: the framebuffer is as
      * tall as the shortest, so a pass kept open for the same images has
      * the same size whichever draw opened it. */
@@ -3425,7 +3459,12 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     pk.rp = rp;
     pk.ncb = ncb;
     pk.z = pass_z;
-    pk.zw = u.zinfo[0] & 5;
+    pk.zw = !hz && (u.zinfo[0] & 5);
+    pk.hz = hz;
+    if (hz && !V.eds) {
+        pk.zs[0] = u.zinfo[0] & 0x17;
+        pk.zs[1] = u.zinfo[1] & 0x7FFFFFF;
+    }
     pk.topo =pkt->prim_class == 1 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST
                                    : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     pk.cull = (pkt->cull & R300_CULL_FRONT) ? VK_CULL_MODE_FRONT_BIT :
@@ -3567,12 +3606,13 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             .dstSet = set, .dstBinding = R300_BIND_VSU, .descriptorCount = 1,
             .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &vbi };
     }
-    for (uint32_t k = 0; k < natt; k++) {
+    uint32_t nin = hz ? ncb : natt;
+    for (uint32_t k = 0; k < nin; k++) {
         ai[k] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, att[k]->view, VK_IMAGE_LAYOUT_GENERAL };
     }
     wr[nwr++] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = set, .dstBinding = R300_BIND_FB0, .descriptorCount = natt,
+        .dstSet = set, .dstBinding = R300_BIND_FB0, .descriptorCount = nin,
         .descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, .pImageInfo = ai };
     wr[nwr++] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -3612,8 +3652,8 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
          * too: without it blending read stale destination pixels (shadows,
          * translucent menus, text left garbage behind). */
         int bmode = vk_draw_barrier_mode();
-        bool reads_fb = (u.zinfo[0] & 3) || ncb > 1 || (u.cblend & 1) || (u.rop & 4) ||
-                        (u.chanmask & 0xF) != 0xF;
+        bool reads_fb = (!hz && (u.zinfo[0] & 3)) || ncb > 1 || (u.cblend & 1) ||
+                        (u.rop & 4) || (u.chanmask & 0xF) != 0xF;
         if (bmode == 1 || (bmode == 2 && reads_fb)) {
             VkMemoryBarrier mb = {
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -3627,6 +3667,23 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         }
     }
 
+    if (hz) {
+        VkPipelineDepthStencilStateCreateInfo zs = vk_zstate(u.zinfo[0], u.zinfo[1], u.zinfo[2]);
+        if (V.eds) {
+            V.vkCmdSetDepthTestEnableEXT(cb, zs.depthTestEnable);
+            V.vkCmdSetDepthWriteEnableEXT(cb, zs.depthWriteEnable);
+            V.vkCmdSetDepthCompareOpEXT(cb, zs.depthCompareOp);
+            V.vkCmdSetStencilTestEnableEXT(cb, zs.stencilTestEnable);
+            V.vkCmdSetStencilOpEXT(cb, VK_STENCIL_FACE_FRONT_BIT, zs.front.failOp,
+                                   zs.front.passOp, zs.front.depthFailOp, zs.front.compareOp);
+            V.vkCmdSetStencilOpEXT(cb, VK_STENCIL_FACE_BACK_BIT, zs.back.failOp,
+                                   zs.back.passOp, zs.back.depthFailOp, zs.back.compareOp);
+        }
+        vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, zs.front.compareMask);
+        vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, zs.front.writeMask);
+        vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, zs.front.reference);
+        V.stat_hwz++;
+    }
     for (uint32_t k = 0; k < ns; k++) {
         uint32_t cx = k * pkt->rt_pitch * (ns > 1);
         uint32_t dyn[2] = { k * ustride, k * mstride };
@@ -3659,12 +3716,14 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     }
     V.stat_draws++;
     if (V.stat_draws % 20000 == 0) {
-        qemu_log("ppc-mac-gpu vulkan: %llu draws, %llu passes, %llu barriers, %llu uploads, "
+        qemu_log("ppc-mac-gpu vulkan: %llu draws (%llu hardware Z), %llu passes, "
+                 "%llu barriers, %llu uploads, "
                  "%llu write-backs, %llu flushes; %llu commits, %llu write-backs "
                  "at commit; uploads: %llu new, %llu cpu, %llu draw, %llu 2d, %llu RT; "
                  "%llu batch waits, %llu depth write-backs at commit; rebuilt "
                  "textures: %llu lookups, %llu hashed, %llu built\n",
-                 (unsigned long long)V.stat_draws, (unsigned long long)V.stat_passes,
+                 (unsigned long long)V.stat_draws, (unsigned long long)V.stat_hwz,
+                 (unsigned long long)V.stat_passes,
                  (unsigned long long)V.stat_barriers,
                  (unsigned long long)V.stat_uploads, (unsigned long long)V.stat_writebacks,
                  (unsigned long long)V.stat_flushes, (unsigned long long)V.stat_commits,
@@ -3698,6 +3757,11 @@ static void *vk_init(uint8_t *vram_ptr, uint64_t vram_size)
         V.zpass = map;
         memset(map, 0, 16);
     }
+    V.hwz = vk_hwz() && vk_tile_init();
+    qemu_log("ppc-mac-gpu vulkan: depth/stencil tested %s (%s, %s state)\n",
+             V.hwz ? "in hardware" : "in the shader",
+             V.zf24 == VK_FORMAT_D24_UNORM_S8_UINT ? "D24S8" : "D32FS8",
+             V.eds ? "dynamic" : "pipeline");
     return &V;
 }
 
@@ -4133,5 +4197,8 @@ static PPCMacGPURenderer vulkan_renderer = {
 
 PPCMacGPURenderer *ppc_mac_gpu_renderer_vulkan(void)
 {
+    if (vk_hwz()) {
+        vulkan_renderer.r300_glsl_flags |= R300_GLSL_HW_Z;
+    }
     return &vulkan_renderer;
 }
