@@ -295,7 +295,7 @@ static struct {
     VkDescriptorSet tile_set;
     bool tile_failed, tile_logged;
 
-    uint64_t stat_draws, stat_passes, stat_uploads, stat_writebacks, stat_flushes, stat_2d;
+    uint64_t stat_draws, stat_passes, stat_barriers, stat_uploads, stat_writebacks, stat_flushes, stat_2d;
     /* why: commits, write-backs made at commit, uploads of new images and
      * of images whose newest page came from the CPU, a draw, a 2D op */
     uint64_t stat_commits, stat_wb_commit, stat_up_new, stat_up_src[4], stat_up_rt;
@@ -2838,6 +2838,24 @@ static VkImageView vk_texture_full(const R300TexDesc *td)
 
 /* ---- draws ------------------------------------------------------------ */
 
+/*
+ * PPCGPU_VK_DRAW_BARRIER:
+ *   0  never emit an in-pass barrier between draws (test MoltenVK tile resolve)
+ *   1  emit on every draw in an open pass (old behaviour)
+ *   2  (default) emit only when the draw reads a colour attachment (blending,
+ *      ROP, partial channel mask, or multiple render targets) or depth/stencil
+ *      is active in the pass
+ */
+static int vk_draw_barrier_mode(void)
+{
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("PPCGPU_VK_DRAW_BARRIER");
+        mode = e ? atoi(e) : 2;
+    }
+    return mode;
+}
+
 static VkFormat vk_rt_format(uint32_t view)
 {
     switch (view) {
@@ -3296,14 +3314,20 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         /* This draw reads what the previous one wrote.  MoltenVK needs it
          * too: without it blending read stale destination pixels (shadows,
          * translucent menus, text left garbage behind). */
-        VkMemoryBarrier mb = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT,
-        };
-        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                             VK_DEPENDENCY_BY_REGION_BIT, 1, &mb, 0, NULL, 0, NULL);
+        int bmode = vk_draw_barrier_mode();
+        bool reads_fb = pass_z || ncb > 1 || (u.cblend & 1) || (u.rop & 4) ||
+                        (u.chanmask & 0xF) != 0xF;
+        if (bmode == 1 || (bmode == 2 && reads_fb)) {
+            VkMemoryBarrier mb = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT,
+            };
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                 VK_DEPENDENCY_BY_REGION_BIT, 1, &mb, 0, NULL, 0, NULL);
+            V.stat_barriers++;
+        }
     }
 
     for (uint32_t k = 0; k < ns; k++) {
@@ -3338,12 +3362,13 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     }
     V.stat_draws++;
     if (V.stat_draws % 20000 == 0) {
-        qemu_log("ppc-mac-gpu vulkan: %llu draws, %llu passes, %llu uploads, "
+        qemu_log("ppc-mac-gpu vulkan: %llu draws, %llu passes, %llu barriers, %llu uploads, "
                  "%llu write-backs, %llu flushes; %llu commits, %llu write-backs "
                  "at commit; uploads: %llu new, %llu cpu, %llu draw, %llu 2d, %llu RT; "
                  "%llu batch waits, %llu depth write-backs at commit; rebuilt "
                  "textures: %llu lookups, %llu hashed, %llu built\n",
                  (unsigned long long)V.stat_draws, (unsigned long long)V.stat_passes,
+                 (unsigned long long)V.stat_barriers,
                  (unsigned long long)V.stat_uploads, (unsigned long long)V.stat_writebacks,
                  (unsigned long long)V.stat_flushes, (unsigned long long)V.stat_commits,
                  (unsigned long long)V.stat_wb_commit, (unsigned long long)V.stat_up_new,
