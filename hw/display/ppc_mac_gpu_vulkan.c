@@ -45,6 +45,7 @@
 #include "qemu/bitmap.h"
 #include "qemu/bswap.h"
 #include "qemu/processor.h"
+#include "system/system.h"
 
 #include <vulkan/vulkan.h>
 
@@ -349,6 +350,35 @@ static int vk_memtype(uint32_t bits, VkMemoryPropertyFlags want)
 
 static void *vk_waiter(void *opaque);
 
+static char *vk_pipecache_path(void)
+{
+    char uuid[2 * VK_UUID_SIZE + 1];
+
+    for (int i = 0; i < VK_UUID_SIZE; i++) {
+        sprintf(uuid + 2 * i, "%02x", V.props.pipelineCacheUUID[i]);
+    }
+    return g_strdup_printf("%s/ppc-mac-gpu/vk-pipecache-%s", g_get_user_cache_dir(), uuid);
+}
+
+static void vk_pipecache_save(Notifier *n, void *data)
+{
+    size_t len = 0;
+
+    if (!V.pipecache ||
+        vkGetPipelineCacheData(V.dev, V.pipecache, &len, NULL) != VK_SUCCESS || !len) {
+        return;
+    }
+    g_autofree char *buf = g_malloc(len);
+    g_autofree char *path = vk_pipecache_path();
+    g_autofree char *dir = g_path_get_dirname(path);
+    if (vkGetPipelineCacheData(V.dev, V.pipecache, &len, buf) == VK_SUCCESS) {
+        g_mkdir_with_parents(dir, 0700);
+        g_file_set_contents(path, buf, len, NULL);
+    }
+}
+
+static Notifier vk_pipecache_exit = { .notify = vk_pipecache_save };
+
 static bool vk_ctx_init(void)
 {
     VkExtensionProperties *ie = NULL, *de = NULL;
@@ -578,10 +608,21 @@ static bool vk_ctx_init(void)
     {
         const char *pce = getenv("PPCGPU_VK_PIPECACHE");
         if (!(pce && pce[0] == '0')) {
+            g_autofree char *path = vk_pipecache_path();
+            g_autofree char *data = NULL;
+            gsize len = 0;
             VkPipelineCacheCreateInfo pcci = {
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
             };
-            vkCreatePipelineCache(V.dev, &pcci, NULL, &V.pipecache);
+            if (g_file_get_contents(path, &data, &len, NULL)) {
+                pcci.initialDataSize = len;
+                pcci.pInitialData = data;
+            }
+            if (vkCreatePipelineCache(V.dev, &pcci, NULL, &V.pipecache) != VK_SUCCESS) {
+                pcci.initialDataSize = 0;
+                vkCreatePipelineCache(V.dev, &pcci, NULL, &V.pipecache);
+            }
+            qemu_add_exit_notifier(&vk_pipecache_exit);
         }
     }
 
