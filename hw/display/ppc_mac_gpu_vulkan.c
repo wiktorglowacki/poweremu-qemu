@@ -174,6 +174,8 @@ typedef struct VkPipeKey {
     VkRenderPass rp;
     uint32_t ncb;
     bool z, zw;
+    bool hz;                    /* Z is a depth/stencil attachment */
+    uint32_t zs[2];             /* ... its ZB_CNTL, ZB_ZSTENCILCNTL (without V.eds) */
     VkPrimitiveTopology topo;
     VkCullModeFlags cull;
     VkFrontFace front;
@@ -201,6 +203,12 @@ static struct {
     bool moltenvk;
     bool depth_clamp, aniso, bc, mirror_clamp;
     VkDeviceSize align;         /* arena allocation alignment */
+    bool eds;                   /* VK_EXT_extended_dynamic_state */
+    PFN_vkCmdSetDepthTestEnableEXT vkCmdSetDepthTestEnableEXT;
+    PFN_vkCmdSetDepthWriteEnableEXT vkCmdSetDepthWriteEnableEXT;
+    PFN_vkCmdSetDepthCompareOpEXT vkCmdSetDepthCompareOpEXT;
+    PFN_vkCmdSetStencilTestEnableEXT vkCmdSetStencilTestEnableEXT;
+    PFN_vkCmdSetStencilOpEXT vkCmdSetStencilOpEXT;
 
     VkCommandPool cmdpool;
     VkDescriptorSetLayout dsl;
@@ -479,6 +487,13 @@ static bool vk_ctx_init(void)
     if (mirror_ext) {
         dext[ndext++] = VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME;
     }
+    /* PPCGPU_VK_EDS=0: depth/stencil state in the pipelines instead (A/B) */
+    const char *eds_env = getenv("PPCGPU_VK_EDS");
+    bool eds = vk_has_ext(de, n, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME) &&
+               !(eds_env && eds_env[0] == '0');
+    if (eds) {
+        dext[ndext++] = VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME;
+    }
     g_free(de);
     de = NULL;
 
@@ -546,9 +561,14 @@ static bool vk_ctx_init(void)
         .queueCount = 1,
         .pQueuePriorities = &prio,
     };
+    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT weds = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT,
+        .pNext = V.props.apiVersion >= VK_API_VERSION_1_2 ? &w12 : NULL,
+        .extendedDynamicState = VK_TRUE,
+    };
     VkDeviceCreateInfo dci = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .pNext = V.props.apiVersion >= VK_API_VERSION_1_2 ? &w12 : NULL,
+        .pNext = eds ? &weds : weds.pNext,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &qci,
         .enabledExtensionCount = ndext,
@@ -557,6 +577,11 @@ static bool vk_ctx_init(void)
     };
     VKCHECK(vkCreateDevice(V.pdev, &dci, NULL, &V.dev), "vkCreateDevice");
     vkGetDeviceQueue(V.dev, V.qfam, 0, &V.queue);
+#define VK_LOAD(f) (V.f = (PFN_##f)vkGetDeviceProcAddr(V.dev, #f))
+    V.eds = eds && VK_LOAD(vkCmdSetDepthTestEnableEXT) && VK_LOAD(vkCmdSetDepthWriteEnableEXT) &&
+            VK_LOAD(vkCmdSetDepthCompareOpEXT) && VK_LOAD(vkCmdSetStencilTestEnableEXT) &&
+            VK_LOAD(vkCmdSetStencilOpEXT);
+#undef VK_LOAD
 
     V.align = MAX(MAX(V.props.limits.minUniformBufferOffsetAlignment,
                       V.props.limits.minStorageBufferOffsetAlignment), 256);
@@ -2503,6 +2528,7 @@ static VkRenderPass vk_render_pass(uint32_t n, const VkFormat *fmt)
 {
     VkAttachmentDescription ad[VK_MAX_ATT];
     VkAttachmentReference ref[VK_MAX_ATT];
+    uint32_t nc = n && vk_aspect(fmt[n - 1]) != VK_IMAGE_ASPECT_COLOR_BIT ? n - 1 : n;
 
     for (unsigned i = 0; i < V.nrp; i++) {
         if (V.rps[i].n == n && !memcmp(V.rps[i].fmt, fmt, n * sizeof(*fmt))) {
@@ -2515,8 +2541,8 @@ static VkRenderPass vk_render_pass(uint32_t n, const VkFormat *fmt)
             .samples = VK_SAMPLE_COUNT_1_BIT,
             .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-            .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-            .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+            .stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE,
             .initialLayout = VK_IMAGE_LAYOUT_GENERAL,
             .finalLayout = VK_IMAGE_LAYOUT_GENERAL,
         };
@@ -2524,10 +2550,11 @@ static VkRenderPass vk_render_pass(uint32_t n, const VkFormat *fmt)
     }
     VkSubpassDescription sd = {
         .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
-        .inputAttachmentCount = n,
+        .inputAttachmentCount = nc,
         .pInputAttachments = ref,
-        .colorAttachmentCount = n,
+        .colorAttachmentCount = nc,
         .pColorAttachments = ref,
+        .pDepthStencilAttachment = nc < n ? &ref[nc] : NULL,
     };
     VkSubpassDependency dep[3] = {
         {   /* between draws: writes before the next draw's input reads */
@@ -2681,6 +2708,32 @@ static VkShaderModule vk_vs_module(const char *vs_glsl, uint32_t vs_id)
     return mod;
 }
 
+static const VkCompareOp vk_zfunc[8] = {
+    VK_COMPARE_OP_NEVER, VK_COMPARE_OP_LESS, VK_COMPARE_OP_LESS_OR_EQUAL, VK_COMPARE_OP_EQUAL,
+    VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_GREATER, VK_COMPARE_OP_NOT_EQUAL,
+    VK_COMPARE_OP_ALWAYS,
+};
+
+static VkStencilOpState vk_stencil(uint32_t s, uint32_t rm)
+{
+    return (VkStencilOpState){ (s >> 3) & 7, (s >> 6) & 7, (s >> 9) & 7, vk_zfunc[s & 7],
+                               (rm >> 8) & 0xFF, (rm >> 16) & 0xFF, rm & 0xFF };
+}
+
+/* r300_ztest's ZB_CNTL, ZB_ZSTENCILCNTL and ZB_STENCILREFMASK as Vulkan state. */
+static VkPipelineDepthStencilStateCreateInfo vk_zstate(uint32_t cntl, uint32_t zs, uint32_t rm)
+{
+    return (VkPipelineDepthStencilStateCreateInfo){
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .depthTestEnable = (cntl >> 1) & 1,
+        .depthWriteEnable = (cntl >> 2) & 1,
+        .depthCompareOp = vk_zfunc[zs & 7],
+        .stencilTestEnable = cntl & 1,
+        .front = vk_stencil(zs >> 3, rm),
+        .back = vk_stencil(cntl & 16 ? zs >> 15 : zs >> 3, rm),
+    };
+}
+
 static VkPipeline vk_pipeline(const char *glsl, uint32_t glsl_id,
                               const VkPipeKey *key)
 {
@@ -2731,7 +2784,7 @@ static VkPipeline vk_pipeline(const char *glsl, uint32_t glsl_id,
             return pv->pipe;
         }
     }
-    int fst = key->z ? R300_STAGE_FS_Z : R300_STAGE_FS;
+    int fst = key->z && !key->hz ? R300_STAGE_FS_Z : R300_STAGE_FS;
     if (!*glsl && ((!key->vs_mod && !pg->mod[R300_STAGE_VS]) || !pg->mod[fst])) {
         fetched = r300_us_glsl_by_id(glsl_id);
         if (!fetched) {
@@ -2775,7 +2828,7 @@ static VkPipeline vk_pipeline(const char *glsl, uint32_t glsl_id,
         .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
     };
     VkPipelineColorBlendAttachmentState cba[VK_MAX_ATT];
-    uint32_t natt = key->ncb + (key->z ? 1 : 0);
+    uint32_t natt = key->ncb + (key->z && !key->hz ? 1 : 0);
     for (uint32_t k = 0; k < natt; k++) {
         cba[k] = (VkPipelineColorBlendAttachmentState){
             .colorWriteMask = k == key->ncb && !key->zw ? 0 :
@@ -2788,10 +2841,18 @@ static VkPipeline vk_pipeline(const char *glsl, uint32_t glsl_id,
         .attachmentCount = natt,
         .pAttachments = cba,
     };
-    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDepthStencilStateCreateInfo dss = vk_zstate(key->zs[0], key->zs[1], 0);
+    VkDynamicState dyn[10] = {
+        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+        VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+        VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+        VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE_EXT, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE_EXT,
+        VK_DYNAMIC_STATE_DEPTH_COMPARE_OP_EXT, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE_EXT,
+        VK_DYNAMIC_STATE_STENCIL_OP_EXT,
+    };
     VkPipelineDynamicStateCreateInfo ds = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .dynamicStateCount = 2,
+        .dynamicStateCount = !key->hz ? 2 : V.eds ? 10 : 5,
         .pDynamicStates = dyn,
     };
     VkGraphicsPipelineCreateInfo gci = {
@@ -2803,6 +2864,7 @@ static VkPipeline vk_pipeline(const char *glsl, uint32_t glsl_id,
         .pViewportState = &vp,
         .pRasterizationState = &rs,
         .pMultisampleState = &ms,
+        .pDepthStencilState = key->hz ? &dss : NULL,
         .pColorBlendState = &cb,
         .pDynamicState = &ds,
         .layout = V.layout,
