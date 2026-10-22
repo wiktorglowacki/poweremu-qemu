@@ -181,6 +181,7 @@ typedef struct VkPipeKey {
     VkCullModeFlags cull;
     VkFrontFace front;
     VkShaderModule vs_mod;      /* GPU vertex program, NULL: the pass-through */
+    VkPipelineColorBlendAttachmentState cba;    /* colour buffer A (vk_ffblend) */
 } VkPipeKey;
 typedef struct VkProg {
     VkShaderModule mod[3];      /* R300Stage */
@@ -1927,6 +1928,71 @@ static bool vk_hwz(void)
     return on;
 }
 
+/*
+ * PPCGPU_VK_FFBLEND=0: blend and mask colour writes in the shader, which
+ * reads the colour buffer behind a barrier (the old behaviour).  By default
+ * a lone RGBA8 colour buffer whose bytes hold the four channels in any order
+ * blends and masks in the pipeline and the shader writes the unblended
+ * colour.  Draws with ROP, DISCARD_SRC_PIXELS or the depth test in the
+ * shader still blend there, and so do factors that read alpha when alpha is
+ * not the last byte (the pipeline's alpha equation is the last byte's).
+ */
+static void vk_ffblend(R300FSUniforms *u, VkPipelineColorBlendAttachmentState *ba, float bc[4])
+{
+    static const VkBlendFactor bf[15] = {
+        VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ONE,
+        VK_BLEND_FACTOR_SRC_COLOR, VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR,
+        VK_BLEND_FACTOR_DST_COLOR, VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR,
+        VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        VK_BLEND_FACTOR_DST_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA,
+        VK_BLEND_FACTOR_SRC_ALPHA_SATURATE,
+        VK_BLEND_FACTOR_CONSTANT_COLOR, VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR,
+        VK_BLEND_FACTOR_CONSTANT_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA,
+    };
+    static const VkBlendOp op[8] = {
+        VK_BLEND_OP_ADD, VK_BLEND_OP_ADD, VK_BLEND_OP_SUBTRACT, VK_BLEND_OP_SUBTRACT,
+        VK_BLEND_OP_MIN, VK_BLEND_OP_MAX,
+        VK_BLEND_OP_REVERSE_SUBTRACT, VK_BLEND_OP_REVERSE_SUBTRACT,
+    };
+    static int on = -1;
+    uint32_t cb = u->cblend, ab = cb & 2 ? u->ablend : cb;
+    uint32_t f[4] = { cb >> 16 & 63, cb >> 24 & 63, ab >> 16 & 63, ab >> 24 & 63 };
+    uint32_t p[4], seen = 0, mask = 0;
+
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_VK_FFBLEND");
+        on = !(e && e[0] == '0');
+    }
+    if (!on || (u->rop & 4)) {
+        return;
+    }
+    for (int i = 0; i < 4; i++) {
+        p[i] = u->out_sel[u->rt_swap32 ? 3 - i : i];
+        seen |= 1u << p[i];
+        mask |= (u->chanmask >> (3 - p[i]) & 1) << i;
+        bc[i] = u->blend_color[(p[i] + 3) & 3];
+    }
+    if (seen != 0xF) {
+        return;
+    }
+    if (cb & 1) {
+        if ((cb & 0x38) || (p[3] && ((cb ^ ab) & 0x3F3F7000))) {
+            return;
+        }
+        for (int i = 0; i < 4; i++) {
+            if (f[i] - 32 > 14 || (p[3] && (f[i] - 38 < 5 || f[i] > 44))) {
+                return;
+            }
+        }
+        *ba = (VkPipelineColorBlendAttachmentState){
+            VK_TRUE, bf[f[0] - 32], bf[f[1] - 32], op[cb >> 12 & 7],
+            bf[f[2] - 32], bf[f[3] - 32], op[ab >> 12 & 7] };
+    }
+    ba->colorWriteMask = mask;
+    u->cblend &= ~1u;
+    u->chanmask = 0xF;
+}
+
 static bool vk_rt_grow(void)
 {
     static int on = -1;
@@ -2905,14 +2971,15 @@ static VkPipeline vk_pipeline(const char *glsl, uint32_t glsl_id,
                               VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
         };
     }
+    cba[0] = key->cba;
     VkPipelineColorBlendStateCreateInfo cb = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
         .attachmentCount = natt,
         .pAttachments = cba,
     };
     VkPipelineDepthStencilStateCreateInfo dss = vk_zstate(key->zs[0], key->zs[1], 0);
-    VkDynamicState dyn[10] = {
-        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+    VkDynamicState dyn[11] = {
+        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
         VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
         VK_DYNAMIC_STATE_STENCIL_REFERENCE,
         VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE_EXT, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE_EXT,
@@ -2921,7 +2988,7 @@ static VkPipeline vk_pipeline(const char *glsl, uint32_t glsl_id,
     };
     VkPipelineDynamicStateCreateInfo ds = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .dynamicStateCount = !key->hz ? 2 : V.eds ? 10 : 5,
+        .dynamicStateCount = !key->hz ? 3 : V.eds ? 11 : 6,
         .pDynamicStates = dyn,
     };
     VkGraphicsPipelineCreateInfo gci = {
@@ -3513,6 +3580,11 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
               (pkt->cull & R300_CULL_BACK) ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
     pk.front = r300_front_ccw(pkt->cull) ? VK_FRONT_FACE_COUNTER_CLOCKWISE
                                          : VK_FRONT_FACE_CLOCKWISE;
+    float bc[4];
+    pk.cba.colorWriteMask = 0xF;
+    if (ncb == 1 && fmt[0] == VK_FORMAT_R8G8B8A8_UNORM && (hz || !pass_z)) {
+        vk_ffblend(&u, &pk.cba, bc);
+    }
     /* GPU vertex shading (R300_GLSL_GPU_VS): triangles only, no line pass */
     bool gpu_vs = pkt->vs_glsl && pkt->vs_id;
     if (gpu_vs) {
@@ -3725,6 +3797,9 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, zs.front.writeMask);
         vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, zs.front.reference);
         V.stat_hwz++;
+    }
+    if (pk.cba.blendEnable) {
+        vkCmdSetBlendConstants(cb, bc);
     }
     for (uint32_t k = 0; k < ns; k++) {
         uint32_t cx = k * pkt->rt_pitch * (ns > 1);
