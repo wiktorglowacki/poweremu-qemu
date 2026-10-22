@@ -46,6 +46,7 @@
 #include "qemu/bswap.h"
 #include "qemu/processor.h"
 #include "system/system.h"
+#include "qemu/main-loop.h"
 
 #include <vulkan/vulkan.h>
 
@@ -2335,6 +2336,17 @@ static bool vk_wait_busy_r200(void *opaque, uint32_t us)
     newest = vk_newest_pending();
     if (!newest) {
         return false;
+    }
+    if (us && bql_locked()) {
+        uint32_t seq = newest->seq;
+        int64_t end = g_get_monotonic_time() + us;
+
+        bql_unlock();
+        while (!vk_seq_done(seq) && g_get_monotonic_time() < end) {
+            cpu_relax();
+        }
+        bql_lock();
+        return !vk_seq_done(seq);
     }
     if (vk_fence_wait(newest, us)) {
         /* A barrier opens every batch, so the newest finishing means all did. */
