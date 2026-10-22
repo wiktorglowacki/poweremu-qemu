@@ -377,15 +377,17 @@ static inline void qemu_futex_wait(QemuEvent *ev, unsigned val)
 #ifdef HAVE_MAC_ULOCK
     if (mac_ulock_on()) {
         if (__builtin_available(macOS 14.4, *)) {
-            os_sync_wait_on_address(&ev->value, (uint64_t)val,
-                                    sizeof(ev->value),
-                                    OS_SYNC_WAIT_ON_ADDRESS_NONE);
+            while (qatomic_read(&ev->value) == val) {
+                os_sync_wait_on_address(&ev->value, (uint64_t)val,
+                                        sizeof(ev->value),
+                                        OS_SYNC_WAIT_ON_ADDRESS_NONE);
+            }
             return;
         }
     }
 #endif
     pthread_mutex_lock(&ev->lock);
-    if (ev->value == val) {
+    while (ev->value == val) {
         pthread_cond_wait(&ev->cond, &ev->lock);
     }
     pthread_mutex_unlock(&ev->lock);
