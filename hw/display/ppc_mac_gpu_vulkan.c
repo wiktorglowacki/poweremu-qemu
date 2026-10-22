@@ -1550,7 +1550,7 @@ static bool vk_tile_copy(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0
     return true;
 }
 
-static void vk_copy_to_vram(VkImg *im)
+static void vk_copy_to_vram_nb(VkImg *im)
 {
     VkCommandBuffer cb = vk_batch()->cb;
     VkBufferImageCopy r[VK_MAX_DR];
@@ -1559,8 +1559,6 @@ static void vk_copy_to_vram(VkImg *im)
         r[i] = vk_region(im, im->dr[i][0], im->dr[i][1], im->dr[i][2], im->dr[i][3]);
     }
     if (im->ndr) {
-        vk_end_pass();
-        vk_full_barrier(cb);
         bool tiled_done = false;
         if (im->tiling) {
             tiled_done = true;
@@ -1573,11 +1571,22 @@ static void vk_copy_to_vram(VkImg *im)
             vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, V.vram_buf,
                                    im->ndr, r);
         }
-        vk_full_barrier(cb);
         V.stat_writebacks++;
     }
     im->dirty = false;
     im->ndr = 0;
+}
+
+static void vk_copy_to_vram(VkImg *im)
+{
+    if (!im->ndr) {
+        im->dirty = false;
+        return;
+    }
+    vk_end_pass();
+    vk_full_barrier(vk_batch()->cb);
+    vk_copy_to_vram_nb(im);
+    vk_full_barrier(vk_batch()->cb);
 }
 
 /* Write back every image with rendering newer than VRAM in [lo, hi). */
@@ -1967,12 +1976,20 @@ static uint32_t vk_commit_ex(void (*done)(void *, uint32_t), void *arg,
     g_assert(b->state == 1);
     vk_end_pass();
     uint64_t wb0 = V.stat_writebacks;
+    bool wb = false;
     for (int i = 0; i < VK_MAX_IMG; i++) {
         if (V.img[i].live && V.img[i].dirty &&
             (writeback_z || !V.img[i].z || !vk_lazy_z())) {
             V.stat_wb_z += V.img[i].z && V.img[i].ndr;
-            vk_copy_to_vram(&V.img[i]);
+            if (!wb && V.img[i].ndr) {
+                vk_full_barrier(b->cb);
+                wb = true;
+            }
+            vk_copy_to_vram_nb(&V.img[i]);
         }
+    }
+    if (wb) {
+        vk_full_barrier(b->cb);
     }
     V.stat_wb_commit += V.stat_writebacks - wb0;
     V.stat_commits++;
