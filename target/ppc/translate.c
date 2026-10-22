@@ -84,6 +84,8 @@ static TCGv_i32 cpu_access_type;
 
 /* PPC_SYNC_EXIT=1: sync always ends the TB in supervisor mode (old behaviour) */
 static bool ppc_sync_exit;
+/* PPC_ISYNC_EXIT=1: isync always exits to the main loop (old behaviour) */
+static bool ppc_isync_exit;
 /* PPC_MTMSR_EE=0: mtmsr always ends the TB (old behaviour) */
 static bool ppc_mtmsr_ee;
 
@@ -105,6 +107,10 @@ void ppc_translate_init(void)
     {
         const char *e = getenv("PPC_SYNC_EXIT");
         ppc_sync_exit = e && e[0] == '1';
+    }
+    {
+        const char *e = getenv("PPC_ISYNC_EXIT");
+        ppc_isync_exit = e && e[0] == '1';
     }
     {
         const char *e = getenv("PPC_MTMSR_EE");
@@ -3030,7 +3036,7 @@ static inline void gen_check_tlb_flush(DisasContext *ctx, bool global)
     } else {
         gen_helper_check_tlb_flush_local(tcg_env);
     }
-    if (global && !ppc_sync_exit) {
+    if (global ? !ppc_sync_exit : !ppc_isync_exit) {
         /*
          * Global TLB flush uses async-work which must run before the
          * next instruction: leave the TB, but only when a flush was
@@ -3062,7 +3068,7 @@ static void gen_isync(DisasContext *ctx)
         gen_check_tlb_flush(ctx, false);
     }
     tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);
-    ctx->base.is_jmp = DISAS_EXIT_UPDATE;
+    ctx->base.is_jmp = ppc_isync_exit ? DISAS_EXIT_UPDATE : DISAS_CHAIN_UPDATE;
 }
 
 static void gen_load_locked(DisasContext *ctx, MemOp memop)

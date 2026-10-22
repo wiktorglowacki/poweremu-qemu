@@ -19,6 +19,7 @@
 
 #define RESULTS     0x10000u
 #define EXC_SAVE    0x30000u    /* exc_handler in start.S */
+#define SMC_BUF     0x40000u
 #define ITERS       4000
 #define MAXLOG      8
 #define BENCH_ITERS 2000000
@@ -50,6 +51,7 @@ enum {
     OP_VMSUMUBM, OP_VMSUMMBM, OP_VMSUMUHM, OP_VMSUMSHM,
     OP_LVSL, OP_LVSR, OP_LVX, OP_LDU16, OP_LDU15,
     OP_VMHRADDSHS, OP_VMHADDSHS, OP_VPERM_DB, OP_DEADST_LD, OP_DEADST_CALL,
+    OP_ISYNC_SMC,
     OP_VADDFP, OP_VSUBFP, OP_VMAXFP, OP_VMINFP, OP_VMADDFP, OP_VNMSUBFP,
     OP_VREFP, OP_VCFSX, OP_VCFUX, OP_VCTSXS, OP_VCTUXS,
     NOPS
@@ -646,6 +648,30 @@ static void run_op(int op, V a, V b, V c, int sh, V *got, V *exp,
                 r.w[0] = ~e.w[0];   /* final value or interrupt count wrong */
             }
         }
+        break;
+    }
+    case OP_ISYNC_SMC: {
+        /* code that rewrites the li after its isync, in the same block */
+        static const uint32_t code[] = {
+            0x90850014,     /* stw   4,20(5) */
+            0x7c00286c,     /* dcbst 0,5 */
+            0x7c0004ac,     /* sync */
+            0x7c002fac,     /* icbi  0,5 */
+            0x4c00012c,     /* isync */
+            0x38600000,     /* li    3,0 */
+            0x4e800020,     /* blr */
+        };
+        uint32_t *buf = (uint32_t *)SMC_BUF;
+        uint32_t (*fn)(uint32_t, uint32_t, uint32_t *) = (void *)buf;
+
+        if (buf[6] != code[6]) {
+            memcpy(buf, code, sizeof(code));
+            asm volatile("dcbst 0,%0\n\tsync\n\ticbi 0,%0\n\tisync"
+                         : : "r"(buf) : "memory");
+        }
+        r.w[0] = fn(0, 0x38600000 | (a.w[0] & 0xffff), buf);
+        r.w[1] = r.w[2] = r.w[3] = 0;
+        e.w[0] = (int16_t)a.w[0];
         break;
     }
     case OP_VMSUMSHM:
