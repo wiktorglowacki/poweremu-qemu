@@ -13361,6 +13361,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
     case R200_CP_RB_RPTR:
         s->regs.cp_rb_rptr = val;
+        cp.epoch++;
         ppc_mac_gpu_rptr_writeback(s);
         gpu_debug_log("CP_RING RPTR <- %u", val);
         break;
