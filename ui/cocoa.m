@@ -606,10 +606,19 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     int h = pixman_image_get_height(pixman_image);
     int bitsPerPixel = PIXMAN_FORMAT_BPP(pixman_image_get_format(pixman_image));
     int stride = pixman_image_get_stride(pixman_image);
-    /* Copy: the layer may keep the image after the surface is replaced. */
-    CFDataRef data = CFDataCreate(NULL,
-                                  (const UInt8 *)pixman_image_get_data(pixman_image),
-                                  (CFIndex)stride * h);
+    /*
+     * Copy: the layer may keep the image after the surface is replaced.
+     * Under the BQL: a display device rewrites the surface in steps from
+     * the main loop thread (scanout rows, then the video overlay and the
+     * cursor over them), and a copy taken in between shows the overlay's
+     * colour key for a frame (MorphOS MPlayer: 0x100010, a black flash).
+     */
+    __block CFDataRef data;
+    with_bql(^{
+        data = CFDataCreate(NULL,
+                            (const UInt8 *)pixman_image_get_data(pixman_image),
+                            (CFIndex)stride * h);
+    });
     CGDataProviderRef provider = CGDataProviderCreateWithCFData(data);
     /*
      * Tag the frame with the display's own colour space: Core Animation
