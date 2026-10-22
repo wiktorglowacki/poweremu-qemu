@@ -685,13 +685,13 @@ static void tlb_flush_range_locked(CPUState *cpu, int midx,
     CPUTLBDesc *d = &cpu->neg.tlb.d[midx];
     CPUTLBDescFast *f = &cpu->neg.tlb.f[midx];
     vaddr mask = MAKE_64BIT_MASK(0, bits);
+    vaddr span = (vaddr)tlb_n_entries(f) << TARGET_PAGE_BITS;
+    vaddr aliases = mask < span ? span >> bits : 1;
 
     /*
-     * If @bits is smaller than the tlb size, there may be multiple entries
-     * within the TLB; otherwise all addresses that match under @mask hit
-     * the same TLB entry.
-     * TODO: Perhaps allow bits to be a few bits less than the size.
-     * For now, just flush the entire TLB.
+     * If @bits is smaller than the tlb size, the addresses that match
+     * under @mask sit in @aliases entries of the TLB; if it is much
+     * smaller, testing them all takes longer than flushing it all.
      *
      * If @len is larger than the tlb size, then it will take longer to
      * test all of the entries in the TLB than it will to flush it all.
@@ -719,10 +719,13 @@ static void tlb_flush_range_locked(CPUState *cpu, int midx,
 
     for (vaddr i = 0; i < len; i += TARGET_PAGE_SIZE) {
         vaddr page = addr + i;
-        CPUTLBEntry *entry = tlb_entry(cpu, midx, page);
 
-        if (tlb_flush_entry_mask_locked(entry, page, mask)) {
-            tlb_n_used_entries_dec(cpu, midx);
+        for (vaddr k = 0; k < aliases; k++) {
+            CPUTLBEntry *entry = tlb_entry(cpu, midx, page + k * (mask + 1));
+
+            if (tlb_flush_entry_mask_locked(entry, page, mask)) {
+                tlb_n_used_entries_dec(cpu, midx);
+            }
         }
         tlb_flush_vtlb_page_mask_locked(cpu, midx, page, mask);
     }
