@@ -1576,7 +1576,8 @@ static void r200_set_present_pitch(PPCMacGPUState *s, uint32_t dst_pitch)
 {
     uint32_t min = s->disp.width * ((s->disp.bpp + 7) / 8);
 
-    if (dst_pitch < min) {
+    if (dst_pitch < min ||
+        (uint64_t)dst_pitch * s->disp.height > s->vram_size - s->disp.offset) {
         static int pitch_reject_log;
         if (pitch_reject_log < 10) {
             mode_log("[STRIDE_CHANGE] ignoring BLT pitch %u for "
@@ -1748,6 +1749,9 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
     /* Validate offset + frame fits in VRAM */
     if (m->offset + (uint64_t)m->stride * m->height > s->vram_size) {
         m->offset = 0;
+    }
+    if ((uint64_t)m->stride * m->height > s->vram_size) {
+        m->height = s->vram_size / m->stride;
     }
 
     /*
