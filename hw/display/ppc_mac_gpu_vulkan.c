@@ -203,6 +203,7 @@ static struct {
     VkCommandPool cmdpool;
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
+    VkPipelineCache pipecache;
 
     /* VRAM */
     uint8_t *vram;
@@ -571,6 +572,15 @@ static bool vk_ctx_init(void)
         .pSetLayouts = &V.dsl,
     };
     VKCHECK(vkCreatePipelineLayout(V.dev, &pli, NULL, &V.layout), "vkCreatePipelineLayout");
+    {
+        const char *pce = getenv("PPCGPU_VK_PIPECACHE");
+        if (!(pce && pce[0] == '0')) {
+            VkPipelineCacheCreateInfo pcci = {
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+            };
+            vkCreatePipelineCache(V.dev, &pcci, NULL, &V.pipecache);
+        }
+    }
 
     for (int i = 0; i < VK_NBATCH; i++) {
         VkBatch *bt = &V.batch[i];
@@ -2206,27 +2216,46 @@ static bool vk_copy_2d_r200(void *opaque, uint64_t src, uint32_t src_pitch,
     }
     vk_writeback_range(src, src_hi);
     VkCommandBuffer cb = vk_transfer_begin(dst, dst_hi);
-    VkBufferCopy *r = g_new(VkBufferCopy, h);
-    if (overlap) {
-        for (uint32_t y = 0; y < h; y++) {
-            r[y] = (VkBufferCopy){ src + (uint64_t)y * src_pitch,
-                                   (uint64_t)y * row_bytes, row_bytes };
-        }
-        vkCmdCopyBuffer(cb, V.vram_buf, V.stage_buf, h, r);
-        vk_full_barrier(cb);
-        for (uint32_t y = 0; y < h; y++) {
-            r[y] = (VkBufferCopy){ (uint64_t)y * row_bytes,
-                                   dst + (uint64_t)y * dst_pitch, row_bytes };
-        }
-        vkCmdCopyBuffer(cb, V.stage_buf, V.vram_buf, h, r);
-    } else {
-        for (uint32_t y = 0; y < h; y++) {
-            r[y] = (VkBufferCopy){ src + (uint64_t)y * src_pitch,
-                                   dst + (uint64_t)y * dst_pitch, row_bytes };
-        }
-        vkCmdCopyBuffer(cb, V.vram_buf, V.vram_buf, h, r);
+    static int contig_on = -1;
+    if (contig_on < 0) {
+        const char *e = getenv("PPCGPU_VK_CONTIG_2D");
+        contig_on = !(e && e[0] == '0');
     }
-    g_free(r);
+    if (contig_on && row_bytes == src_pitch && row_bytes == dst_pitch) {
+        VkDeviceSize bytes = (VkDeviceSize)row_bytes * h;
+        if (overlap) {
+            VkBufferCopy c0 = { src, 0, bytes };
+            VkBufferCopy c1 = { 0, dst, bytes };
+            vkCmdCopyBuffer(cb, V.vram_buf, V.stage_buf, 1, &c0);
+            vk_full_barrier(cb);
+            vkCmdCopyBuffer(cb, V.stage_buf, V.vram_buf, 1, &c1);
+        } else {
+            VkBufferCopy c0 = { src, dst, bytes };
+            vkCmdCopyBuffer(cb, V.vram_buf, V.vram_buf, 1, &c0);
+        }
+    } else {
+        VkBufferCopy *r = g_new(VkBufferCopy, h);
+        if (overlap) {
+            for (uint32_t y = 0; y < h; y++) {
+                r[y] = (VkBufferCopy){ src + (uint64_t)y * src_pitch,
+                                       (uint64_t)y * row_bytes, row_bytes };
+            }
+            vkCmdCopyBuffer(cb, V.vram_buf, V.stage_buf, h, r);
+            vk_full_barrier(cb);
+            for (uint32_t y = 0; y < h; y++) {
+                r[y] = (VkBufferCopy){ (uint64_t)y * row_bytes,
+                                       dst + (uint64_t)y * dst_pitch, row_bytes };
+            }
+            vkCmdCopyBuffer(cb, V.stage_buf, V.vram_buf, h, r);
+        } else {
+            for (uint32_t y = 0; y < h; y++) {
+                r[y] = (VkBufferCopy){ src + (uint64_t)y * src_pitch,
+                                       dst + (uint64_t)y * dst_pitch, row_bytes };
+            }
+            vkCmdCopyBuffer(cb, V.vram_buf, V.vram_buf, h, r);
+        }
+        g_free(r);
+    }
     vk_full_barrier(cb);
     vk_note_read(src, src_hi);
     vk_gpu_wrote(dst, dst_hi);
@@ -2576,7 +2605,7 @@ static VkPipeline vk_pipeline(const char *glsl, uint32_t glsl_id,
         .subpass = 0,
     };
     VkPipeVar pv = { *key, VK_NULL_HANDLE };
-    if (vkCreateGraphicsPipelines(V.dev, VK_NULL_HANDLE, 1, &gci, NULL, &pv.pipe) != VK_SUCCESS) {
+    if (vkCreateGraphicsPipelines(V.dev, V.pipecache, 1, &gci, NULL, &pv.pipe) != VK_SUCCESS) {
         vk_warn(1u << 1, "pipeline creation failed");
         return VK_NULL_HANDLE;
     }

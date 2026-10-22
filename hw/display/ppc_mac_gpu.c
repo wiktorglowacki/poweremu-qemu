@@ -3055,15 +3055,39 @@ static void ppc_mac_gpu_display_update_inner(void *opaque)
          * double-buffered desktop differs only where it was redrawn, and
          * uploading just those rows is what saves the UI's time.
          */
+        static int flip_scan = -1;
+        if (flip_scan < 0) {
+            const char *e = getenv("PPCGPU_FLIP_SCAN");
+            flip_scan = !(e && e[0] == '0');
+        }
         partial = true;
         for (int y = 0; y < (int)height; y++) {
             if (memcmp(s->shadow_buf + (uint64_t)y * stride,
                        vram_ptr + s->disp.offset + (uint64_t)y * stride,
                        width * 4)) {
-                if (lo < 0) {
-                    lo = y;
-                }
+                lo = y;
                 hi = y + 1;
+                break;
+            }
+        }
+        if (lo >= 0) {
+            if (flip_scan) {
+                for (int y = (int)height - 1; y > lo; y--) {
+                    if (memcmp(s->shadow_buf + (uint64_t)y * stride,
+                               vram_ptr + s->disp.offset + (uint64_t)y * stride,
+                               width * 4)) {
+                        hi = y + 1;
+                        break;
+                    }
+                }
+            } else {
+                for (int y = lo + 1; y < (int)height; y++) {
+                    if (memcmp(s->shadow_buf + (uint64_t)y * stride,
+                               vram_ptr + s->disp.offset + (uint64_t)y * stride,
+                               width * 4)) {
+                        hi = y + 1;
+                    }
+                }
             }
         }
     }
