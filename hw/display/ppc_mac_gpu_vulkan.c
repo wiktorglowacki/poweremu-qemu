@@ -1544,6 +1544,16 @@ static bool vk_tile_init(void)
     return true;
 }
 
+static bool vk_zstage(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_VK_ZSTAGE");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
 /* The staging buffer (device local) and the descriptor set over it. */
 static bool vk_tile_staging(VkDeviceSize need)
 {
@@ -1595,7 +1605,7 @@ static bool vk_tile_staging(VkDeviceSize need)
         return false;
     }
     VkDescriptorBufferInfo bi[2] = {
-        { V.zs_buf, 0, VK_WHOLE_SIZE },
+        { vk_zstage() ? V.zs_buf : V.vram_buf, 0, VK_WHOLE_SIZE },
         { V.tile_buf, 0, VK_WHOLE_SIZE },
     };
     VkWriteDescriptorSet w[2];
@@ -1616,6 +1626,9 @@ static bool vk_tile_staging(VkDeviceSize need)
 static uint64_t vk_zs_copy(VkCommandBuffer cb, const VkImg *im, uint32_t y, uint32_t h,
                            uint32_t band, bool to_vram)
 {
+    if (!vk_zstage()) {
+        return 0;
+    }
     uint64_t lo = im->addr + (uint64_t)(y / band) * band * im->pitch;
     uint64_t hi = MIN(im->addr + (uint64_t)ROUND_UP(y + h, band) * im->pitch, V.vram_size);
     VkBufferCopy c = { to_vram ? 0 : lo, to_vram ? lo : 0, hi - lo };
