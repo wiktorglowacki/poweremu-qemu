@@ -10681,7 +10681,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                  * d[0] = IB base address (GPU/AGP address)
                  * d[1] = IB size in dwords
                  */
-                if (body_dw >= 2) {
+                if (body_dw >= 2 && g_in_pm4 < 4) {
                     uint32_t sub_ib_base = d[0];
                     uint32_t sub_ib_size = d[1] & 0xFFFFF;
                     gpu_debug_log("PM4_IB_DISPATCH base=0x%x size=%u dw",
