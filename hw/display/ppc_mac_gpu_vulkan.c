@@ -2519,6 +2519,7 @@ static VkPipeline vk_pipeline(const char *glsl, uint32_t glsl_id,
     /* The GLSL memo's ids never repeat, so a hit by id skips hashing the
      * whole program text on every draw (that was 2-3% of the GPU thread). */
     VkProg *pg = glsl_id ? g_hash_table_lookup(V.progs_by_id, GUINT_TO_POINTER(glsl_id)) : NULL;
+    g_autofree char *fetched = NULL;
 
     if (!pg) {
         pg = g_hash_table_lookup(V.progs, glsl);
@@ -2527,6 +2528,13 @@ static VkPipeline vk_pipeline(const char *glsl, uint32_t glsl_id,
         }
     }
     if (!pg) {
+        if (!*glsl) {
+            fetched = r300_us_glsl_by_id(glsl_id);
+            if (!fetched) {
+                return VK_NULL_HANDLE;
+            }
+            glsl = fetched;
+        }
         pg = g_new0(VkProg, 1);
         pg->pipes = g_array_new(FALSE, FALSE, sizeof(VkPipeVar));
         g_hash_table_insert(V.progs, g_strdup(glsl), pg);
@@ -2555,8 +2563,16 @@ static VkPipeline vk_pipeline(const char *glsl, uint32_t glsl_id,
             return pv->pipe;
         }
     }
+    int fst = key->z ? R300_STAGE_FS_Z : R300_STAGE_FS;
+    if (!*glsl && ((!key->vs_mod && !pg->mod[R300_STAGE_VS]) || !pg->mod[fst])) {
+        fetched = r300_us_glsl_by_id(glsl_id);
+        if (!fetched) {
+            return VK_NULL_HANDLE;
+        }
+        glsl = fetched;
+    }
     VkShaderModule vs = key->vs_mod ? key->vs_mod : vk_module(pg, glsl, R300_STAGE_VS);
-    VkShaderModule fs = vk_module(pg, glsl, key->z ? R300_STAGE_FS_Z : R300_STAGE_FS);
+    VkShaderModule fs = vk_module(pg, glsl, fst);
     if (!vs || !fs) {
         return VK_NULL_HANDLE;
     }
@@ -3864,7 +3880,7 @@ static bool vk_compose_overlay(void *opaque, const PPCMacGPUOverlayParams *p)
 
 static PPCMacGPURenderer vulkan_renderer = {
     .name             = "vulkan",
-    .r300_glsl_flags  = R300_GLSL_VRAM_SSBO | R300_GLSL_GPU_VS,
+    .r300_glsl_flags  = R300_GLSL_VRAM_SSBO | R300_GLSL_GPU_VS | R300_GLSL_TEXT_BY_ID,
     .init             = vk_init,
     .fini             = vk_fini,
     .draw_r300        = vk_draw_r300,

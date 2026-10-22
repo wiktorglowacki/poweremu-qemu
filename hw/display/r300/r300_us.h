@@ -126,6 +126,9 @@ enum {
                                                buffer, not a uint texture view */
 #define R300_GLSL_GPU_VS        (1u << 1)   /* the renderer runs vertex programs
                                                (r300_draw.h vs_glsl) */
+#define R300_GLSL_TEXT_BY_ID    (1u << 2)   /* r300_us_glsl_cached() hits return
+                                               "" and the renderer fetches the
+                                               text with r300_us_glsl_by_id() */
 
 /*
  * Build the GLSL source for the current US program.  It compiles as three
@@ -150,6 +153,8 @@ char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
  */
 char *r300_us_glsl_cached(const R300State *st, const R300FSDesc *desc,
                           uint32_t flags, uint32_t *id, const char **err);
+char *r300_us_glsl_by_id(uint32_t id);              /* malloc'd copy, or NULL */
+bool r300_us_glsl_writes_w(uint32_t id, const char *glsl);
 
 /*
  * Texture formats (TX_FORMAT1.TXFORMAT) the shader decodes itself from the

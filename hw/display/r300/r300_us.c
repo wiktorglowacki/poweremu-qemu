@@ -1675,6 +1675,7 @@ typedef struct USMemo {
     uint16_t *idx;
     uint32_t *val;
     char *glsl;
+    bool writes_w;
 } USMemo;
 
 #define US_MEMO_SLOTS 64
@@ -1707,7 +1708,7 @@ char *r300_us_glsl_cached(const R300State *st, const R300FSDesc *desc,
             us_memo[0] = hit;
             *id = hit.id;
             *err = NULL;
-            return strdup(hit.glsl);
+            return strdup(flags & R300_GLSL_TEXT_BY_ID ? "" : hit.glsl);
         }
     }
 
@@ -1739,7 +1740,32 @@ char *r300_us_glsl_cached(const R300State *st, const R300FSDesc *desc,
         m->val[i] = st->regs[us_rec.idx[i]];
     }
     m->glsl = strdup(glsl);
+    m->writes_w = strstr(glsl, "ow = ar") != NULL;
     m->id = us_memo_next_id++;
     *id = m->id;
     return glsl;
+}
+
+static const USMemo *us_memo_by_id(uint32_t id)
+{
+    for (unsigned k = 0; id && k < US_MEMO_SLOTS; k++) {
+        if (us_memo[k].glsl && us_memo[k].id == id) {
+            return &us_memo[k];
+        }
+    }
+    return NULL;
+}
+
+char *r300_us_glsl_by_id(uint32_t id)
+{
+    const USMemo *m = us_memo_by_id(id);
+
+    return m ? strdup(m->glsl) : NULL;
+}
+
+bool r300_us_glsl_writes_w(uint32_t id, const char *glsl)
+{
+    const USMemo *m = us_memo_by_id(id);
+
+    return m ? m->writes_w : glsl && strstr(glsl, "ow = ar");
 }
