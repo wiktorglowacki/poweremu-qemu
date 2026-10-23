@@ -60,6 +60,7 @@ struct ScreamerState {
     int64_t pace_last, pace_frac, pace_idle;
     int tx_carry, rx_carry;
     bool primed;                  /* jitter buffer filled, output running */
+    uint32_t prime_ms;
 
     uint32_t bpos;
     uint32_t ppos;

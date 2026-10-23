@@ -360,7 +360,7 @@ static void screamerspk_callback(void *opaque, int free_b)
         return;
     }
     if (!s->primed) {
-        if (s->wpos - s->rpos < s->rate * SCREAMER_PRIME_MS / 1000) {
+        if (s->wpos - s->rpos < s->rate * s->prime_ms / 1000) {
             return;
         }
         s->primed = true;
@@ -627,6 +627,7 @@ static void screamer_initfn(Object *obj)
 
 static const Property screamer_properties[] = {
     DEFINE_AUDIO_PROPERTIES(ScreamerState, card),
+    DEFINE_PROP_UINT32("prime-ms", ScreamerState, prime_ms, SCREAMER_PRIME_MS),
 };
 
 static void screamer_class_init(ObjectClass *oc, void *data)
