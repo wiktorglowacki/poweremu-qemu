@@ -372,6 +372,7 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
     sbd = SYS_BUS_DEVICE(&ns->i2s);
     memory_region_add_subregion(&s->bar, 0x10000, sysbus_mmio_get_region(sbd, 0));
     sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, NEWWORLD_I2S_TX_DMA_IRQ));
+    sysbus_connect_irq(sbd, 2, qdev_get_gpio_in(pic_dev, NEWWORLD_I2S_RX_DMA_IRQ));
     macio_screamer_register_dma(SCREAMER(sbd), &s->dbdma, 0x0, 0x2);
 }
 

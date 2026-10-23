@@ -184,6 +184,18 @@ static void screamer_pace_cb(void *opaque)
     due = MIN(due, (int64_t)s->rate / 20);    /* at most 50 ms after a stall */
 
     int moved = 0;
+    for (int64_t left = due; left > 0 && s->rx_io.len;) {
+        int n = MIN(left, s->rx_io.len >> s->shift);
+        dma_memory_set(&address_space_memory, s->rx_io.addr, 0, n << s->shift,
+                       MEMTXATTRS_UNSPECIFIED);
+        s->rx_io.addr += n << s->shift;
+        s->rx_io.len -= n << s->shift;
+        left -= n;
+        moved += n;
+        if (!s->rx_io.len) {
+            s->rx_io.dma_end(&s->rx_io);
+        }
+    }
     while (due > 0 && s->io.len) {
         int n = pmac_screamer_tx_transfer(s, due);
         if (n == 0) {
@@ -203,6 +215,16 @@ static void screamer_pace_cb(void *opaque)
     timer_mod(s->pace_timer, now + SCREAMER_PACE_NS);
 }
 
+static void screamer_pace_start(ScreamerState *s)
+{
+    s->pace_idle = 0;
+    if (!timer_pending(s->pace_timer)) {
+        s->pace_last = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        s->pace_frac = 0;
+        timer_mod(s->pace_timer, s->pace_last + SCREAMER_PACE_NS);
+    }
+}
+
 static void pmac_screamer_tx(DBDMA_io *io)
 {
     ScreamerState *s = io->opaque;
@@ -211,12 +233,7 @@ static void pmac_screamer_tx(DBDMA_io *io)
                      " len: %x\n", io->addr, io->len);
 
     memcpy(&s->io, io, sizeof(DBDMA_io));
-    s->pace_idle = 0;
-    if (!timer_pending(s->pace_timer)) {
-        s->pace_last = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-        s->pace_frac = 0;
-        timer_mod(s->pace_timer, s->pace_last + SCREAMER_PACE_NS);
-    }
+    screamer_pace_start(s);
 }
 
 static void pmac_screamer_tx_flush(DBDMA_io *io)
@@ -287,13 +304,32 @@ static void pmac_screamer_rx_flush(DBDMA_io *io)
 #endif
 }
 
+static void pmac_i2s_rx(DBDMA_io *io)
+{
+    ScreamerState *s = io->opaque;
+
+    s->rx_io = *io;
+    screamer_pace_start(s);
+}
+
+static void pmac_i2s_rx_flush(DBDMA_io *io)
+{
+    ScreamerState *s = io->opaque;
+
+    s->rx_io.len = 0;
+    pmac_screamer_rx_flush(io);
+}
+
 void macio_screamer_register_dma(ScreamerState *s, void *dbdma, int txchannel, int rxchannel)
 {
+    bool i2s = object_dynamic_cast(OBJECT(s), TYPE_MAC_I2S);
+
     s->dbdma = dbdma;
     DBDMA_register_channel(dbdma, txchannel, s->dma_tx_irq,
                            pmac_screamer_tx, pmac_screamer_tx_flush, s);
     DBDMA_register_channel(dbdma, rxchannel, s->dma_rx_irq,
-                           pmac_screamer_rx, pmac_screamer_rx_flush, s);
+                           i2s ? pmac_i2s_rx : pmac_screamer_rx,
+                           i2s ? pmac_i2s_rx_flush : pmac_screamer_rx_flush, s);
 }
 
 static void screamerspk_callback(void *opaque, int free_b)
@@ -393,6 +429,7 @@ static void screamer_reset(DeviceState *dev)
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->codec_ctrl_regs, 0, sizeof(s->codec_ctrl_regs));
     memset(&s->io, 0, sizeof(DBDMA_io));
+    memset(&s->rx_io, 0, sizeof(DBDMA_io));
 
     s->rate = 44100;
     screamer_update_settings(s);

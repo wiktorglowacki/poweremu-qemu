@@ -64,6 +64,7 @@ struct ScreamerState {
     uint32_t ppos;
     uint32_t rate;
     DBDMA_io io;
+    DBDMA_io rx_io;
 
     uint32_t regs[6];
     uint32_t codec_ctrl_regs[8];

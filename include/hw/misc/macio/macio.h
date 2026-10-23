@@ -66,6 +66,7 @@
 #define NEWWORLD_SCREAMER_DMA_IRQ 0x09
 #define NEWWORLD_SCREAMER_RX_IRQ 0x0a
 #define NEWWORLD_I2S_TX_DMA_IRQ 0x01
+#define NEWWORLD_I2S_RX_DMA_IRQ 0x02
 
 /* MacIO virtual bus */
 #define TYPE_MACIO_BUS "macio-bus"
