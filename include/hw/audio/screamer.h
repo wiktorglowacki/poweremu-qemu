@@ -32,6 +32,7 @@
 #include "audio/audio.h"
 
 #define TYPE_SCREAMER "screamer"
+#define TYPE_MAC_I2S "mac-i2s"
 OBJECT_DECLARE_SIMPLE_TYPE(ScreamerState, SCREAMER)
 
 #define SCREAMER_BUFFER_SIZE 0x4000

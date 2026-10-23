@@ -65,6 +65,7 @@
 #define NEWWORLD_SCREAMER_IRQ  0x18
 #define NEWWORLD_SCREAMER_DMA_IRQ 0x09
 #define NEWWORLD_SCREAMER_RX_IRQ 0x0a
+#define NEWWORLD_I2S_TX_DMA_IRQ 0x01
 
 /* MacIO virtual bus */
 #define TYPE_MACIO_BUS "macio-bus"
@@ -151,6 +152,7 @@ struct NewWorldMacIOState {
 
     MACIOIDEState ide[2];
     MacIOGPIOState gpio;
+    ScreamerState i2s;
 };
 
 #endif /* MACIO_H */

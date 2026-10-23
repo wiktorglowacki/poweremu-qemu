@@ -364,6 +364,15 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
     sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, NEWWORLD_SCREAMER_DMA_IRQ));
     sysbus_connect_irq(sbd, 2, qdev_get_gpio_in(pic_dev, NEWWORLD_SCREAMER_RX_IRQ));
     macio_screamer_register_dma(SCREAMER(sbd), &s->dbdma, 0x10, 0x12);
+
+    /* Keylargo I2S cell, i2s-a: same transport as the screamer */
+    if (!qdev_realize(DEVICE(&ns->i2s), BUS(&s->macio_bus), errp)) {
+        return;
+    }
+    sbd = SYS_BUS_DEVICE(&ns->i2s);
+    memory_region_add_subregion(&s->bar, 0x10000, sysbus_mmio_get_region(sbd, 0));
+    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, NEWWORLD_I2S_TX_DMA_IRQ));
+    macio_screamer_register_dma(SCREAMER(sbd), &s->dbdma, 0x0, 0x1);
 }
 
 static void macio_newworld_init(Object *obj)
@@ -375,6 +384,7 @@ static void macio_newworld_init(Object *obj)
     object_initialize_child(obj, "pic", &ns->pic, TYPE_OPENPIC);
 
     object_initialize_child(obj, "gpio", &ns->gpio, TYPE_MACIO_GPIO);
+    object_initialize_child(obj, "i2s", &ns->i2s, TYPE_MAC_I2S);
 
     for (i = 0; i < 2; i++) {
         macio_init_ide(s, &ns->ide[i], i);

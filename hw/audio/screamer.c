@@ -599,9 +599,15 @@ static const TypeInfo screamer_type_info = {
     .class_init = screamer_class_init,
 };
 
+static const TypeInfo mac_i2s_type_info = {
+    .name = TYPE_MAC_I2S,
+    .parent = TYPE_SCREAMER,
+};
+
 static void screamer_register_types(void)
 {
     type_register_static(&screamer_type_info);
+    type_register_static(&mac_i2s_type_info);
 }
 
 type_init(screamer_register_types)
