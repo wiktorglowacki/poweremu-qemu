@@ -95,7 +95,9 @@ void sdl2_window_create(struct sdl2_console *scon)
     }
 #ifdef CONFIG_OPENGL
     if (scon->opengl) {
-        flags |= SDL_WINDOW_OPENGL;
+        /* a drawable in output pixels on scaled Wayland outputs; the
+         * window keeps the guest's size in window units */
+        flags |= SDL_WINDOW_OPENGL | SDL_WINDOW_ALLOW_HIGHDPI;
     }
 #endif
 
@@ -319,6 +321,27 @@ static void sdl_send_mouse_event(struct sdl2_console *scon, int dx, int dy,
     }
 
     if (qemu_input_is_absolute(scon->dcl.con)) {
+#ifdef CONFIG_OPENGL
+        /* window units to guest pixels through the fitted picture of a
+         * resized or full-screen GL window (the 2D path's logical renderer
+         * size does this already; a scanout is stretched to the window) */
+        if (scon->opengl) {
+            int gw = surface_width(scon->surface);
+            int gh = surface_height(scon->surface);
+            int ww, wh, vx = 0, vy = 0, vw, vh;
+
+            SDL_GetWindowSize(scon->real_window, &ww, &wh);
+            vw = ww;
+            vh = wh;
+            if (!scon->scanout_mode) {
+                surface_gl_fit(gw, gh, ww, wh, &vx, &vy, &vw, &vh);
+            }
+            if (vw > 0 && vh > 0) {
+                x = MIN(MAX((int64_t)(x - vx) * gw / vw, 0), gw - 1);
+                y = MIN(MAX((int64_t)(y - vy) * gh / vh, 0), gh - 1);
+            }
+        }
+#endif
         qemu_input_queue_abs(scon->dcl.con, INPUT_AXIS_X,
                              x, 0, surface_width(scon->surface));
         qemu_input_queue_abs(scon->dcl.con, INPUT_AXIS_Y,

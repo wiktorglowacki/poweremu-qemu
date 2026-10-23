@@ -438,6 +438,8 @@ void surface_gl_destroy_texture(QemuGLShader *gls,
 void surface_gl_setup_viewport(QemuGLShader *gls,
                                DisplaySurface *surface,
                                int ww, int wh);
+void surface_gl_fit(int gw, int gh, int ww, int wh,
+                    int *x, int *y, int *w, int *h);
 #endif
 
 typedef struct QemuDisplay QemuDisplay;

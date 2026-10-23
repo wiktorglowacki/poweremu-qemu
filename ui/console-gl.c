@@ -94,13 +94,29 @@ void surface_gl_create_texture(QemuGLShader *gls,
     }
 
     /* $QEMU_GL_FILTER=nearest: unfiltered scaling (crisp at integer
-     * ratios, e.g. a 1920x1080 guest on a 3840x2160 monitor) */
+     * ratios, e.g. a 1920x1080 guest on a 3840x2160 monitor); "auto"
+     * switches per frame in surface_gl_setup_viewport */
     {
         const char *f = getenv("QEMU_GL_FILTER");
         GLint filter = f && !strcmp(f, "nearest") ? GL_NEAREST : GL_LINEAR;
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
     }
+}
+
+/* The guest picture fitted into a ww x wh window, aspect kept, centred. */
+void surface_gl_fit(int gw, int gh, int ww, int wh,
+                    int *x, int *y, int *w, int *h)
+{
+    if ((int64_t)ww * gh < (int64_t)wh * gw) {
+        *w = ww;
+        *h = (int64_t)ww * gh / gw;
+    } else {
+        *w = (int64_t)wh * gw / gh;
+        *h = wh;
+    }
+    *x = (ww - *w) / 2;
+    *y = (wh - *h) / 2;
 }
 
 void surface_gl_update_texture(QemuGLShader *gls,
@@ -149,21 +165,25 @@ void surface_gl_setup_viewport(QemuGLShader *gls,
                                DisplaySurface *surface,
                                int ww, int wh)
 {
-    int gw, gh, stripe;
-    float sw, sh;
+    int gw, gh, x, y, w, h;
+    const char *f;
 
     assert(gls);
 
     gw = surface_width(surface);
     gh = surface_height(surface);
 
-    sw = (float)ww/gw;
-    sh = (float)wh/gh;
-    if (sw < sh) {
-        stripe = wh - wh*sw/sh;
-        glViewport(0, stripe / 2, ww, wh - stripe);
-    } else {
-        stripe = ww - ww*sh/sw;
-        glViewport(stripe / 2, 0, ww - stripe, wh);
+    /* integer fit: a 1440x900 guest in 2880x1920 gets exactly 2880x1800 */
+    surface_gl_fit(gw, gh, ww, wh, &x, &y, &w, &h);
+    glViewport(x, y, w, h);
+
+    /* $QEMU_GL_FILTER=auto: nearest at whole-number ratios (1:1, 2x, ...),
+     * linear in between */
+    f = getenv("QEMU_GL_FILTER");
+    if (f && !strcmp(f, "auto") && surface->texture) {
+        GLint filter = w % gw == 0 && h % gh == 0 ? GL_NEAREST : GL_LINEAR;
+        glBindTexture(GL_TEXTURE_2D, surface->texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
     }
 }
