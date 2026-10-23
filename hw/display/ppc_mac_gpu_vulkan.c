@@ -1472,11 +1472,11 @@ static const char vk_zconv_main[] =
 
 static bool vk_tile_init(void)
 {
-    if (V.tile_pipe) {
-        return true;
-    }
     if (V.tile_failed) {
         return false;
+    }
+    if (V.tile_pipe) {
+        return true;
     }
     VkDescriptorSetLayoutBinding b[2] = {
         { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
@@ -1561,17 +1561,13 @@ static bool vk_tile_staging(VkDeviceSize need)
         return true;
     }
     if (V.tile_buf) {
-        vkDeviceWaitIdle(V.dev);
-        vkDestroyDescriptorPool(V.dev, V.tile_pool, NULL);
-        vkDestroyBuffer(V.dev, V.tile_buf, NULL);
-        vkFreeMemory(V.dev, V.tile_mem, NULL);
-        vkDestroyBuffer(V.dev, V.zs_buf, NULL);
-        vkFreeMemory(V.dev, V.zs_mem, NULL);
-        V.tile_pool = VK_NULL_HANDLE;
-        V.tile_set = VK_NULL_HANDLE;
+        vk_trash(NULL, TRASH_BUF, (uint64_t)(uintptr_t)V.tile_buf);
+        vk_trash(NULL, TRASH_MEM, (uint64_t)(uintptr_t)V.tile_mem);
+        vk_trash(NULL, TRASH_BUF, (uint64_t)(uintptr_t)V.zs_buf);
+        vk_trash(NULL, TRASH_MEM, (uint64_t)(uintptr_t)V.zs_mem);
         V.tile_buf = VK_NULL_HANDLE;
     }
-    VkDeviceSize size = MAX(need, (VkDeviceSize)16 << 20);
+    VkDeviceSize size = MAX(pow2ceil(need), (VkDeviceSize)16 << 20);
     VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     if (!vk_buffer(size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
@@ -1583,10 +1579,10 @@ static bool vk_tile_staging(VkDeviceSize need)
         return false;
     }
     V.tile_size = size;
-    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 };
+    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 };
     VkDescriptorPoolCreateInfo pci = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 1,
+        .maxSets = 8,
         .poolSizeCount = 1,
         .pPoolSizes = &ps,
     };
@@ -1595,7 +1591,7 @@ static bool vk_tile_staging(VkDeviceSize need)
         .descriptorSetCount = 1,
         .pSetLayouts = &V.tile_dsl,
     };
-    if (vkCreateDescriptorPool(V.dev, &pci, NULL, &V.tile_pool) != VK_SUCCESS) {
+    if (!V.tile_pool && vkCreateDescriptorPool(V.dev, &pci, NULL, &V.tile_pool) != VK_SUCCESS) {
         V.tile_failed = true;
         return false;
     }
