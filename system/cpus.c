@@ -554,6 +554,7 @@ void rust_bql_mock_lock(void)
  * thread took the BQL, how often it found it held, how long it waited
  * for it and how long it held it (condition waits not counted).
  */
+static unsigned bql_waiters;
 static int bql_stats = -1;
 static __thread struct {
     uint64_t n, waits;
@@ -601,10 +602,17 @@ void bql_lock_impl(const char *file, int line)
             bql_st.t_acq = t0;
         }
         bql_st.n++;
-    } else {
+    } else if (qemu_mutex_trylock(&bql)) {
+        qatomic_inc(&bql_waiters);
         bql_lock_fn(&bql, file, line);
+        qatomic_dec(&bql_waiters);
     }
     set_bql_locked(true);
+}
+
+bool bql_contended(void)
+{
+    return qatomic_read(&bql_waiters) != 0;
 }
 
 void bql_unlock(void)

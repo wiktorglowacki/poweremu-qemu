@@ -35,6 +35,7 @@
 #include "qemu/datadir.h"
 #include "qemu/rcu.h"
 #include "qemu/main-loop.h"
+#include "qemu/processor.h"
 #include "hw/pci/pci_device.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
@@ -461,6 +462,8 @@ static struct {
     uint32_t ring_mask;
     unsigned pkts;
     int64_t yield_at;
+    bool handoff;
+    int slice_us;
     /* Statistics (BQL): catch-ups the guest forced, by register. */
     uint32_t syncs, kicks;
     uint16_t sync_reg[0x10000 / 4];
@@ -10870,6 +10873,15 @@ static bool ppc_mac_gpu_cp_on_thread(void)
  * true if the ring was taken over while the lock was released, in which
  * case the rest of this segment has been (or will be) run by someone else.
  */
+static void ppc_mac_gpu_cp_handoff(void)
+{
+    int64_t until = g_get_monotonic_time() + 200;
+
+    while (cp.handoff && bql_contended() && g_get_monotonic_time() < until) {
+        cpu_relax();
+    }
+}
+
 static bool ppc_mac_gpu_cp_yield(PPCMacGPUState *s, uint32_t pos_dw)
 {
     int64_t now;
@@ -10893,6 +10905,7 @@ static bool ppc_mac_gpu_cp_yield(PPCMacGPUState *s, uint32_t pos_dw)
     g_in_pm4 = 0;
     cp_in_ring = false;
     bql_unlock();
+    ppc_mac_gpu_cp_handoff();
     bql_lock();
     g_in_pm4 = nest;
     if (cp.epoch != epoch) {
@@ -10900,7 +10913,7 @@ static bool ppc_mac_gpu_cp_yield(PPCMacGPUState *s, uint32_t pos_dw)
         return true;
     }
     cp_in_ring = true;
-    cp.yield_at = g_get_monotonic_time() + CP_SLICE_US;
+    cp.yield_at = g_get_monotonic_time() + cp.slice_us;
     return false;
 }
 
@@ -11120,6 +11133,7 @@ static void *ppc_mac_gpu_cp_thread(void *opaque)
             qatomic_read(&s->regs.cp_rb_rptr)) {
             int64_t t0 = cps_on() ? get_clock() : 0;
             qatomic_set(&cp.running, true);
+            ppc_mac_gpu_cp_handoff();
             bql_lock();
             if (t0) {
                 int64_t t1 = get_clock(), k = cps.kick_ns;
@@ -11130,7 +11144,7 @@ static void *ppc_mac_gpu_cp_thread(void *opaque)
                 cps.kick_ns = 0;
                 cps.runs++;
             }
-            cp.yield_at = g_get_monotonic_time() + CP_SLICE_US;
+            cp.yield_at = g_get_monotonic_time() + cp.slice_us;
             ppc_mac_gpu_cp_run(s);
             if (t0) {
                 cps.run_ns += get_clock() - t0;
@@ -11257,6 +11271,9 @@ static void ppc_mac_gpu_cp_start(PPCMacGPUState *s)
     cp.steal = !(e && e[0] == '0');
     e = getenv("PPCGPU_CP_STEAL_MAX");
     cp.steal_max = e ? strtoul(e, NULL, 0) : 64;
+    e = getenv("PPCGPU_CP_HANDOFF");
+    cp.handoff = !(e && e[0] == '0');
+    cp.slice_us = cp.handoff ? 500 : CP_SLICE_US;
     e = getenv("PPCGPU_CP_WPTR_SYNC");
     cp.wptr_sync = cp.steal && !(e && e[0] == '0');
     qemu_event_init(&cp.kick, false);

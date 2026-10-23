@@ -270,6 +270,8 @@ void rust_bql_mock_lock(void);
  */
 bool bql_locked(void);
 
+bool bql_contended(void);
+
 /**
  * bql_block: Allow/deny releasing the BQL
  *
