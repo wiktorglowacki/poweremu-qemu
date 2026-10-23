@@ -21,6 +21,10 @@
  *    stamp the pages they touch; an image whose range holds a newer
  *    stamp than its own is stale and copied from VRAM before use, after
  *    any image holding newer contents of that range is written back.
+ *    A colour buffer keeps the stale rows as rectangles instead and loads
+ *    only the part of them a draw renders into (vk_st_load): MorphOS's
+ *    compositor blits each 64-row band of a window on the CPU and then
+ *    draws only the borders over it.
  *  - What a batch renders is written back to VRAM at the end of the
  *    batch, so completed work is in VRAM as the device expects (fences,
  *    scanout, CPU reads after flush_r200).  Only the rectangles draws
@@ -72,6 +76,8 @@
 #define VK_MAX_DR           8       /* dirty rectangles per image */
 #define VK_OVL_KINDS        17      /* vk_overlap(): kinds of draw */
 #define VK_OVL_PIXELS       (1u << 22)
+#define VK_MAX_ST           16      /* stale rectangles per colour buffer */
+#define VK_ST_LOADS         2       /* ... loaded in part per batch (vk_st_load) */
 
 static char vk_err[256];
 
@@ -144,6 +150,9 @@ typedef struct VkImg {
     bool dirty;                 /* rendered into since its last write-back */
     uint32_t ndr;               /* ... in these rectangles (x0, y0, x1, y1) */
     uint32_t dr[VK_MAX_DR][4];
+    uint32_t nst;               /* colour buffer: VRAM is newer in these, */
+    uint32_t st[VK_MAX_ST][4];  /* ... loaded when a draw needs them (vk_st_load) */
+    uint32_t st_seq, st_loads;  /* ... so far in batch st_seq */
     uint64_t used;
     uint64_t hash;              /* PPCGPU_VK_CHECK: VRAM bytes when loaded, or 0 */
     bool z;                     /* last bound as a depth buffer */
@@ -1882,10 +1891,33 @@ static void vk_zconv(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0,
     }
 }
 
+static inline bool vk_rect_meets(const uint32_t *a, const uint32_t *b)
+{
+    return a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3];
+}
+
+/* PPCGPU_VK_CHECK=1: a and b, rectangles of im, must not meet. */
+static void vk_check_apart(const VkImg *im, const uint32_t *a, const uint32_t *b,
+                           const char *what)
+{
+    static int n;
+    if (vk_rect_meets(a, b) && n++ < 100) {
+        qemu_log("ppc-mac-gpu vulkan CHECK: %s: %06x %ux%u, %u,%u-%u,%u meets %u,%u-%u,%u\n",
+                 what, im->addr, im->width, im->height, a[0], a[1], a[2], a[3],
+                 b[0], b[1], b[2], b[3]);
+    }
+}
+
 static void vk_copy_to_vram_nb(VkImg *im)
 {
     VkCommandBuffer cb = vk_batch()->cb;
     VkBufferImageCopy r[VK_MAX_DR];
+
+    for (uint32_t i = 0; vk_check() && i < im->ndr; i++) {
+        for (uint32_t j = 0; j < im->nst; j++) {
+            vk_check_apart(im, im->dr[i], im->st[j], "write-back of a stale rectangle");
+        }
+    }
 
     for (uint32_t i = 0; i < im->ndr; i++) {
         r[i] = vk_region(im, im->dr[i][0], im->dr[i][1], im->dr[i][2], im->dr[i][3]);
@@ -1924,15 +1956,21 @@ static void vk_copy_to_vram(VkImg *im)
     vk_full_barrier(vk_batch()->cb);
 }
 
-/* Write back every image with rendering newer than VRAM in [lo, hi). */
-static void vk_writeback_range(uint64_t lo, uint64_t hi)
+/* Write back every image but skip with rendering newer than VRAM in [lo, hi). */
+static void vk_writeback_others(uint64_t lo, uint64_t hi, const VkImg *skip)
 {
     for (int i = 0; i < VK_MAX_IMG; i++) {
         VkImg *im = &V.img[i];
-        if (im->live && im->dirty && lo < vk_img_hi(im) && im->addr < hi) {
+        if (im != skip && im->live && im->dirty && lo < vk_img_hi(im) && im->addr < hi) {
             vk_copy_to_vram(im);
         }
     }
+}
+
+/* Write back every image with rendering newer than VRAM in [lo, hi). */
+static void vk_writeback_range(uint64_t lo, uint64_t hi)
+{
+    vk_writeback_others(lo, hi, NULL);
 }
 
 static void vk_img_free(VkImg *im)
@@ -2153,15 +2191,268 @@ static bool vk_rt_grow(void)
 }
 
 /*
+ * PPCGPU_VK_RT_LAZY=0: a colour buffer reloads every row that VRAM holds
+ * newer as soon as a draw binds it (A/B).  By default those rows become
+ * stale rectangles of the image (VkImg.st), and a draw loads only their
+ * part inside the dirty rectangle it will be written back with.  MorphOS
+ * composites a window in 64-row bands: the 2D engine copies a band and the
+ * next one's background (on the CPU, the GPU being idle), four draws put
+ * the borders and the shadow on them, and the driver waits for idle before
+ * the next band.  Every band reloaded 128 whole rows of the screen (737 KB
+ * at 1440x900) for draws covering about 2,000 pixels, in a batch the vCPU
+ * then waited for.
+ */
+static bool vk_rt_lazy(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_VK_RT_LAZY");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/*
+ * The dirty rectangle vk_img_written keeps rectangle r (x0, y0, x1, y1) of
+ * im in: its index in im->dr (im->ndr for a new one), and in out the
+ * rectangle it becomes; -1 if r is empty inside the image.
+ */
+static int vk_dr_slot(const VkImg *im, const uint32_t *r, uint32_t *out)
+{
+    uint32_t x0 = r[0], y0 = r[1];
+    uint32_t x1 = MIN(r[2], im->width), y1 = MIN(r[3], im->height);
+    int best = -1;
+    uint64_t grow = UINT64_MAX;
+
+    if (x0 >= x1 || y0 >= y1) {
+        return -1;
+    }
+    /* inside one we have, merged into the one it grows least, or new */
+    for (uint32_t i = 0; i < im->ndr; i++) {
+        const uint32_t *d = im->dr[i];
+        uint64_t a0 = (uint64_t)(d[2] - d[0]) * (d[3] - d[1]);
+        uint64_t a1 = (uint64_t)(MAX(d[2], x1) - MIN(d[0], x0)) *
+                      (MAX(d[3], y1) - MIN(d[1], y0));
+        if (a1 - a0 < grow) {
+            grow = a1 - a0;
+            best = i;
+        }
+    }
+    if (best >= 0 && (grow == 0 || im->ndr == VK_MAX_DR)) {
+        const uint32_t *d = im->dr[best];
+        out[0] = MIN(d[0], x0);
+        out[1] = MIN(d[1], y0);
+        out[2] = MAX(d[2], x1);
+        out[3] = MAX(d[3], y1);
+        return best;
+    }
+    out[0] = x0;
+    out[1] = y0;
+    out[2] = x1;
+    out[3] = y1;
+    return im->ndr;
+}
+
+/*
+ * Stale rectangles never overlap im's dirty ones (rendering VRAM lacks):
+ * a stale rectangle is loaded from VRAM later, which would lose it, so
+ * such rendering goes to VRAM before r is marked stale.
+ */
+static void vk_st_clean(VkImg *im, const uint32_t *r)
+{
+    for (uint32_t i = 0; im->dirty && i < im->ndr; i++) {
+        if (vk_rect_meets(im->dr[i], r)) {
+            vk_copy_to_vram(im);
+        }
+    }
+}
+
+/* Append t minus c to out[n...] (up to four rectangles); the new count. */
+static uint32_t vk_st_cut(const uint32_t *t, const uint32_t *c, uint32_t (*out)[4],
+                          uint32_t n)
+{
+    if (!vk_rect_meets(t, c)) {
+        memcpy(out[n++], t, sizeof(out[0]));
+        return n;
+    }
+    uint32_t y0 = MAX(t[1], c[1]), y1 = MIN(t[3], c[3]);
+    if (t[1] < y0) {
+        out[n][0] = t[0], out[n][1] = t[1], out[n][2] = t[2], out[n++][3] = y0;
+    }
+    if (y1 < t[3]) {
+        out[n][0] = t[0], out[n][1] = y1, out[n][2] = t[2], out[n++][3] = t[3];
+    }
+    if (t[0] < c[0]) {
+        out[n][0] = t[0], out[n][1] = y0, out[n][2] = c[0], out[n++][3] = y1;
+    }
+    if (c[2] < t[2]) {
+        out[n][0] = c[2], out[n][1] = y0, out[n][2] = t[2], out[n++][3] = y1;
+    }
+    return n;
+}
+
+/* Mark r of im stale.  The rectangles stay disjoint; too many become one
+ * around them all (a draw loads only what it needs of it anyway). */
+static void vk_st_add(VkImg *im, const uint32_t *r)
+{
+    uint32_t keep[VK_MAX_ST * 4 + 1][4], nk = 0;
+
+    vk_st_clean(im, r);
+    for (uint32_t i = 0; i < im->nst; i++) {
+        nk = vk_st_cut(im->st[i], r, keep, nk);
+    }
+    memcpy(keep[nk++], r, sizeof(keep[0]));
+    if (nk > VK_MAX_ST) {
+        uint32_t b[4] = { keep[0][0], keep[0][1], keep[0][2], keep[0][3] };
+        for (uint32_t i = 1; i < nk; i++) {
+            b[0] = MIN(b[0], keep[i][0]);
+            b[1] = MIN(b[1], keep[i][1]);
+            b[2] = MAX(b[2], keep[i][2]);
+            b[3] = MAX(b[3], keep[i][3]);
+        }
+        vk_st_clean(im, b);
+        memcpy(keep[0], b, sizeof(b));
+        nk = 1;
+    }
+    memcpy(im->st, keep, nk * sizeof(keep[0]));
+    im->nst = nk;
+}
+
+/* The rows of im's pages newer than im->gen become stale; im holds gen. */
+static void vk_st_rows(VkImg *im, uint64_t gen)
+{
+    uint64_t hi = vk_img_hi(im), last = vk_pg(hi - 1), p0 = 0;
+    bool run = false;
+    uint8_t src = 0;
+
+    for (uint64_t p = vk_pg(im->addr); p <= last + 1; p++) {
+        bool newer = p <= last && p < V.npages &&
+                     vk_page_gen_for(p, im->addr, hi) > im->gen;
+        if (newer && !run) {
+            p0 = p;
+        } else if (!newer && run) {
+            uint64_t blo = MAX(p0 * VK_PAGE, (uint64_t)im->addr);
+            uint64_t bhi = MIN(p * VK_PAGE, hi);
+            uint32_t r[4] = { 0, (blo - im->addr) / im->pitch, im->width,
+                              MIN((uint32_t)DIV_ROUND_UP(bhi - im->addr, im->pitch),
+                                  im->height) };
+            if (r[1] < r[3]) {
+                vk_st_add(im, r);
+            }
+            src = V.page_src[p - 1];
+        }
+        run = newer;
+    }
+    V.stat_up_src[src & 3]++;
+    im->gen = gen;
+}
+
+/*
+ * Load from VRAM what a draw into rectangle draw (x0, y0, x1, y1; NULL:
+ * the whole image) needs of im's stale rectangles: their part inside the
+ * dirty rectangle the draw will be kept in (vk_dr_slot), which the
+ * write-back copies whole, so it must hold nothing stale.  Each stale
+ * rectangle that meets it loads over its whole height in those columns:
+ * the compositor's next draw is usually the rest of a window border, just
+ * below.  After VK_ST_LOADS of those in a batch (a band's left and right
+ * border), whole rectangles load: the window's bottom border is 20 draws
+ * side by side, and every load ends the render pass.
+ */
+static void vk_st_load(VkImg *im, const uint32_t *draw)
+{
+    uint32_t n[4] = { 0, 0, im->width, im->height };
+    uint32_t keep[VK_MAX_ST * 4][4], nk = 0;
+    uint32_t load[VK_MAX_ST * 5][4], nl = 0;
+    bool whole = im->st_seq == (V.cur ? V.cur->seq : 0) && im->st_loads >= VK_ST_LOADS;
+
+    if (!im->nst || (draw && vk_dr_slot(im, draw, n) < 0)) {
+        return;
+    }
+    if (im->bpp < 4) {
+        /* vk_region starts a row at a 4-byte boundary: keep edges there */
+        uint32_t a = 4 / im->bpp;
+        n[0] = QEMU_ALIGN_DOWN(n[0], a);
+        n[2] = MIN(QEMU_ALIGN_UP(n[2], a), im->width);
+    }
+    for (uint32_t i = 0; i < im->nst; i++) {
+        const uint32_t *t = im->st[i];
+        if (vk_rect_meets(t, n)) {
+            load[nl][0] = whole ? t[0] : MAX(t[0], n[0]);
+            load[nl][1] = t[1];
+            load[nl][2] = whole ? t[2] : MIN(t[2], n[2]);
+            load[nl][3] = t[3];
+            nk = vk_st_cut(t, load[nl++], keep, nk);
+        } else {
+            memcpy(keep[nk++], t, sizeof(keep[0]));
+        }
+    }
+    if (!nl) {
+        return;
+    }
+    while (nk > VK_MAX_ST) {
+        /* too many pieces left: load the smallest as well */
+        uint32_t j = 0;
+        uint64_t a = UINT64_MAX;
+        for (uint32_t i = 0; i < nk; i++) {
+            uint64_t ai = (uint64_t)(keep[i][2] - keep[i][0]) * (keep[i][3] - keep[i][1]);
+            if (ai < a) {
+                a = ai;
+                j = i;
+            }
+        }
+        memcpy(load[nl++], keep[j], sizeof(keep[0]));
+        memmove(keep[j], keep[j + 1], (nk - j - 1) * sizeof(keep[0]));
+        nk--;
+    }
+    memcpy(im->st, keep, nk * sizeof(keep[0]));
+    im->nst = nk;
+    for (uint32_t i = 0; vk_check() && im->dirty && i < nl; i++) {
+        for (uint32_t j = 0; j < im->ndr; j++) {
+            vk_check_apart(im, load[i], im->dr[j], "stale load over rendering not in VRAM");
+        }
+    }
+
+    /* Rendering of other images over those rows that VRAM lacks goes
+     * there first (im has none in them: vk_st_clean). */
+    uint32_t y0 = im->height, y1 = 0;
+    for (uint32_t i = 0; i < nl; i++) {
+        y0 = MIN(y0, load[i][1]);
+        y1 = MAX(y1, load[i][3]);
+    }
+    vk_writeback_others(im->addr + (uint64_t)y0 * im->pitch,
+                        im->addr + (uint64_t)y1 * im->pitch, im);
+    VkCommandBuffer cb = vk_batch()->cb;
+    VkBufferImageCopy r[VK_MAX_ST * 5];
+    im->st_loads = im->st_seq == V.cur->seq ? im->st_loads + 1 : 1;
+    im->st_seq = V.cur->seq;
+    for (uint32_t i = 0; i < nl; i++) {
+        r[i] = vk_region(im, load[i][0], load[i][1], load[i][2], load[i][3]);
+    }
+    vk_end_pass();
+    vk_full_barrier(cb);
+    vkCmdCopyBufferToImage(cb, V.vram_buf, im->img, VK_IMAGE_LAYOUT_GENERAL, nl, r);
+    vk_full_barrier(cb);
+    for (uint32_t i = 0; i < nl; i++) {
+        vk_note_read(r[i].bufferOffset,
+                     im->addr + (uint64_t)(load[i][3] - 1) * im->pitch +
+                     (uint64_t)load[i][2] * im->bpp);
+    }
+    V.stat_uploads++;
+    V.stat_up_rt++;
+}
+
+/*
  * The image for a VRAM range: w x h texels of bpp bytes at addr, rows
  * pitch bytes apart.  Its contents are current: copied from VRAM when a
  * CPU write or another image's rendering made them stale (after writing
  * such rendering back).  With max_h, an image up to max_h rows tall will
  * do, and a new one replaces the shorter images of the same buffer.
+ * With draw (a colour buffer, the rectangle a draw renders into), only
+ * what that draw needs is current (vk_st_load).
  */
 static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
                          uint32_t pitch, VkFormat fmt, uint32_t bpp,
-                         uint32_t tiling, uint32_t max_h)
+                         uint32_t tiling, uint32_t max_h, const uint32_t *draw)
 {
     VkImg *im = NULL;
     int lru = -1;
@@ -2269,6 +2560,19 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
                      (unsigned long long)gen);
         }
         im->valid = false;
+    }
+    if (draw && im->valid && vk_rt_lazy() && cls == IMG_RT && !tiling && pitch % 4 == 0 &&
+        vk_aspect(fmt) == VK_IMAGE_ASPECT_COLOR_BIT) {
+        if (gen > im->gen) {
+            vk_st_rows(im, gen);
+        }
+        vk_st_load(im, draw);
+        return im;
+    }
+    if (!im->valid) {
+        im->nst = 0;                    /* all of it loads below */
+    } else if (im->nst) {
+        vk_st_load(im, NULL);
     }
     if (!im->valid || gen > im->gen) {
         /* The rows holding pages newer than the image (all, if new), in
@@ -2381,38 +2685,18 @@ static void vk_img_written(VkImg *im, uint32_t x0, uint32_t y0,
 {
     uint32_t s = vk_batch()->seq;
 
-    x1 = MIN(x1, im->width);
-    y1 = MIN(y1, im->height);
-    if (x0 >= x1 || y0 >= y1) {
+    uint32_t r[4] = { x0, y0, x1, y1 };
+    int k = vk_dr_slot(im, r, r);
+
+    if (k < 0) {
         return;
     }
-    /* Keep the rectangle: inside one we have, merged into the one it
-     * grows least, or new. */
-    int best = -1;
-    uint64_t grow = UINT64_MAX;
-    for (uint32_t i = 0; i < im->ndr; i++) {
-        uint32_t *d = im->dr[i];
-        uint64_t a0 = (uint64_t)(d[2] - d[0]) * (d[3] - d[1]);
-        uint64_t a1 = (uint64_t)(MAX(d[2], x1) - MIN(d[0], x0)) *
-                      (MAX(d[3], y1) - MIN(d[1], y0));
-        if (a1 - a0 < grow) {
-            grow = a1 - a0;
-            best = i;
-        }
-    }
-    if (best >= 0 && (grow == 0 || im->ndr == VK_MAX_DR)) {
-        uint32_t *d = im->dr[best];
-        d[0] = MIN(d[0], x0);
-        d[1] = MIN(d[1], y0);
-        d[2] = MAX(d[2], x1);
-        d[3] = MAX(d[3], y1);
-    } else {
-        uint32_t *d = im->dr[im->ndr++];
-        d[0] = x0;
-        d[1] = y0;
-        d[2] = x1;
-        d[3] = y1;
-    }
+    /* Keep the rectangle (vk_dr_slot: inside one we have, merged into the
+     * one it grows least, or new). */
+    x1 = MIN(x1, im->width);
+    y1 = MIN(y1, im->height);
+    memcpy(im->dr[k], r, sizeof(r));
+    im->ndr += k == im->ndr;
     im->dirty = true;
     im->valid = true;
     /*
@@ -3785,7 +4069,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                 h = (V.vram_size - td->gpu_addr - (uint64_t)w * b) / td->pitch_bytes + 1;
             }
             VkImg *im = vk_img_get(IMG_TEX, td->gpu_addr, w, h, td->pitch_bytes,
-                                   vk_tex_format(td->kind), b, td->tiling & 2, 0);
+                                   vk_tex_format(td->kind), b, td->tiling & 2, 0, NULL);
             if (im) {
                 view = im->view;
             } else if (!vk_range_pending(td->gpu_addr, (uint64_t)td->gpu_addr + td->size_bytes)) {
@@ -3823,9 +4107,11 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     }
 
     /* Colour buffers and the depth buffer. */
+    uint32_t drect[4] = { sx0, sy0, sx1, sy1 };     /* as vk_img_written gets it */
     for (uint32_t k = 0; k < ncb; k++) {
         att[k] = vk_img_get(IMG_RT, addr[k], fbw, fbh, bpr[k], fmt[k], bpp[k],
-                            k ? pkt->cb[k].tiling : pkt->rt_tiling, rt_max_h);
+                            k ? pkt->cb[k].tiling : pkt->rt_tiling, rt_max_h,
+                            ns > 1 ? NULL : drect);
         if (!att[k]) {
             if (k == 0) {
                 vk_warn(1u << 7, "colour buffer unusable");
@@ -3870,7 +4156,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         att[ncb] = vk_img_get(IMG_RT, zd->gpu_addr, zw, fbh,
                               ns * zd->pitch * zd->bpp, zf, zd->bpp,
                               zd->tiling | (hz ? (u.zinfo[3] & R300_ZFMT_ENDIAN_MASK) << 2 : 0),
-                              rt_max_h);
+                              rt_max_h, NULL);
         if (att[ncb] && (zw == fbw || z_narrow)) {
             fmt[ncb] = zf;
             natt++;
