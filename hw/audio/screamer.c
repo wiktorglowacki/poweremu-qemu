@@ -184,7 +184,9 @@ static void screamer_pace_cb(void *opaque)
     due = MIN(due, (int64_t)s->rate / 20);    /* at most 50 ms after a stall */
 
     int moved = 0;
-    for (int64_t left = due; left > 0 && s->rx_io.len;) {
+    int64_t left = due + s->rx_carry;
+    s->rx_carry = 0;
+    while (left > 0 && s->rx_io.len) {
         int n = MIN(left, s->rx_io.len >> s->shift);
         dma_memory_set(&address_space_memory, s->rx_io.addr, 0, n << s->shift,
                        MEMTXATTRS_UNSPECIFIED);
@@ -194,8 +196,13 @@ static void screamer_pace_cb(void *opaque)
         moved += n;
         if (!s->rx_io.len) {
             s->rx_io.dma_end(&s->rx_io);
+            if (!s->rx_io.len) {
+                s->rx_carry = left;
+            }
         }
     }
+    due += s->tx_carry;
+    s->tx_carry = 0;
     while (due > 0 && s->io.len) {
         int n = pmac_screamer_tx_transfer(s, due);
         if (n == 0) {
@@ -203,6 +210,9 @@ static void screamer_pace_cb(void *opaque)
         }
         due -= n;
         moved += n;
+        if (!s->io.len) {
+            s->tx_carry = due;
+        }
         if (!s->voice) {
             s->rpos = s->wpos;              /* no host output: play to nowhere */
         }

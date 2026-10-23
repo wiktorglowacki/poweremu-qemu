@@ -58,6 +58,7 @@ struct ScreamerState {
     uint32_t rpos;
     QEMUTimer *pace_timer;        /* pulls TX DMA at the sample rate */
     int64_t pace_last, pace_frac, pace_idle;
+    int tx_carry, rx_carry;
     bool primed;                  /* jitter buffer filled, output running */
 
     uint32_t bpos;
