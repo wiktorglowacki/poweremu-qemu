@@ -1124,6 +1124,20 @@ static inline bool vk_page_pending_write(uint64_t p)
  * not yet in VRAM over a page the CPU wrote gets that rendering written
  * back before it is reloaded (vk_img_get), so both survive.
  */
+static void vk_page_cpu(uint64_t p)
+{
+    V.page_gen[p] = V.gen;
+    V.page_src[p] = 1;
+    if (vk_check() && vk_page_pending_write(p)) {
+        static int n;
+        if (n++ < 300) {
+            qemu_log("ppc-mac-gpu vulkan CHECK: CPU wrote VRAM page %06llx while "
+                     "rendering to it is pending (no flush first)\n",
+                     (unsigned long long)p * VK_PAGE);
+        }
+    }
+}
+
 static void vk_harvest(void)
 {
     if (!V.dirty_fn) {
@@ -1137,16 +1151,19 @@ static void vk_harvest(void)
     }
     V.gen++;
     for (; p < V.npages; p = find_next_bit(V.dirty_bm, V.npages, p + 1)) {
-        V.page_gen[p] = V.gen;
-        V.page_src[p] = 1;
-        if (vk_check() && vk_page_pending_write(p)) {
-            static int n;
-            if (n++ < 300) {
-                qemu_log("ppc-mac-gpu vulkan CHECK: CPU wrote VRAM page %06llx while "
-                         "rendering to it is pending (no flush first)\n",
-                         (unsigned long long)p * VK_PAGE);
-            }
-        }
+        vk_page_cpu(p);
+    }
+}
+
+static void vk_vram_written(void *opaque, uint64_t lo, uint64_t hi)
+{
+    hi = MIN(hi, V.vram_size);
+    if (!V.page_gen || lo >= hi) {
+        return;
+    }
+    V.gen++;
+    for (uint64_t p = vk_pg(lo); p <= vk_pg(hi - 1); p++) {
+        vk_page_cpu(p);
     }
 }
 
@@ -4371,6 +4388,7 @@ static PPCMacGPURenderer vulkan_renderer = {
     .copy_2d_r200     = vk_copy_2d_r200,
     .fill_2d_r200     = vk_fill_2d_r200,
     .set_dirty_source = vk_set_dirty_source,
+    .vram_written     = vk_vram_written,
     .get_caps         = vk_get_caps,
 };
 

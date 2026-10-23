@@ -461,6 +461,7 @@ typedef struct PPCMacGPURenderer {
      * and marks its own writes dirty.  Optional — may be NULL.
      */
     void (*set_dirty_source)(void *opaque, PPCMacGPUDirtyFn fn, void *arg);
+    void (*vram_written)(void *opaque, uint64_t lo, uint64_t hi);
 
     /*
      * Notify the backend that a display mode change occurred.
