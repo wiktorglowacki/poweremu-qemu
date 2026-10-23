@@ -112,6 +112,7 @@ typedef struct VkBatch {
     VkCommandBuffer cb;
     VkFence fence;
     int64_t submitted;          /* g_get_monotonic_time() at vkQueueSubmit */
+    uint32_t draws;
     GArray *pools;              /* VkDescriptorPool */
     unsigned pool_cur;
     GPtrArray *chunks;          /* VkChunk * used by this batch */
@@ -1049,6 +1050,7 @@ static VkBatch *vk_batch(void)
     vkBeginCommandBuffer(b->cb, &bi);
     /* ordered after everything submitted before (and host writes) */
     vk_full_barrier(b->cb);
+    b->draws = 0;
     V.cur = b;
     V.chunk = NULL;
     return b;
@@ -2360,8 +2362,21 @@ static uint32_t vk_commit(void (*done)(void *, uint32_t), void *arg)
     return vk_commit_ex(done, arg, false);
 }
 
+/*
+ * PPCGPU_VK_SUBMIT_MIN (default 256, 0 = off): a submit that nothing waits
+ * for (a lazily handled WAIT_UNTIL) leaves a batch with fewer draws open.
+ */
 static uint32_t vk_submit_r200(void *opaque, void (*done)(void *, uint32_t), void *arg)
 {
+    static int min = -1;
+
+    if (min < 0) {
+        const char *e = getenv("PPCGPU_VK_SUBMIT_MIN");
+        min = e ? CLAMP(atoi(e), 0, 1000000) : 256;
+    }
+    if (!done && V.cur && V.cur->draws < min) {
+        return 0;
+    }
     return vk_commit(done, arg);
 }
 
@@ -3846,6 +3861,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         vk_img_written(att[k], sx0, sy0, (ns - 1) * pkt->rt_pitch * (ns > 1) + sx1, sy1);
     }
     V.stat_draws++;
+    b->draws++;
     if (V.stat_draws % 20000 == 0) {
         qemu_log("ppc-mac-gpu vulkan: %llu draws (%llu hardware Z), %llu passes, "
                  "%llu barriers, %llu uploads, "
