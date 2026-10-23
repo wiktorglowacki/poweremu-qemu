@@ -120,7 +120,8 @@ enum {
     R300_BIND_VSU = 6,          /* UBO R300VSU: GPU vertex shader uniforms */
     R300_BIND_FB0 = 8,          /* input attachments: colour buffers, then Z */
     R300_BIND_TEX0 = 16,        /* combined image samplers, one per unit */
-    R300_BIND_COUNT = 32,
+    R300_BIND_FBIMG0 = 32,      /* storage images: the FB0 buffers again (R300_ROV) */
+    R300_BIND_COUNT = 37,
 };
 
 /* r300_us_to_glsl flags */

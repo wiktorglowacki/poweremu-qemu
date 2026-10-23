@@ -33,6 +33,13 @@ static char *r300_strdup_err(const char *what, const char *msg)
 uint32_t *r300_glsl_to_spirv(const char *glsl, R300Stage stage,
                              size_t *nwords, char **err)
 {
+    return r300_glsl_to_spirv_defs(glsl, stage, NULL, nwords, err);
+}
+
+uint32_t *r300_glsl_to_spirv_defs(const char *glsl, R300Stage stage,
+                                  const char *const *defines,
+                                  size_t *nwords, char **err)
+{
     static shaderc_compiler_t compiler;
     static const char *macro[] = { "R300_VS", "R300_FS", "R300_FS_Z", "R300_CS" };
     shaderc_compile_options_t opts;
@@ -55,6 +62,10 @@ uint32_t *r300_glsl_to_spirv(const char *glsl, R300Stage stage,
                                                  strlen(macro[stage]), "1", 1);
     if (stage == R300_STAGE_FS_Z) {
         shaderc_compile_options_add_macro_definition(opts, "R300_FS", 7, "1", 1);
+    }
+    for (unsigned i = 0; defines && defines[i]; i++) {
+        shaderc_compile_options_add_macro_definition(opts, defines[i], strlen(defines[i]),
+                                                     "1", 1);
     }
     res = shaderc_compile_into_spv(compiler, glsl, strlen(glsl),
                                    stage == R300_STAGE_VS ? shaderc_glsl_vertex_shader :

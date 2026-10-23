@@ -31,9 +31,14 @@
  * The fragment shader reads the buffers it blends into as input
  * attachments that are also its colour attachments (a feedback loop, all
  * images in VK_IMAGE_LAYOUT_GENERAL).  Draws are ordered by a by-region
- * self-dependency barrier between them (MoltenVK included).  Without
- * VK_EXT_rasterization_order_attachment_access, overlapping primitives
- * of one draw are not ordered on other GPUs (not handled yet).
+ * self-dependency barrier between them (MoltenVK included).  Within one
+ * draw nothing orders them: RADV's input attachment reads return what the
+ * buffer held before the draw, so a later primitive blends with, tests
+ * against or writes back the pixel an earlier one of the same draw already
+ * replaced.  A fragment that changes nothing is discarded instead of
+ * writing back what it read, and a draw whose result still depends on the
+ * buffer reads and writes it as a storage image inside a fragment shader
+ * pixel interlock (vk_rov).
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  */
@@ -65,6 +70,8 @@
 #define VK_SETS_PER_POOL    256
 #define VK_MAX_ATT          (R300_US_MAX_TARGETS + 1)
 #define VK_MAX_DR           8       /* dirty rectangles per image */
+#define VK_OVL_KINDS        17      /* vk_overlap(): kinds of draw */
+#define VK_OVL_PIXELS       (1u << 22)
 
 static char vk_err[256];
 
@@ -184,10 +191,11 @@ typedef struct VkPipeKey {
     VkFrontFace front;
     VkShaderModule vs_mod;      /* GPU vertex program, NULL: the pass-through */
     VkPipelineColorBlendAttachmentState cba;    /* colour buffer A (vk_ffblend) */
+    bool rov;                   /* buffers as storage images in an interlock (vk_rov) */
 } VkPipeKey;
 typedef struct VkProg {
-    VkShaderModule mod[3];      /* R300Stage */
-    bool failed[3];
+    VkShaderModule mod[5];      /* R300Stage, then FS and FS_Z with R300_ROV */
+    bool failed[5];
     GArray *pipes;              /* VkPipeVar */
 } VkProg;
 typedef struct VkPipeVar {
@@ -210,6 +218,7 @@ static struct {
     bool hwz;                   /* depth/stencil attachments (vk_hwz) */
     VkFormat zf24;              /* ... for Z24S8: D24S8, else D32S8 */
     bool eds;                   /* VK_EXT_extended_dynamic_state */
+    bool rov;                   /* vk_rov: pixel interlock and storage images */
     PFN_vkCmdSetDepthTestEnableEXT vkCmdSetDepthTestEnableEXT;
     PFN_vkCmdSetDepthWriteEnableEXT vkCmdSetDepthWriteEnableEXT;
     PFN_vkCmdSetDepthCompareOpEXT vkCmdSetDepthCompareOpEXT;
@@ -240,7 +249,9 @@ static struct {
 
     VkBuffer zpass_buf;
     VkDeviceMemory zpass_mem;
-    uint32_t *zpass;
+    uint32_t *zpass;            /* [0] the Z-pass count, then vk_overlap()'s */
+    uint32_t ovl_id;
+    uint64_t ovl_draws[VK_OVL_KINDS];
 
     /* staging for overlapping 2D copies (GPU only, so batches serialise it) */
     VkBuffer stage_buf;
@@ -316,6 +327,7 @@ static struct {
     bool tile_failed, tile_logged;
 
     uint64_t stat_draws, stat_hwz, stat_passes, stat_barriers, stat_uploads, stat_writebacks, stat_flushes, stat_2d;
+    uint64_t stat_rov;          /* draws through vk_rov's interlock */
     /* why: commits, write-backs made at commit, uploads of new images and
      * of images whose newest page came from the CPU, a draw, a 2D op */
     uint64_t stat_commits, stat_wb_commit, stat_up_new, stat_up_src[4], stat_up_rt;
@@ -400,12 +412,32 @@ static void vk_pipecache_save(Notifier *n, void *data)
  */
 static Notifier vk_pipecache_shutdown = { .notify = vk_pipecache_save };
 
+/*
+ * PPCGPU_VK_INTERLOCK=0: a draw whose result depends on the buffers it
+ * reads (blending or a ROP in the shader, the Z/stencil test in the shader
+ * with writes) reads them as input attachments, unordered within the draw
+ * (the old path).  By default, on a device with fragmentShaderPixelInterlock
+ * and storage images of the buffers' formats, such a draw reads and writes
+ * them as storage images inside a pixel interlock (R300_ROV in r300_us.c).
+ * The interlock around the input attachment read is not enough on RADV:
+ * ACO hoists that load above the interlock's wait, and colour writes are
+ * not visible to it within the draw anyway.  MoltenVK only with
+ * PPCGPU_VK_INTERLOCK=1 (untested).
+ */
+static bool vk_rov_wanted(void)
+{
+    const char *e = getenv("PPCGPU_VK_INTERLOCK");
+    return e ? e[0] == '1' : !V.moltenvk;
+}
+
+static bool vk_overlap(void);
+
 static bool vk_ctx_init(void)
 {
     VkExtensionProperties *ie = NULL, *de = NULL;
     VkPhysicalDevice *pd = NULL;
     uint32_t n = 0;
-    const char *iext[4], *dext[4];
+    const char *iext[4], *dext[8];
     uint32_t niext = 0, ndext = 0;
     bool portability = false;
 
@@ -514,6 +546,7 @@ static bool vk_ctx_init(void)
     if (eds) {
         dext[ndext++] = VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME;
     }
+    bool il_ext = vk_has_ext(de, n, VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
     g_free(de);
     de = NULL;
 
@@ -530,12 +563,17 @@ static bool vk_ctx_init(void)
                      drv.driverID == VK_DRIVER_ID_MOLTENVK;
     }
 
+    VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT fil = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT,
+    };
     VkPhysicalDeviceVulkan12Features f12 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+        .pNext = il_ext ? &fil : NULL,
     };
     VkPhysicalDeviceFeatures2 f2 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-        .pNext = V.props.apiVersion >= VK_API_VERSION_1_2 ? &f12 : NULL,
+        .pNext = V.props.apiVersion >= VK_API_VERSION_1_2 ? (void *)&f12 :
+                 il_ext ? (void *)&fil : NULL,
     };
     vkGetPhysicalDeviceFeatures2(V.pdev, &f2);
     if (!f2.features.fragmentStoresAndAtomics) {
@@ -548,7 +586,14 @@ static bool vk_ctx_init(void)
         .shaderClipDistance = f2.features.shaderClipDistance,
         .samplerAnisotropy = f2.features.samplerAnisotropy,
         .textureCompressionBC = f2.features.textureCompressionBC,
+        /* the shader-Z pipelines mask the Z attachment, not the colour */
+        .independentBlend = f2.features.independentBlend,
     };
+    V.rov = vk_rov_wanted() && fil.fragmentShaderPixelInterlock &&
+            f2.features.shaderStorageImageReadWithoutFormat &&
+            f2.features.shaderStorageImageWriteWithoutFormat;
+    want.shaderStorageImageReadWithoutFormat = V.rov;
+    want.shaderStorageImageWriteWithoutFormat = V.rov;
     V.depth_clamp = want.depthClamp;
     V.aniso = want.samplerAnisotropy;
     V.bc = want.textureCompressionBC;
@@ -586,9 +631,17 @@ static bool vk_ctx_init(void)
         .pNext = V.props.apiVersion >= VK_API_VERSION_1_2 ? &w12 : NULL,
         .extendedDynamicState = VK_TRUE,
     };
+    VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT wil = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT,
+        .pNext = eds ? (void *)&weds : weds.pNext,
+        .fragmentShaderPixelInterlock = VK_TRUE,
+    };
+    if (V.rov) {
+        dext[ndext++] = VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME;
+    }
     VkDeviceCreateInfo dci = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .pNext = eds ? &weds : weds.pNext,
+        .pNext = V.rov ? (void *)&wil : eds ? (void *)&weds : weds.pNext,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &qci,
         .enabledExtensionCount = ndext,
@@ -614,7 +667,7 @@ static bool vk_ctx_init(void)
     VKCHECK(vkCreateCommandPool(V.dev, &cpi, NULL, &V.cmdpool), "vkCreateCommandPool");
 
     /* One descriptor set layout for every R300 program (R300_BIND_*). */
-    VkDescriptorSetLayoutBinding b[7 + VK_MAX_ATT + R300_NUM_TEX_UNITS];
+    VkDescriptorSetLayoutBinding b[7 + 2 * VK_MAX_ATT + R300_NUM_TEX_UNITS];
     uint32_t nb = 0;
     const VkShaderStageFlags all = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     b[nb++] = (VkDescriptorSetLayoutBinding){ R300_BIND_UNIFORMS,
@@ -638,6 +691,10 @@ static bool vk_ctx_init(void)
     for (uint32_t k = 0; k < R300_NUM_TEX_UNITS; k++) {
         b[nb++] = (VkDescriptorSetLayoutBinding){ R300_BIND_TEX0 + k,
             VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
+    }
+    for (uint32_t k = 0; V.rov && k < VK_MAX_ATT; k++) {
+        b[nb++] = (VkDescriptorSetLayoutBinding){ R300_BIND_FBIMG0 + k,
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
     }
     VkDescriptorSetLayoutCreateInfo dli = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -701,11 +758,12 @@ static bool vk_ctx_init(void)
     qemu_thread_create(&V.thread, "vk-wait", vk_waiter, NULL, QEMU_THREAD_DETACHED);
     V.thread_started = true;
 
-    qemu_log("ppc-mac-gpu vulkan: %s (%s, Vulkan %u.%u)%s\n", V.props.deviceName,
+    qemu_log("ppc-mac-gpu vulkan: %s (%s, Vulkan %u.%u)%s%s\n", V.props.deviceName,
              V.moltenvk ? "MoltenVK" : "native",
              VK_API_VERSION_MAJOR(V.props.apiVersion),
              VK_API_VERSION_MINOR(V.props.apiVersion),
-             V.bc ? "" : ", no BC (DXT) textures");
+             V.bc ? "" : ", no BC (DXT) textures",
+             V.rov ? ", ordered framebuffer reads (pixel interlock)" : "");
     V.ready = true;
     return true;
 
@@ -2040,6 +2098,50 @@ static void vk_ffblend(R300FSUniforms *u, VkPipelineColorBlendAttachmentState *b
     u->chanmask = 0xF;
 }
 
+/* Can a colour buffer of format f be a storage image (vk_rov)? */
+static bool vk_rov_format(VkFormat f)
+{
+    static uint8_t known[256];      /* 1 no, 2 yes */
+
+    if (!V.rov || (unsigned)f >= 256) {
+        return false;
+    }
+    if (!known[f]) {
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(V.pdev, f, &fp);
+        known[f] = fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT ? 2 : 1;
+    }
+    return known[f] == 2;
+}
+
+/*
+ * Does a draw's colour depend on the pixel it replaces: blending in the
+ * shader (u as vk_ffblend left it) with a factor or equation that reads the
+ * destination, a ROP that does, or DISCARD_SRC_PIXELS where the shader
+ * cannot discard (a depth or stencil value to update, zcntl ZB_CNTL)?  A
+ * partial channel mask or an unwritten target writes back what it read,
+ * the same for every primitive of the draw: no dependency.
+ */
+static bool vk_reads_dst(const R300FSUniforms *u, uint32_t zcntl)
+{
+    uint32_t cb = u->cblend, ab = cb & 2 ? u->ablend : cb;
+    uint32_t rop = u->rop >> 8 & 15;
+
+    if ((u->rop & 4) && (rop >> 1 & 5) != (rop & 5)) {
+        return true;
+    }
+    if (!(cb & 1) || (u->rop & 4)) {
+        return false;
+    }
+    for (int i = 0; i < 2; i++) {
+        uint32_t c = i ? ab : cb, op = c >> 12 & 7, sf = c >> 16 & 63, df = c >> 24 & 63;
+        if (op == 4 || op == 5 || df != 32 || sf == 36 || sf == 37 || (sf >= 40 && sf <= 42)) {
+            return true;
+        }
+    }
+    return (cb & 0x38) && (zcntl & 5);
+}
+
 static bool vk_rt_grow(void)
 {
     static int on = -1;
@@ -2122,7 +2224,8 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
                                    vk_aspect(fmt) != VK_IMAGE_ASPECT_COLOR_BIT ?
                                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT :
                                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                                   VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
+                                   VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
+                                   (vk_rov_format(fmt) ? VK_IMAGE_USAGE_STORAGE_BIT : 0));
         if (!vk_image(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, fmt, w, h, 1, 1, 1, usage,
                       &im->img, &im->mem, &im->view)) {
             return NULL;
@@ -2817,6 +2920,60 @@ static VkRenderPass vk_render_pass(uint32_t n, const VkFormat *fmt)
     return rp;
 }
 
+/*
+ * The render pass of vk_rov's draws: no attachments at all.  The buffers
+ * are storage images only, as the spec wants for an image the draw writes
+ * through a descriptor (an attachment of the same subpass may only be read,
+ * and only as an input attachment, without a feedback-loop layout).
+ */
+static VkRenderPass vk_rov_pass(void)
+{
+    static VkRenderPass rp;
+
+    if (rp) {
+        return rp;
+    }
+    VkSubpassDescription sd = {
+        .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+    };
+    VkSubpassDependency dep[3] = {
+        {   /* between draws: storage writes before the next draw's accesses */
+            .srcSubpass = 0, .dstSubpass = 0,
+            .srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT,
+        },
+        {
+            .srcSubpass = VK_SUBPASS_EXTERNAL, .dstSubpass = 0,
+            .srcStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+        },
+        {
+            .srcSubpass = 0, .dstSubpass = VK_SUBPASS_EXTERNAL,
+            .srcStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+        },
+    };
+    VkRenderPassCreateInfo rci = {
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+        .subpassCount = 1,
+        .pSubpasses = &sd,
+        .dependencyCount = 3,
+        .pDependencies = dep,
+    };
+    if (vkCreateRenderPass(V.dev, &rci, NULL, &rp) != VK_SUCCESS) {
+        vk_warn(1u << 0, "render pass creation failed");
+        rp = VK_NULL_HANDLE;
+    }
+    return rp;
+}
+
 static VkFramebuffer vk_framebuffer(VkRenderPass rp, uint32_t n, VkImg **att,
                                     uint32_t w, uint32_t h)
 {
@@ -2859,18 +3016,35 @@ static VkFramebuffer vk_framebuffer(VkRenderPass rp, uint32_t n, VkImg **att,
     return f->fb;
 }
 
-static VkShaderModule vk_module(VkProg *pg, const char *glsl, R300Stage stage)
+/* pg->mod[] slot of a stage, rov: its R300_ROV variant (FS and FS_Z) */
+static int vk_mod_slot(R300Stage stage, bool rov)
 {
-    if (pg->mod[stage] || pg->failed[stage]) {
-        return pg->mod[stage];
+    return rov ? stage + 2 : stage;
+}
+
+static VkShaderModule vk_module(VkProg *pg, const char *glsl, R300Stage stage, bool rov)
+{
+    int m = vk_mod_slot(stage, rov);
+    if (pg->mod[m] || pg->failed[m]) {
+        return pg->mod[m];
     }
     size_t nw;
     char *err = NULL;
-    uint32_t *spv = r300_glsl_to_spirv(glsl, stage, &nw, &err);
+    const char *defs[3];
+    unsigned nd = 0;
+    if (rov) {
+        defs[nd++] = "R300_ROV";
+    }
+    if (vk_overlap() && stage != R300_STAGE_VS) {
+        defs[nd++] = "R300_OVERLAP";
+    }
+    defs[nd] = NULL;
+    uint32_t *spv = r300_glsl_to_spirv_defs(glsl, stage, defs, &nw, &err);
     if (!spv) {
-        qemu_log("ppc-mac-gpu vulkan: %s: %s\n%s\n", r300_stage_entry(stage), err, glsl);
+        qemu_log("ppc-mac-gpu vulkan: %s%s: %s\n%s\n", r300_stage_entry(stage),
+                 rov ? " (R300_ROV)" : "", err, glsl);
         free(err);
-        pg->failed[stage] = true;
+        pg->failed[m] = true;
         return VK_NULL_HANDLE;
     }
     VkShaderModuleCreateInfo mci = {
@@ -2878,12 +3052,12 @@ static VkShaderModule vk_module(VkProg *pg, const char *glsl, R300Stage stage)
         .codeSize = nw * 4,
         .pCode = spv,
     };
-    if (vkCreateShaderModule(V.dev, &mci, NULL, &pg->mod[stage]) != VK_SUCCESS) {
-        pg->mod[stage] = VK_NULL_HANDLE;
-        pg->failed[stage] = true;
+    if (vkCreateShaderModule(V.dev, &mci, NULL, &pg->mod[m]) != VK_SUCCESS) {
+        pg->mod[m] = VK_NULL_HANDLE;
+        pg->failed[m] = true;
     }
     free(spv);
-    return pg->mod[stage];
+    return pg->mod[m];
 }
 
 /* The GPU vertex program vs_glsl (id vs_id), compiled once per distinct text. */
@@ -3002,15 +3176,16 @@ static VkPipeline vk_pipeline(const char *glsl, uint32_t glsl_id,
         }
     }
     int fst = key->z && !key->hz ? R300_STAGE_FS_Z : R300_STAGE_FS;
-    if (!*glsl && ((!key->vs_mod && !pg->mod[R300_STAGE_VS]) || !pg->mod[fst])) {
+    if (!*glsl && ((!key->vs_mod && !pg->mod[R300_STAGE_VS]) ||
+                   !pg->mod[vk_mod_slot(fst, key->rov)])) {
         fetched = r300_us_glsl_by_id(glsl_id);
         if (!fetched) {
             return VK_NULL_HANDLE;
         }
         glsl = fetched;
     }
-    VkShaderModule vs = key->vs_mod ? key->vs_mod : vk_module(pg, glsl, R300_STAGE_VS);
-    VkShaderModule fs = vk_module(pg, glsl, fst);
+    VkShaderModule vs = key->vs_mod ? key->vs_mod : vk_module(pg, glsl, R300_STAGE_VS, false);
+    VkShaderModule fs = vk_module(pg, glsl, fst, key->rov);
     if (!vs || !fs) {
         return VK_NULL_HANDLE;
     }
@@ -3045,7 +3220,7 @@ static VkPipeline vk_pipeline(const char *glsl, uint32_t glsl_id,
         .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
     };
     VkPipelineColorBlendAttachmentState cba[VK_MAX_ATT];
-    uint32_t natt = key->ncb + (key->z && !key->hz ? 1 : 0);
+    uint32_t natt = key->rov ? 0 : key->ncb + (key->z && !key->hz ? 1 : 0);
     for (uint32_t k = 0; k < natt; k++) {
         cba[k] = (VkPipelineColorBlendAttachmentState){
             .colorWriteMask = k == key->ncb && !key->zw ? 0 :
@@ -3353,6 +3528,74 @@ static VkImageView vk_texture_full(const R300TexDesc *td)
 /* ---- draws ------------------------------------------------------------ */
 
 /*
+ * PPCGPU_VK_OVERLAP=1: count the fragments that land on a pixel an earlier
+ * primitive of the same draw already wrote, by kind of draw: bit 0 the
+ * depth/stencil test in the shader, 1 blending in the shader, 2 ROP,
+ * 3 DISCARD_SRC_PIXELS (kinds 1-15 read the buffers they write); 16 reads
+ * them only for a channel mask or other targets; 0 does not read them.
+ * Logged every 5000 draws (PPCGPU_VK_OVERLAP=N: every N).  A diagnostic:
+ * every fragment does an atomic, and with a depth attachment it counts
+ * fragments that then fail the test.
+ */
+static uint32_t vk_overlap_every(void)
+{
+    static int every = -1;
+    if (every < 0) {
+        const char *e = getenv("PPCGPU_VK_OVERLAP");
+        every = e ? atoi(e) : 0;
+        every = every == 1 ? 5000 : MAX(every, 0);
+    }
+    return every;
+}
+
+static bool vk_overlap(void)
+{
+    return vk_overlap_every() != 0;
+}
+
+static void vk_overlap_draw(R300FSUniforms *u, bool hz, bool pass_z, uint32_t ncb,
+                            VkFormat fmt, bool rov, const R300DrawPacket *pkt)
+{
+    uint32_t kind = (!hz && pass_z && (u->zinfo[0] & 3)) | (u->cblend & 1) << 1 |
+                    (u->rop & 4) | ((u->cblend & 1) && (u->cblend & 0x38) ? 8 : 0);
+    static unsigned nseen;
+    static uint32_t seen[24][4];
+
+    if (!kind && (ncb > 1 || (u->chanmask & 0xF) != 0xF)) {
+        kind = 16;
+    }
+    if (!++V.ovl_id) {
+        V.ovl_id = 1;
+    }
+    u->pad2[0] = V.ovl_id;
+    u->pad2[1] = kind;
+    V.ovl_draws[kind]++;
+    if (kind && kind < 16 && nseen < 24) {
+        uint32_t sig[4] = { kind | rov << 8, u->cblend, u->rop, fmt };
+        unsigned i;
+        for (i = 0; i < nseen && memcmp(seen[i], sig, sizeof(sig)); i++) {
+        }
+        if (i == nseen) {
+            memcpy(seen[nseen++], sig, sizeof(sig));
+            qemu_log("ppc-mac-gpu vulkan: overlap: draw %llu kind %u%s, cblend %08x "
+                     "ablend %08x rop %08x format %u, %u targets, chanmask %x, ZB_CNTL %x, "
+                     "%s vertices, %u\n", (unsigned long long)V.stat_draws, kind,
+                     rov ? " (interlocked)" : "", u->cblend, u->ablend, u->rop, fmt, ncb,
+                     u->chanmask, u->zinfo[0], pkt->vs_glsl ? "GPU" : "CPU", pkt->num_verts);
+        }
+    }
+    if (V.ovl_id % vk_overlap_every() == 0) {
+        for (int k = 0; k < VK_OVL_KINDS; k++) {
+            if (V.ovl_draws[k]) {
+                qemu_log("ppc-mac-gpu vulkan: overlap kind %d: %llu draws, "
+                         "%u overlapping fragments\n", k,
+                         (unsigned long long)V.ovl_draws[k], qatomic_read(&V.zpass[1 + k]));
+            }
+        }
+    }
+}
+
+/*
  * PPCGPU_VK_DRAW_BARRIER:
  *   0  never emit an in-pass barrier between draws (test MoltenVK tile resolve)
  *   1  emit on every draw in an open pass (old behaviour)
@@ -3595,7 +3838,31 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     }
     uint32_t natt = ncb;
     bool z16 = zd->bpp == 2;
-    bool hz = V.hwz && !u.zpass_count;
+    /*
+     * vk_rov: does what this draw writes depend on what an earlier
+     * primitive of it wrote?  Blending or a ROP the pipeline cannot take
+     * (as vk_ffblend would leave it), or the Z/stencil test in the shader
+     * with writes.  Such a draw tests depth in the shader too: a depth
+     * attachment's test would come after the shader's stores.
+     */
+    bool sz = want_z && (!V.hwz || u.zpass_count);
+    bool rov = false;
+    if (V.rov && ((u.cblend & 1) || (u.rop & 4) || sz)) {
+        R300FSUniforms fu = u;
+        VkPipelineColorBlendAttachmentState fba = { 0 };
+        float fbc[4];
+        if (!sz && ncb == 1 && (fmt[0] == VK_FORMAT_R8G8B8A8_UNORM ||
+                                fmt[0] == VK_FORMAT_R5G6B5_UNORM_PACK16)) {
+            vk_ffblend(&fu, &fba, fbc, fmt[0] == VK_FORMAT_R5G6B5_UNORM_PACK16);
+        }
+        uint32_t zc = want_z ? u.zinfo[0] : 0;
+        rov = vk_reads_dst(&fu, zc) || (sz && (zc & 3) && (zc & 5));
+        for (uint32_t k = 0; rov && k < ncb; k++) {
+            rov = vk_rov_format(fmt[k]);
+        }
+        rov = rov && (!want_z || vk_rov_format(z16 ? VK_FORMAT_R16_UINT : VK_FORMAT_R32_UINT));
+    }
+    bool hz = V.hwz && !u.zpass_count && !(rov && (u.zinfo[0] & 3));
     if (want_z) {
         VkFormat zf = hz ? (z16 ? VK_FORMAT_D16_UNORM : V.zf24)
                          : z16 ? VK_FORMAT_R16_UINT : VK_FORMAT_R32_UINT;
@@ -3614,7 +3881,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         }
     }
     /* Keep the open pass's depth buffer bound for depth-less draws. */
-    if (!want_z && V.in_pass && V.pass_z && V.pass_n == ncb + 1 &&
+    if (!want_z && !rov && V.in_pass && V.pass_z && V.pass_n == ncb + 1 &&
         sx1 <= V.pass_img[ncb]->width) {
         bool same = true;
         for (uint32_t k = 0; k < ncb; k++) {
@@ -3643,7 +3910,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         fbw = MIN(fbw, att[k]->width);  /* a narrower depth buffer (vk_zpitch) */
     }
 
-    VkRenderPass rp = vk_render_pass(natt, fmt);
+    VkRenderPass rp = rov ? vk_rov_pass() : vk_render_pass(natt, fmt);
     if (!rp) {
         return -1;
     }
@@ -3654,6 +3921,8 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     pk.z = pass_z;
     pk.zw = !hz && (u.zinfo[0] & 5);
     pk.hz = hz;
+    pk.rov = rov;
+    pk.cba.colorWriteMask = rov ? 0 : 0xF;
     if (hz && !V.eds) {
         pk.zs[0] = u.zinfo[0] & 0x17;
         pk.zs[1] = u.zinfo[1] & 0x7FFFFFF;
@@ -3665,10 +3934,12 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     pk.front = r300_front_ccw(pkt->cull) ? VK_FRONT_FACE_COUNTER_CLOCKWISE
                                          : VK_FRONT_FACE_CLOCKWISE;
     float bc[4];
-    pk.cba.colorWriteMask = 0xF;
     if (ncb == 1 && (fmt[0] == VK_FORMAT_R8G8B8A8_UNORM || fmt[0] == VK_FORMAT_R5G6B5_UNORM_PACK16) &&
-        (hz || !pass_z)) {
+        (hz || !pass_z) && !rov) {
         vk_ffblend(&u, &pk.cba, bc, fmt[0] == VK_FORMAT_R5G6B5_UNORM_PACK16);
+    }
+    if (vk_overlap()) {
+        vk_overlap_draw(&u, hz, pass_z, ncb, fmt[0], rov, pkt);
     }
     /* GPU vertex shading (R300_GLSL_GPU_VS): triangles only, no line pass */
     bool gpu_vs = pkt->vs_glsl && pkt->vs_id;
@@ -3745,18 +4016,19 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     VkDescriptorSet set = VK_NULL_HANDLE;
     for (;;) {
         if (b->pool_cur == b->pools->len) {
-            VkDescriptorPoolSize ps[5] = {
+            VkDescriptorPoolSize ps[6] = {
                 { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SETS_PER_POOL },
                 { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2 * VK_SETS_PER_POOL },
                 { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 * VK_SETS_PER_POOL },
                 { VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, VK_MAX_ATT * VK_SETS_PER_POOL },
                 { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                   R300_NUM_TEX_UNITS * VK_SETS_PER_POOL },
+                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_MAX_ATT * VK_SETS_PER_POOL },
             };
             VkDescriptorPoolCreateInfo pci = {
                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
                 .maxSets = VK_SETS_PER_POOL,
-                .poolSizeCount = 5,
+                .poolSizeCount = V.rov ? 6 : 5,
                 .pPoolSizes = ps,
             };
             VkDescriptorPool pool;
@@ -3778,7 +4050,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     }
     VkDescriptorBufferInfo bi[6] = {
         { ub, uo, sizeof(R300FSUniforms) },
-        { V.zpass_buf, 0, 16 },
+        { V.zpass_buf, 0, vk_overlap() ? VK_WHOLE_SIZE : 16 },
         { vb, vo, vbytes },
         { ub, uo + ns * ustride, 16 },
         { V.vram_buf, 0, VK_WHOLE_SIZE },
@@ -3811,8 +4083,10 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     }
     wr[nwr++] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = set, .dstBinding = R300_BIND_FB0, .descriptorCount = nin,
-        .descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, .pImageInfo = ai };
+        .dstSet = set, .dstBinding = rov ? R300_BIND_FBIMG0 : R300_BIND_FB0,
+        .descriptorCount = nin,
+        .descriptorType = rov ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                              : VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, .pImageInfo = ai };
     wr[nwr++] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .dstSet = set, .dstBinding = R300_BIND_TEX0, .descriptorCount = R300_NUM_TEX_UNITS,
@@ -3827,7 +4101,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     }
     if (!same) {
         vk_end_pass();
-        VkFramebuffer fb = vk_framebuffer(rp, natt, att, fbw, fbh);
+        VkFramebuffer fb = vk_framebuffer(rp, rov ? 0 : natt, att, fbw, fbh);
         if (!fb) {
             return -1;
         }
@@ -3843,9 +4117,20 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         V.pass_fb = fb;
         V.pass_n = natt;
         memcpy(V.pass_img, att, natt * sizeof(att[0]));
-        V.pass_z = pass_z;
+        V.pass_z = pass_z && !rov;
         V.pass_z16 = z16;
         V.stat_passes++;
+    } else if (rov) {
+        /* vk_rov_pass: the previous draw's storage writes first */
+        VkMemoryBarrier mb = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        };
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             VK_DEPENDENCY_BY_REGION_BIT, 1, &mb, 0, NULL, 0, NULL);
+        V.stat_barriers++;
     } else {
         /* This draw reads what the previous one wrote.  MoltenVK needs it
          * too: without it blending read stale destination pixels (shadows,
@@ -3865,6 +4150,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             V.stat_barriers++;
         }
     }
+    V.stat_rov += rov;
 
     if (hz) {
         VkPipelineDepthStencilStateCreateInfo zs = vk_zstate(u.zinfo[0], u.zinfo[1], u.zinfo[2]);
@@ -3919,14 +4205,14 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     V.stat_draws++;
     b->draws++;
     if (V.stat_draws % 20000 == 0) {
-        qemu_log("ppc-mac-gpu vulkan: %llu draws (%llu hardware Z), %llu passes, "
+        qemu_log("ppc-mac-gpu vulkan: %llu draws (%llu hardware Z, %llu interlocked), %llu passes, "
                  "%llu barriers, %llu uploads, "
                  "%llu write-backs, %llu flushes; %llu commits, %llu write-backs "
                  "at commit; uploads: %llu new, %llu cpu, %llu draw, %llu 2d, %llu RT; "
                  "%llu batch waits, %llu depth write-backs at commit; rebuilt "
                  "textures: %llu lookups, %llu hashed, %llu built\n",
                  (unsigned long long)V.stat_draws, (unsigned long long)V.stat_hwz,
-                 (unsigned long long)V.stat_passes,
+                 (unsigned long long)V.stat_rov, (unsigned long long)V.stat_passes,
                  (unsigned long long)V.stat_barriers,
                  (unsigned long long)V.stat_uploads, (unsigned long long)V.stat_writebacks,
                  (unsigned long long)V.stat_flushes, (unsigned long long)V.stat_commits,
@@ -3951,14 +4237,15 @@ static void *vk_init(uint8_t *vram_ptr, uint64_t vram_size)
         return NULL;
     }
     if (!V.zpass_buf) {
-        if (!vk_buffer(16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        if (!vk_buffer(vk_overlap() ? 4 * (33 + VK_OVL_PIXELS) : 16,
+                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0,
                        &V.zpass_buf, &V.zpass_mem, &map)) {
             return NULL;
         }
         V.zpass = map;
-        memset(map, 0, 16);
+        memset(map, 0, vk_overlap() ? 4 * (33 + VK_OVL_PIXELS) : 16);
     }
     V.hwz = vk_hwz() && vk_tile_init();
     qemu_log("ppc-mac-gpu vulkan: depth/stencil tested %s (%s, %s state)\n",

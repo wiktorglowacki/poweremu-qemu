@@ -30,6 +30,12 @@ const char *r300_stage_entry(R300Stage stage);
 uint32_t *r300_glsl_to_spirv(const char *glsl, R300Stage stage,
                              size_t *nwords, char **err);
 
+/* The same with the macros named in the NULL-terminated defines[] set
+ * (e.g. R300_ROV, see r300_us.c). */
+uint32_t *r300_glsl_to_spirv_defs(const char *glsl, R300Stage stage,
+                                  const char *const *defines,
+                                  size_t *nwords, char **err);
+
 /*
  * Cross-compile a stage's SPIR-V to MSL (macOS, framebuffer fetch for the
  * input attachments, R300_BIND_* mapped as r300_us.h describes).  The
