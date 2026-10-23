@@ -1272,6 +1272,17 @@ static int vk_texfull_max(void)
 
 static bool vk_range_pending(uint64_t lo, uint64_t hi);
 
+/* PPCGPU_VK_TEX_SNAPSHOT=0: textures are uploaded from VRAM when the batch runs. */
+static bool vk_tex_snapshot(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_VK_TEX_SNAPSHOT");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
 static uint64_t vk_img_hash(uint32_t addr, uint32_t w, uint32_t h, uint32_t pitch,
                             uint32_t bpp)
 {
@@ -2138,6 +2149,13 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
         uint32_t band = vk_tile_band(cls, tiling, bpp);
         uint64_t band_b = (uint64_t)pitch * band;
         uint32_t y0 = 0, y1 = h;
+        uint8_t src = 0;
+        for (uint64_t p = vk_pg(addr), g = 0; p <= vk_pg(hi - 1) && p < V.npages; p++) {
+            if (vk_page_gen_for(p, addr, hi) >= g) {
+                g = vk_page_gen_for(p, addr, hi);
+                src = V.page_src[p];
+            }
+        }
         if (im->valid) {
             uint64_t lo_p = UINT64_MAX, hi_p = 0;
             for (uint64_t p = vk_pg(addr); p <= vk_pg(hi - 1) && p < V.npages; p++) {
@@ -2173,7 +2191,21 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
         if (vk_aspect(fmt) != VK_IMAGE_ASPECT_COLOR_BIT) {
             vk_zconv(cb, im, 0, y0, w, y1, false);
         } else if (!(im->tiling && vk_tile_copy(cb, im, 0, y0, w, y1, false))) {
-            vkCmdCopyBufferToImage(cb, V.vram_buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+            VkBuffer sb = V.vram_buf;
+            uint64_t slo = r.bufferOffset;
+            uint64_t shi = MIN(addr + (uint64_t)(r.imageOffset.y + r.imageExtent.height) * pitch,
+                               V.vram_size);
+            if (cls == IMG_TEX && src == 1 && vk_tex_snapshot() && shi > slo) {
+                VkDeviceSize so;
+                void *dst = vk_arena(shi - slo, &sb, &so);
+                if (dst) {
+                    memcpy(dst, V.vram + slo, shi - slo);
+                    r.bufferOffset = so;
+                } else {
+                    sb = V.vram_buf;
+                }
+            }
+            vkCmdCopyBufferToImage(cb, sb, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
         }
         vk_full_barrier(cb);
         vk_note_read(rlo, rhi);
