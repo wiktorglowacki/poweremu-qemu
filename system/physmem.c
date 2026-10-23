@@ -2641,6 +2641,7 @@ static subpage_t *subpage_init(FlatView *fv, hwaddr base)
     memory_region_init_io(&mmio->iomem, NULL, &subpage_ops, mmio,
                           NULL, TARGET_PAGE_SIZE);
     mmio->iomem.subpage = true;
+    mmio->iomem.lockless_io = !getenv("QEMU_SUBPAGE_BQL");
 #if defined(DEBUG_SUBPAGE)
     printf("%s: %p base " HWADDR_FMT_plx " len %08x\n", __func__,
            mmio, base, TARGET_PAGE_SIZE);

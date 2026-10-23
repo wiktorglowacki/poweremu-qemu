@@ -10885,7 +10885,8 @@ static bool ppc_mac_gpu_cp_yield(PPCMacGPUState *s, uint32_t pos_dw)
     }
     /* Publish progress: a catch-up starts here, and the guest may reuse
      * the ring space behind it. */
-    s->regs.cp_rb_rptr = (cp.seg_rptr + pos_dw) & cp.ring_mask;
+    qatomic_store_release(&s->regs.cp_rb_rptr,
+                          (cp.seg_rptr + pos_dw) & cp.ring_mask);
     ppc_mac_gpu_rptr_writeback(s);
     epoch = cp.epoch;
     nest = g_in_pm4;
@@ -10997,7 +10998,7 @@ static void ppc_mac_gpu_cp_run(PPCMacGPUState *s)
     unsigned epoch = ++cp.epoch;    /* a yielded CP thread gives up its copy */
 
     for (;;) {
-        uint32_t wptr = qatomic_read(&s->regs.cp_rb_wptr);
+        uint32_t wptr = qatomic_load_acquire(&s->regs.cp_rb_wptr);
         uint32_t rptr = s->regs.cp_rb_rptr;
 
         if (wptr == rptr) {
@@ -11022,7 +11023,7 @@ static void ppc_mac_gpu_cp_run(PPCMacGPUState *s)
         /* Everything up to wptr is carried out: the ring is empty again --
          * in the card's own register and in the copy the driver may be
          * reading from memory instead. */
-        s->regs.cp_rb_rptr = wptr;
+        qatomic_store_release(&s->regs.cp_rb_rptr, wptr);
         ppc_mac_gpu_rptr_writeback(s);
         /* Bump CSQ stat counter so the kext's "wait for CSQ change" poll
          * sees a different value after we process commands. */
@@ -11194,7 +11195,7 @@ static uint64_t ppc_mac_gpu_cp_rptr_read(void *opaque, hwaddr addr,
                                          unsigned size)
 {
     PPCMacGPUState *s = opaque;
-    uint32_t rptr = qatomic_read(&s->regs.cp_rb_rptr);
+    uint32_t rptr = qatomic_load_acquire(&s->regs.cp_rb_rptr);
 
     cps_count(cps.rd, R200_CP_RB_RPTR);
     uint32_t pending = (qatomic_read(&s->regs.cp_rb_wptr) - rptr) &
@@ -11215,7 +11216,7 @@ static uint64_t ppc_mac_gpu_cp_rptr_read(void *opaque, hwaddr addr,
         if (!locked) {
             bql_unlock();
         }
-        rptr = qatomic_read(&s->regs.cp_rb_rptr);
+        rptr = qatomic_load_acquire(&s->regs.cp_rb_rptr);
     }
     return rptr;
 }
