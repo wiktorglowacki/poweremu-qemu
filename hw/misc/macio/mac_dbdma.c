@@ -641,6 +641,8 @@ static void dbdma_control_write(DBDMA_channel *ch)
                         (value & PAUSE) ? "sett" : "clear");
     }
 
+    status = (status & ~(mask & DEVSTAT)) | (value & mask & DEVSTAT);
+
     /* FLUSH is its own thing */
     if ((mask & FLUSH) && (value & FLUSH))  {
         DBDMA_DPRINTFCH(ch, " Setting FLUSH !\n");
