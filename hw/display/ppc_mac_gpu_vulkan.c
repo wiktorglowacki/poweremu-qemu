@@ -46,6 +46,7 @@
 #include "qemu/bswap.h"
 #include "qemu/processor.h"
 #include "system/system.h"
+#include "system/runstate.h"
 #include "qemu/main-loop.h"
 
 #include <vulkan/vulkan.h>
@@ -391,7 +392,13 @@ static void vk_pipecache_save(Notifier *n, void *data)
     }
 }
 
-static Notifier vk_pipecache_exit = { .notify = vk_pipecache_save };
+/*
+ * Saved when QEMU shuts down (window closed, QMP quit, SIGTERM, guest
+ * power-off), from the main loop while the device and any Vulkan layers
+ * are still up.  An exit notifier ran after the layers' own atexit
+ * teardown: the validation layer aborted in vkGetPipelineCacheData.
+ */
+static Notifier vk_pipecache_shutdown = { .notify = vk_pipecache_save };
 
 static bool vk_ctx_init(void)
 {
@@ -661,7 +668,7 @@ static bool vk_ctx_init(void)
                 pcci.initialDataSize = 0;
                 vkCreatePipelineCache(V.dev, &pcci, NULL, &V.pipecache);
             }
-            qemu_add_exit_notifier(&vk_pipecache_exit);
+            qemu_register_shutdown_notifier(&vk_pipecache_shutdown);
         }
     }
 
