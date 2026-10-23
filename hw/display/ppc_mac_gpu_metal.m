@@ -8989,6 +8989,7 @@ static MTLPixelFormat r300_rt_pf(uint32_t view)
     case R300_RTV_R32U:    return MTLPixelFormatR32Uint;
     case R300_RTV_RG32U:   return MTLPixelFormatRG32Uint;
     case R300_RTV_RGBA32U: return MTLPixelFormatRGBA32Uint;
+    case R300_RTV_RGB565:  return MTLPixelFormatB5G6R5Unorm;
     default:               return MTLPixelFormatRGBA8Unorm;
     }
 }

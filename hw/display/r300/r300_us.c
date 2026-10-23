@@ -92,14 +92,28 @@ uint32_t r300_tex_raw_bpp(uint32_t txformat)
     }
 }
 
-uint32_t r300_cb_view(uint32_t cf, uint32_t of, uint32_t *bpp)
+static bool rt565_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_VK_RT565");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+uint32_t r300_cb_view(uint32_t cf, uint32_t of, uint32_t endian, uint32_t *bpp)
 {
     of &= 0x1F;
     switch (cf & 0xF) {
     case 9:                                         /* I8 */
         *bpp = 1;
         return R300_RTV_R8U;
-    case 3: case 4: case 13: case 15:               /* 1555, 565, UV88, 4444 */
+    case 4:                                         /* 565 */
+        *bpp = 2;
+        return endian || !rt565_on() ? R300_RTV_R16U : R300_RTV_RGB565;
+    case 3: case 13: case 15:                       /* 1555, UV88, 4444 */
         *bpp = 2;
         return R300_RTV_R16U;
     case 6:                                         /* ARGB8888 */
@@ -595,7 +609,7 @@ uint32_t r300_color_endian(const R300State *st, unsigned target)
      * remove this opt-in exception when the hardware view is established. */
     if (st->morphos_color_compat && st->card_bytes && endian == 2 &&
         ((pitch >> 21) & 15) == 6 &&
-        r300_cb_view(6, r300_us_out_fmt(st, target), &bpp) == R300_RTV_RGBA8) {
+        r300_cb_view(6, r300_us_out_fmt(st, target), endian, &bpp) == R300_RTV_RGBA8) {
         return 0;
     }
     return endian;
@@ -1234,7 +1248,7 @@ static void us_emit_cb(R300Sb *sb, const R300State *st, unsigned k)
     uint32_t pitch = r300_reg(st, RB3D_COLORPITCH0 + 4 * k);
     uint32_t cf = (pitch >> 21) & 0xF, e = r300_color_endian(st, k);
     uint32_t ofr = r300_us_out_fmt(st, k), of = ofr & 0x1F;
-    uint32_t bpp, view = r300_cb_view(cf, of, &bpp);
+    uint32_t bpp, view = r300_cb_view(cf, of, e, &bpp);
     bool sg[4];
     const char *type, *load, *pad;
     char sel[64], swap[16];
@@ -1263,6 +1277,17 @@ static void us_emit_cb(R300Sb *sb, const R300State *st, unsigned k)
             "vec4 r300_cb%u_unpack(vec4 fb) { return r300_unpack(fb, %s, %s); }\n"
             "vec4 r300_cb%u_pack(vec4 c) { return r300_pack(c, %s, %s); }\n\n",
             k, k, k, k, k, k, R300_BIND_FB0 + k, k, k, k, k, sel, swap, k, sel, swap);
+        return;
+    }
+    if (view == R300_RTV_RGB565) {
+        r300_sb_printf(sb,
+            "#define r300_cb%u_t vec4\n#define r300_cb%u_o vec4\n#define R300_CB%u_OUT(x) (x)\n"
+            "#define R300_CB%u_CLAMP true\n#define R300_CB%u_BLEND true\n"
+            "layout(input_attachment_index = %u, set = 0, binding = %u) uniform subpassInput fbin%u;\n"
+            "#define R300_FB%u_LOAD subpassLoad(fbin%u)\n"
+            "vec4 r300_cb%u_unpack(vec4 fb) { return r300_from_hw(vec4(fb.z, fb.y, fb.x, 1.0), %s); }\n"
+            "vec4 r300_cb%u_pack(vec4 c) { vec4 h = r300_to_hw(c, %s); return vec4(h.z, h.y, h.x, c.w); }\n\n",
+            k, k, k, k, k, k, R300_BIND_FB0 + k, k, k, k, k, sel, k, sel);
         return;
     }
     type = view == R300_RTV_RG32U ? "uvec2" : view == R300_RTV_RGBA32U ? "uvec4" : "uint";

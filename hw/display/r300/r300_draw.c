@@ -1786,7 +1786,7 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     pkt->rt_tiling = (pitch_reg >> 16) & 3;
     pkt->rt_format = (pitch_reg >> 21) & 0xF;
     pkt->rt_view = r300_cb_view(pkt->rt_format, r300_reg(st, US_OUT_FMT_0),
-                                &pkt->rt_bpp);
+                                r300_color_endian(st, 0), &pkt->rt_bpp);
     if ((pkt->rt_bpp == 1 && (pitch_reg >> 19) & 3) ||
         (pkt->rt_bpp == 2 && ((pitch_reg >> 19) & 3) >= 2)) {
         pkt->warn |= R300_WARN_RTFMT;   /* swap across pixels: not done */
@@ -1806,7 +1806,7 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         c->pitch = pr & 0x3FFE;
         c->tiling = (pr >> 16) & 3;
         c->format = (pr >> 21) & 0xF;
-        c->view = r300_cb_view(c->format, r300_us_out_fmt(st, k), &c->bpp);
+        c->view = r300_cb_view(c->format, r300_us_out_fmt(st, k), r300_color_endian(st, k), &c->bpp);
         if (c->view == R300_RTV_NONE || !c->pitch) {
             pkt->warn |= R300_WARN_RTFMT;
             pkt->num_cb = k;            /* bind the ones before it */

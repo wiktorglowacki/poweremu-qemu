@@ -187,8 +187,9 @@ enum {
     R300_RTV_R32U,
     R300_RTV_RG32U,
     R300_RTV_RGBA32U,
+    R300_RTV_RGB565,            /* 565 without a byte swap: float R5G6B5 view */
 };
-uint32_t r300_cb_view(uint32_t colorformat, uint32_t outfmt, uint32_t *bpp);
+uint32_t r300_cb_view(uint32_t colorformat, uint32_t outfmt, uint32_t endian, uint32_t *bpp);
 uint32_t r300_color_endian(const R300State *st, unsigned target);
 
 /* R300 US constants are 24-bit floats (1 sign, 7 exponent, 16 mantissa). */

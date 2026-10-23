@@ -159,12 +159,13 @@ static Target render_cb(uint32_t cf, uint32_t of, uint32_t endian, const float c
     program(&st, false);
     r300_state_write(&st, 0x4E38, (cf << 21) | (endian << 19) | W);
     r300_state_write(&st, 0x46A4, of);
-    view = r300_cb_view(cf, of, &bpp);
+    view = r300_cb_view(cf, of, endian, &bpp);
     MTLPixelFormat pf = view == R300_RTV_R8U ? MTLPixelFormatR8Uint :
                         view == R300_RTV_R16U ? MTLPixelFormatR16Uint :
                         view == R300_RTV_R32U ? MTLPixelFormatR32Uint :
                         view == R300_RTV_RG32U ? MTLPixelFormatRG32Uint :
                         view == R300_RTV_RGBA32U ? MTLPixelFormatRGBA32Uint :
+                        view == R300_RTV_RGB565 ? MTLPixelFormatB5G6R5Unorm :
                                                    MTLPixelFormatRGBA8Unorm;
     Target t = target(pf, bpp, fill);
     char *m = msl_for(&st);

@@ -1950,7 +1950,8 @@ static bool vk_hwz(void)
  * shader still blend there, and so do factors that read alpha when alpha is
  * not the last byte (the pipeline's alpha equation is the last byte's).
  */
-static void vk_ffblend(R300FSUniforms *u, VkPipelineColorBlendAttachmentState *ba, float bc[4])
+static void vk_ffblend(R300FSUniforms *u, VkPipelineColorBlendAttachmentState *ba, float bc[4],
+                       bool c565)
 {
     static const VkBlendFactor bf[15] = {
         VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ONE,
@@ -1980,7 +1981,7 @@ static void vk_ffblend(R300FSUniforms *u, VkPipelineColorBlendAttachmentState *b
         return;
     }
     for (int i = 0; i < 4; i++) {
-        p[i] = u->out_sel[u->rt_swap32 ? 3 - i : i];
+        p[i] = c565 ? (i == 3 ? 0 : u->out_sel[2 - i]) : u->out_sel[u->rt_swap32 ? 3 - i : i];
         seen |= 1u << p[i];
         mask |= (u->chanmask >> (3 - p[i]) & 1) << i;
         bc[i] = u->blend_color[(p[i] + 3) & 3];
@@ -3310,6 +3311,7 @@ static VkFormat vk_rt_format(uint32_t view)
     case R300_RTV_R32U:    return VK_FORMAT_R32_UINT;
     case R300_RTV_RG32U:   return VK_FORMAT_R32G32_UINT;
     case R300_RTV_RGBA32U: return VK_FORMAT_R32G32B32A32_UINT;
+    case R300_RTV_RGB565:  return VK_FORMAT_R5G6B5_UNORM_PACK16;
     default:               return VK_FORMAT_R8G8B8A8_UNORM;
     }
 }
@@ -3597,8 +3599,9 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                                          : VK_FRONT_FACE_CLOCKWISE;
     float bc[4];
     pk.cba.colorWriteMask = 0xF;
-    if (ncb == 1 && fmt[0] == VK_FORMAT_R8G8B8A8_UNORM && (hz || !pass_z)) {
-        vk_ffblend(&u, &pk.cba, bc);
+    if (ncb == 1 && (fmt[0] == VK_FORMAT_R8G8B8A8_UNORM || fmt[0] == VK_FORMAT_R5G6B5_UNORM_PACK16) &&
+        (hz || !pass_z)) {
+        vk_ffblend(&u, &pk.cba, bc, fmt[0] == VK_FORMAT_R5G6B5_UNORM_PACK16);
     }
     /* GPU vertex shading (R300_GLSL_GPU_VS): triangles only, no line pass */
     bool gpu_vs = pkt->vs_glsl && pkt->vs_id;
