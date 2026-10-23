@@ -182,6 +182,7 @@ static void screamer_pace_cb(void *opaque)
     int64_t due = s->pace_frac / NANOSECONDS_PER_SECOND;
     s->pace_frac -= due * NANOSECONDS_PER_SECOND;
     due = MIN(due, (int64_t)s->rate / 20);    /* at most 50 ms after a stall */
+    timer_mod(s->pace_timer, now + SCREAMER_PACE_NS);
 
     int moved = 0;
     int64_t left = due + s->rx_carry;
@@ -220,9 +221,8 @@ static void screamer_pace_cb(void *opaque)
     if (moved) {
         s->pace_idle = 0;
     } else if (++s->pace_idle > 200) {      /* ~200 ms without DMA: stop */
-        return;
+        timer_del(s->pace_timer);
     }
-    timer_mod(s->pace_timer, now + SCREAMER_PACE_NS);
 }
 
 static void screamer_pace_start(ScreamerState *s)
