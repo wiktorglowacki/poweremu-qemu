@@ -32,7 +32,7 @@ void tlb_unprotect_code(ram_addr_t ram_addr);
 
 /*
  * Self-modifying code by the guest's cache instructions (set by the target,
- * PPC: PPC_ICBI_SMC=1).  CPU stores no longer trap on pages that hold
+ * PPC: unless PPC_ICBI_SMC=0).  CPU stores no longer trap on pages that hold
  * translated code; the target invalidates code itself where the
  * architecture demands it (PPC icbi, HID0[ICFI]) with tlb_invalidate_code().
  * DMA writes still invalidate through the DIRTY_MEMORY_CODE bitmap.

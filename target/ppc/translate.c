@@ -98,11 +98,11 @@ void ppc_translate_init(void)
 #if !defined(CONFIG_USER_ONLY)
     {
         /*
-         * PPC_ICBI_SMC=1: translated code is invalidated by the guest's
-         * icbi and HID0[ICFI] instead of by trapping stores to code pages.
+         * PPC_ICBI_SMC=0: translated code is invalidated by trapping stores
+         * to code pages instead of by the guest's icbi and HID0[ICFI].
          */
         const char *e = getenv("PPC_ICBI_SMC");
-        tcg_smc_by_icbi = e && e[0] == '1';
+        tcg_smc_by_icbi = !(e && e[0] == '0');
     }
     {
         const char *e = getenv("PPC_SYNC_EXIT");
