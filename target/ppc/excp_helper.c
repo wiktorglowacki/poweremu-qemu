@@ -2163,8 +2163,8 @@ void ppc_maybe_interrupt(CPUPPCState *env)
     /*
      * The guest rewrites MSR constantly, and every write came here to take
      * the BQL, which the GPU command thread holds for most of a game frame
-     * (half the vCPU's time went to waiting for it).  With nothing pending
-     * and CPU_INTERRUPT_HARD already clear there is nothing to change; a
+     * (half the vCPU's time went to waiting for it).  With nothing unmasked
+     * pending and CPU_INTERRUPT_HARD clear there is nothing to change; a
      * source raising an interrupt calls this itself, under the BQL, after
      * setting pending_interrupts.
      *
@@ -2177,9 +2177,17 @@ void ppc_maybe_interrupt(CPUPPCState *env)
      * and CPU_INTERRUPT_HARD clear until the next MSR write -- forever in a
      * user-mode loop that waits for the decrementer.
      */
+    static int unmasked_check = -1;
+
+    if (unlikely(unmasked_check < 0)) {
+        const char *e = getenv("PPC_IRQ_UNMASKED_CHECK");
+        unmasked_check = !(e && e[0] == '0');
+    }
     smp_mb();
-    if (!bql_locked() && !qatomic_read(&env->pending_interrupts) &&
-        !(qatomic_read(&cs->interrupt_request) & CPU_INTERRUPT_HARD)) {
+    if (!bql_locked() &&
+        !(qatomic_read(&cs->interrupt_request) & CPU_INTERRUPT_HARD) &&
+        (!qatomic_read(&env->pending_interrupts) ||
+         (unmasked_check && !ppc_next_unmasked_interrupt(env)))) {
         return;
     }
 
