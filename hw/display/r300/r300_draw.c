@@ -1619,13 +1619,22 @@ static bool copy_state(const R300State *st, unsigned *coord)
 {
     uint32_t cb = r300_reg(st, RB3D_CBLEND);
     uint32_t ab = r300_reg(st, RB3D_ABLEND);
+    uint32_t fb = r300_reg(st, FG_FOG_BLEND);
     bool no_blend = !(cb & 1) && !((cb >> 3) & 7);
     bool alpha_over = cb == 0x27260007 && ab == 0x27210000;
+    static int fog_copy = -1;
+
+    if (fog_copy < 0) {
+        const char *e = getenv("PPCGPU_CPU_COPY_FOG");
+        fog_copy = !(e && e[0] == '0');
+    }
+    bool no_fog = !(fb & 1) ||
+                  (fog_copy && (((fb >> 1) & 3) != 3 || !(r300_reg(st, FG_FOG_FACTOR) & 0x3FF)));
 
     return r300_reg(st, TX_ENABLE) == 1 && !(r300_reg(st, ZB_CNTL) & 7) &&
            (no_blend || alpha_over) &&
            !(r300_reg(st, FG_ALPHA_FUNC) & (1u << 11)) &&
-           !(r300_reg(st, FG_FOG_BLEND) & 1) && !(r300_reg(st, RB3D_ROPCNTL) & 4) &&
+           no_fog && !(r300_reg(st, RB3D_ROPCNTL) & 4) &&
            (r300_reg(st, RB3D_COLOR_CHANNEL_MASK) & 0xF) == 0xF &&
            (r300_reg(st, SC_CLIP_RULE) & 0xFFFF) == 0xFFFF &&
            !(r300_reg(st, VAP_CLIP_CNTL) & 0x3F) &&     /* user clip planes */
@@ -1657,9 +1666,11 @@ static void copy_detect(const R300FSDesc *desc, const Route *route,
         td->dim != R300_TEXDIM_2D || td->tiling) {
         return;
     }
+    uint32_t fb = pkt->uniforms.fog_blend;
     for (int i = 0; i < 6; i++) {
         const float *p = v[i].pos, *t = v[i].v[k];
-        if (p[3] != 1.0f || !(p[2] >= 0.0f && p[2] <= 1.0f)) {
+        if (p[3] != 1.0f || !(p[2] >= 0.0f && p[2] <= 1.0f) ||
+            ((fb & 1) && ((fb >> 1) & 3) != 3 && v[i].aux[0] > 0.0f)) {
             return;
         }
         xy[i][0] = (p[0] + 1) * pkt->rt_width * 0.5f;
