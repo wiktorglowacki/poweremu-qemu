@@ -2495,6 +2495,30 @@ static void ppc_mac_gpu_present_done(void *arg, uint32_t seq)
     dpy_refresh_soon(s->con);
 }
 
+static inline uint32_t ppc_mac_gpu_px16(uint32_t v, bool is565)
+{
+    uint32_t r, g, b;
+
+    if (is565) {
+        r = (v >> 11) & 31; g = (v >> 5) & 63; b = v & 31;
+        r = (r << 3) | (r >> 2); g = (g << 2) | (g >> 4);
+    } else {
+        r = (v >> 10) & 31; g = (v >> 5) & 31; b = v & 31;
+        r = (r << 3) | (r >> 2); g = (g << 3) | (g >> 2);
+    }
+    b = (b << 3) | (b >> 2);
+    return 0xFF000000u | (r << 16) | (g << 8) | b;
+}
+
+static inline void ppc_mac_gpu_line16(uint32_t *dp, const uint8_t *sp,
+                                      uint32_t w, bool le, bool is565)
+{
+    for (uint32_t x = 0; x < w; x++) {
+        dp[x] = ppc_mac_gpu_px16(le ? lduw_le_p(sp + 2 * x) :
+                                      lduw_be_p(sp + 2 * x), is565);
+    }
+}
+
 static void ppc_mac_gpu_display_update_inner(void *opaque);
 
 /* The refresh timer calls this with the BQL held: time it (rate line). */
@@ -2694,26 +2718,30 @@ static void ppc_mac_gpu_display_update_inner(void *opaque)
         }
         s->display_invalid = false;
         bool is565 = s->disp.bpp == 16;
+        static int line16_generic = -1;
+        if (line16_generic < 0) {
+            line16_generic = getenv("PPCGPU_LINE16_GENERIC") != NULL;
+        }
         if ((uint64_t)s->disp.offset + (uint64_t)stride * height <= s->vram_size) {
             for (uint32_t y = 0; y < height; y++) {
                 const uint8_t *sp = vram_ptr + s->disp.offset + (uint64_t)y * stride;
                 uint32_t *dp = (uint32_t *)s->shadow_buf + (uint64_t)y * width;
-                for (uint32_t x = 0; x < width; x++) {
-                    if (bpp_bytes == 1) {
+                if (bpp_bytes == 1) {
+                    for (uint32_t x = 0; x < width; x++) {
                         dp[x] = 0xFF000000u | (s->regs.palette[sp[x]] & 0xFFFFFF);
-                        continue;
                     }
-                    uint32_t v = s->r300_card_bytes ? lduw_le_p(sp + 2 * x) : lduw_be_p(sp + 2 * x);
-                    uint32_t r, g, b;
+                } else if (line16_generic) {
+                    ppc_mac_gpu_line16(dp, sp, width, s->r300_card_bytes, is565);
+                } else if (s->r300_card_bytes) {
                     if (is565) {
-                        r = (v >> 11) & 31; g = (v >> 5) & 63; b = v & 31;
-                        r = (r << 3) | (r >> 2); g = (g << 2) | (g >> 4);
+                        ppc_mac_gpu_line16(dp, sp, width, true, true);
                     } else {
-                        r = (v >> 10) & 31; g = (v >> 5) & 31; b = v & 31;
-                        r = (r << 3) | (r >> 2); g = (g << 3) | (g >> 2);
+                        ppc_mac_gpu_line16(dp, sp, width, true, false);
                     }
-                    b = (b << 3) | (b >> 2);
-                    dp[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+                } else if (is565) {
+                    ppc_mac_gpu_line16(dp, sp, width, false, true);
+                } else {
+                    ppc_mac_gpu_line16(dp, sp, width, false, false);
                 }
             }
         }
