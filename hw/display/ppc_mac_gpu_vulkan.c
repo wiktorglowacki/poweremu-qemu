@@ -2039,7 +2039,8 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
         VkImg *c = &V.img[i];
         if (c->live && c->cls == cls && c->addr == addr && c->width == w &&
             c->pitch == pitch && c->fmt == fmt && c->tiling == tiling &&
-            (c->height == h || (c->height > h && c->height <= max_h)) &&
+            (c->height == h || (c->height > h && (c->height <= max_h ||
+             (max_h && vk_range_gen(addr + (uint64_t)h * pitch, vk_img_hi(c)) <= c->gen)))) &&
             (!im || c->height > im->height)) {
             im = c;
         }
@@ -3369,8 +3370,9 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     /* The framebuffer: sample k of row y is row y * ns + k (see Metal). */
     fbw = ns > 1 ? ns * pkt->rt_pitch : pkt->rt_width;
     /* Keep image heights stable while avoiding an unused 4096-row tail. */
-    uint32_t fbh = MIN(pkt->rt_height, ROUND_UP(sy1, 256));
-    uint32_t rt_max_h = vk_rt_grow() ? pkt->rt_height : 0;
+    uint32_t rt_h = ROUND_UP(pkt->rt_height, 8);
+    uint32_t fbh = MIN(rt_h, ROUND_UP(sy1, 256));
+    uint32_t rt_max_h = vk_rt_grow() ? rt_h : 0;
     for (uint32_t k = 0; k < ncb; k++) {
         uint32_t view = k ? pkt->cb[k].view : pkt->rt_view;
         addr[k] = k ? pkt->cb[k].gpu_addr : pkt->rt_gpu_addr;
