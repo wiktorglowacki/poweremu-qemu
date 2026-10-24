@@ -138,6 +138,19 @@ static inline CPUTLBEntry *tlb_entry(CPUState *cpu, uintptr_t mmu_idx,
     return &cpu->neg.tlb.f[mmu_idx].table[tlb_index(cpu, mmu_idx, addr)];
 }
 
+/*
+ * $TCG_TLB_FIX=0: a flush that found nothing dirty still empties the jump
+ * cache, and flushing a victim entry decrements n_used_entries again.
+ */
+static bool tcg_tlb_fix = true;
+
+static void __attribute__((constructor)) tcg_tlb_fix_init(void)
+{
+    const char *e = getenv("TCG_TLB_FIX");
+
+    tcg_tlb_fix = !(e && e[0] == '0');
+}
+
 static void tlb_window_reset(CPUTLBDesc *desc, int64_t ns,
                              size_t max_entries)
 {
@@ -390,7 +403,13 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
 
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 
-    tcg_flush_jmp_cache(cpu);
+    /*
+     * No index was dirty: nothing was filled since those indexes were last
+     * flushed, together with the jump cache, so it holds nothing of theirs.
+     */
+    if (to_clean || !tcg_tlb_fix) {
+        tcg_flush_jmp_cache(cpu);
+    }
 
     if (to_clean == ALL_MMUIDX_BITS) {
         qatomic_set(&cpu->neg.tlb.c.full_flush_count,
@@ -487,7 +506,14 @@ static void tlb_flush_vtlb_page_mask_locked(CPUState *cpu, int mmu_idx,
 
     assert_cpu_is_self(cpu);
     for (k = 0; k < CPU_VTLB_SIZE; k++) {
-        if (tlb_flush_entry_mask_locked(&d->vtable[k], page, mask)) {
+        /*
+         * n_used_entries counts the main table only: tlb_set_page_full()
+         * already subtracted an entry when it moved it to the victim table.
+         * Subtracting again wrapped the count, and the next flush of the
+         * index then doubled the TLB.
+         */
+        if (tlb_flush_entry_mask_locked(&d->vtable[k], page, mask) &&
+            !tcg_tlb_fix) {
             tlb_n_used_entries_dec(cpu, mmu_idx);
         }
     }
