@@ -236,19 +236,34 @@ static inline bool cpu_physical_memory_all_dirty(ram_addr_t start,
     return dirty;
 }
 
+/* One page's bit in one client's dirty bitmap; call under the RCU lock. */
+static inline bool cpu_physical_memory_dirty_page_test(unsigned long page,
+                                                       unsigned client)
+{
+    DirtyMemoryBlocks *blocks = qatomic_rcu_read(&ram_list.dirty_memory[client]);
+
+    return test_bit(page % DIRTY_MEMORY_BLOCK_SIZE,
+                    blocks->blocks[page / DIRTY_MEMORY_BLOCK_SIZE]);
+}
+
 static inline bool cpu_physical_memory_get_dirty_flag(ram_addr_t addr,
                                                       unsigned client)
 {
-    return cpu_physical_memory_get_dirty(addr, 1, client);
+    assert(client < DIRTY_MEMORY_NUM);
+    RCU_READ_LOCK_GUARD();
+    return cpu_physical_memory_dirty_page_test(addr >> TARGET_PAGE_BITS,
+                                               client);
 }
 
 static inline bool cpu_physical_memory_is_clean(ram_addr_t addr)
 {
-    bool vga = cpu_physical_memory_get_dirty_flag(addr, DIRTY_MEMORY_VGA);
-    bool code = cpu_physical_memory_get_dirty_flag(addr, DIRTY_MEMORY_CODE);
-    bool migration =
-        cpu_physical_memory_get_dirty_flag(addr, DIRTY_MEMORY_MIGRATION);
-    return !(vga && code && migration);
+    unsigned long page = addr >> TARGET_PAGE_BITS;
+
+    RCU_READ_LOCK_GUARD();
+    return !(cpu_physical_memory_dirty_page_test(page, DIRTY_MEMORY_VGA) &&
+             cpu_physical_memory_dirty_page_test(page, DIRTY_MEMORY_CODE) &&
+             cpu_physical_memory_dirty_page_test(page,
+                                                 DIRTY_MEMORY_MIGRATION));
 }
 
 static inline uint8_t cpu_physical_memory_range_includes_clean(ram_addr_t start,
