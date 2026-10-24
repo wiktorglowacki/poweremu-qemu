@@ -23,6 +23,7 @@
 #include "exec/exec-all.h"
 #include "internal.h"
 #include "fpu/softfloat.h"
+#include "fp32-conv.h"
 
 static inline float128 float128_snan_to_qnan(float128 x)
 {
@@ -64,42 +65,7 @@ static inline bool fp_exceptions_enabled(CPUPPCState *env)
  */
 uint64_t helper_todouble(uint32_t arg)
 {
-    uint32_t abs_arg = arg & 0x7fffffff;
-    uint64_t ret;
-
-    if (likely(abs_arg >= 0x00800000)) {
-        if (unlikely(extract32(arg, 23, 8) == 0xff)) {
-            /* Inf or NAN.  */
-            ret  = (uint64_t)extract32(arg, 31, 1) << 63;
-            ret |= (uint64_t)0x7ff << 52;
-            ret |= (uint64_t)extract32(arg, 0, 23) << 29;
-        } else {
-            /* Normalized operand.  */
-            ret  = (uint64_t)extract32(arg, 30, 2) << 62;
-            ret |= ((extract32(arg, 30, 1) ^ 1) * (uint64_t)7) << 59;
-            ret |= (uint64_t)extract32(arg, 0, 30) << 29;
-        }
-    } else {
-        /* Zero or Denormalized operand.  */
-        ret = (uint64_t)extract32(arg, 31, 1) << 63;
-        if (unlikely(abs_arg != 0)) {
-            /*
-             * Denormalized operand.
-             * Shift fraction so that the msb is in the implicit bit position.
-             * Thus, shift is in the range [1:23].
-             */
-            int shift = clz32(abs_arg) - 8;
-            /*
-             * The first 3 terms compute the float64 exponent.  We then bias
-             * this result by -1 so that we can swallow the implicit bit below.
-             */
-            int exp = -126 - shift + 1023 - 1;
-
-            ret |= (uint64_t)exp << 52;
-            ret += (uint64_t)abs_arg << (52 - 23 + shift);
-        }
-    }
-    return ret;
+    return ppc_todouble(arg);
 }
 
 /*
@@ -108,28 +74,7 @@ uint64_t helper_todouble(uint32_t arg)
  */
 uint32_t helper_tosingle(uint64_t arg)
 {
-    int exp = extract64(arg, 52, 11);
-    uint32_t ret;
-
-    if (likely(exp > 896)) {
-        /* No denormalization required (includes Inf, NaN).  */
-        ret  = extract64(arg, 62, 2) << 30;
-        ret |= extract64(arg, 29, 30);
-    } else {
-        /*
-         * Zero or Denormal result.  If the exponent is in bounds for
-         * a single-precision denormal result, extract the proper
-         * bits.  If the input is not zero, and the exponent is out of
-         * bounds, then the result is undefined; this underflows to
-         * zero.
-         */
-        ret = extract64(arg, 63, 1) << 31;
-        if (unlikely(exp >= 874)) {
-            /* Denormal result.  */
-            ret |= ((1ULL << 52) | extract64(arg, 0, 52)) >> (896 + 30 - exp);
-        }
-    }
-    return ret;
+    return ppc_tosingle(arg);
 }
 
 static inline int ppc_float32_get_unbiased_exp(float32 f)

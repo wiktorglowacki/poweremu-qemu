@@ -1202,11 +1202,112 @@ static void gen_mtfsfi(DisasContext *ctx)
     ctx->base.is_jmp = DISAS_CHAIN_UPDATE;
 }
 
+/*
+ * lfs/lfsu/lfsx and stfs/stfsu/stfsx: the single <-> double conversion
+ * inline.  The VSX lxssp/stxssp family shares these two functions and
+ * gets it too.
+ *
+ * helper_todouble() and helper_tosingle() are pure bit manipulation, so
+ * all a load or store pays for them is the call: 11.8% and 2.9% of the
+ * vCPU thread's samples in Doom 3 (and replacing the body with one host
+ * cvtss2sd changed nothing, the call is the cost).  Both conversions
+ * have a form that is a handful of integer ops for the values a guest
+ * uses, so this emits that form and branches to the existing helper for
+ * everything else.  The arithmetic is ppc_todouble()/ppc_tosingle() in
+ * fp32-conv.h, which the helpers are wrappers around too; the branch
+ * goes the other way for
+ *
+ *  - a zero, denormal, infinity or NaN in a single: the helper shifts a
+ *    denormal's mantissa up, and leaves a signalling NaN's quiet bit
+ *    clear where a host cvtss2sd would set it, and
+ *  - a zero, denormal or underflowing double being stored: the helper
+ *    denormalises it with a variable shift.
+ *
+ * Neither helper reads or writes FPSCR or the softfloat status, and the
+ * PowerPC definitions ignore the rounding mode, so unlike the arithmetic
+ * paths this needs no fpscr or hflags test.  PPC_NATIVE_FP=0 (the kill
+ * switch) and PPC_STRICT_FP=1 keep everything on the helpers.
+ */
+static bool native_fp_conv_on(void)
+{
+#if defined(__x86_64__)
+    static int on = -1;
+    if (on < 0) {
+        const char *strict = getenv("PPC_STRICT_FP");
+        const char *nat = getenv("PPC_NATIVE_FP");
+        on = !(strict && strict[0] == '1') && !(nat && nat[0] == '0');
+    }
+    return on;
+#else
+    /* other hosts keep the call they have always made */
+    return false;
+#endif
+}
+
+/* ppc_todouble() of a normal single, one TCG op per line of it. */
+static void gen_native_todouble(TCGv_i64 dest, TCGv_i32 src)
+{
+    TCGLabel *slow = gen_new_label();
+    TCGLabel *done = gen_new_label();
+    TCGv_i64 x = tcg_temp_new_i64();
+    TCGv_i64 a = tcg_temp_new_i64();
+    TCGv_i64 t = tcg_temp_new_i64();
+
+    tcg_gen_extu_i32_i64(x, src);
+    tcg_gen_andi_i64(a, x, 0x7fffffff);
+    /* normal: (arg & 0x7fffffff) in [0x00800000, 0x7f800000) */
+    tcg_gen_subi_i64(t, a, 0x00800000);
+    tcg_gen_brcondi_i64(TCG_COND_GEU, t, 0x7f000000, slow);
+
+    /* sign | (exponent + 896) << 52 | mantissa << 29 */
+    tcg_gen_shli_i64(dest, a, 29);
+    tcg_gen_addi_i64(dest, dest, (int64_t)896 << 52);
+    tcg_gen_andi_i64(t, x, 0x80000000);
+    tcg_gen_shli_i64(t, t, 32);
+    tcg_gen_or_i64(dest, dest, t);
+    tcg_gen_br(done);
+
+    gen_set_label(slow);
+    gen_helper_todouble(dest, src);
+    gen_set_label(done);
+}
+
+/* ppc_tosingle() of a double big enough that no denormalising is needed. */
+static void gen_native_tosingle(TCGv_i32 dest, TCGv_i64 src)
+{
+    TCGLabel *slow = gen_new_label();
+    TCGLabel *done = gen_new_label();
+    TCGv_i64 t = tcg_temp_new_i64();
+    TCGv_i64 u = tcg_temp_new_i64();
+
+    /* exp > 896, which includes infinities and NaNs */
+    tcg_gen_shri_i64(t, src, 52);
+    tcg_gen_andi_i64(t, t, 0x7ff);
+    tcg_gen_brcondi_i64(TCG_COND_LEU, t, 896, slow);
+
+    /* truncate: (arg >> 29) & 0x3fffffff | (arg >> 62) << 30 */
+    tcg_gen_shri_i64(u, src, 29);
+    tcg_gen_andi_i64(u, u, 0x3fffffff);
+    tcg_gen_shri_i64(t, src, 62);
+    tcg_gen_shli_i64(t, t, 30);
+    tcg_gen_or_i64(u, u, t);
+    tcg_gen_extrl_i64_i32(dest, u);
+    tcg_gen_br(done);
+
+    gen_set_label(slow);
+    gen_helper_tosingle(dest, src);
+    gen_set_label(done);
+}
+
 static void gen_qemu_ld32fs(DisasContext *ctx, TCGv_i64 dest, TCGv addr)
 {
     TCGv_i32 tmp = tcg_temp_new_i32();
     tcg_gen_qemu_ld_i32(tmp, addr, ctx->mem_idx, DEF_MEMOP(MO_UL));
-    gen_helper_todouble(dest, tmp);
+    if (native_fp_conv_on()) {
+        gen_native_todouble(dest, tmp);
+    } else {
+        gen_helper_todouble(dest, tmp);
+    }
 }
 
 /* lfdepx (external PID lfdx) */
@@ -1348,7 +1449,11 @@ static void glue(gen_, name##x)(DisasContext *ctx)                            \
 static void gen_qemu_st32fs(DisasContext *ctx, TCGv_i64 src, TCGv addr)
 {
     TCGv_i32 tmp = tcg_temp_new_i32();
-    gen_helper_tosingle(tmp, src);
+    if (native_fp_conv_on()) {
+        gen_native_tosingle(tmp, src);
+    } else {
+        gen_helper_tosingle(tmp, src);
+    }
     tcg_gen_qemu_st_i32(tmp, addr, ctx->mem_idx, DEF_MEMOP(MO_UL));
 }
 
