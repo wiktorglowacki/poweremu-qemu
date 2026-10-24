@@ -594,7 +594,9 @@ void bql_lock_impl(const char *file, int line)
     if (unlikely(bql_stats_on())) {
         int64_t t0 = get_clock();
         if (qemu_mutex_trylock(&bql)) {
+            qatomic_inc(&bql_waiters);
             bql_lock_fn(&bql, file, line);
+            qatomic_dec(&bql_waiters);
             bql_st.waits++;
             bql_st.t_acq = get_clock();
             bql_st.wait_ns += bql_st.t_acq - t0;
