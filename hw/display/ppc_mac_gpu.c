@@ -4219,18 +4219,28 @@ static bool r300_cpu_copy(PPCMacGPUState *s, const R300DrawPacket *pkt)
             return false;
         }
         uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+        unsigned coord;
+        float ga = 1.0f;
+
+        /* the shader may scale the texel's alpha by a global alpha (copy_state
+         * took the draw for a copy because it blends with that alpha) */
+        r300_us_plain_copy(s->r3, &coord, &ga);
         for (uint32_t y = 0; y < h; y++) {
             uint8_t *o = vram + dst + y * pitch;
             const uint8_t *t = vram + src_lo + y * tpitch;
             for (uint32_t x = 0; x < w * 4; x += 4) {
-                uint32_t a = t[x], ia = 255 - a;
-                if (a == 255) {
-                    memcpy(o + x, t + x, 4);
-                } else if (a) {
-                    for (int c = 1; c < 4; c++) {
-                        uint32_t v = t[x + c] * a + o[x + c] * ia + 128;
-                        o[x + c] = (v + (v >> 8)) >> 8;
+                /*
+                 * Texels and pixels are B, G, R, A bytes (TX_FORMAT1 a60c,
+                 * COLORPITCH ARGB8888); CBLEND SRC_ALPHA, ONE_MINUS_SRC_ALPHA,
+                 * ABLEND ONE, ONE_MINUS_SRC_ALPHA, rounded to 8 bits like the
+                 * GPU's UNORM store.
+                 */
+                float a = t[x + 3] * ga * (1.0f / 255.0f);
+                if (a > 0.0f) {
+                    for (int c = 0; c < 3; c++) {
+                        o[x + c] = (uint8_t)(t[x + c] * a + o[x + c] * (1.0f - a) + 0.5f);
                     }
+                    o[x + 3] = (uint8_t)(255.0f * a + o[x + 3] * (1.0f - a) + 0.5f);
                 }
             }
         }
@@ -5419,6 +5429,46 @@ static void vram_rect_dirty(PPCMacGPUState *s, uint64_t offset, uint32_t pitch,
     }
 }
 
+/*
+ * GMC_SRC_DATATYPE (bits 13:12) of a host-data blit: 0 mono with
+ * DP_SRC_FRGD/BKGD_CLR, 1 mono with the background left alone, 3 colour;
+ * GMC_BYTE_PIX_ORDER (bit 14) LSB first.  MUI ghosts a disabled gadget
+ * with a 32x16 mono dither this way (gmc 0x53cc1603).
+ */
+static inline void fill_vram_px(PPCMacGPUState *s, uint8_t *vram,
+                                uint64_t addr, uint32_t color, uint32_t bpp);
+
+static uint8_t host_data_mono_mode(uint32_t gmc)
+{
+    uint32_t dt = (gmc >> 12) & 3;
+    return dt > 1 ? 0 : (dt + 1) | ((gmc >> 14) & 1) << 2;
+}
+
+/* One dword of mono host data: up to 32 pixels of the current row (a row
+ * starts on a fresh dword).  Returns false once the rectangle is done. */
+static bool host_data_put_mono(PPCMacGPUState *s, uint8_t *vram, uint32_t val, uint32_t bpp)
+{
+    /* the bytes in the order the colour path stores them */
+    uint32_t m = s->r300 && !s->r300_card_bytes ? bswap32(val) : val;
+
+    for (int i = 0; i < 32 && s->host_data_cur_x < s->host_data_w; i++) {
+        uint32_t byte = (m >> (i & ~7)) & 0xFF;
+        bool on = (byte >> ((s->host_data_mono & 4) ? (i & 7) : 7 - (i & 7))) & 1;
+        if (on || (s->host_data_mono & 3) == 1) {
+            uint64_t a = (uint64_t)s->host_data_offset +
+                         (uint64_t)(s->host_data_dst_y + s->host_data_cur_y) * s->host_data_pitch +
+                         (uint64_t)(s->host_data_dst_x + s->host_data_cur_x) * bpp;
+            fill_vram_px(s, vram, a, on ? s->regs.dp_src_frgd_clr : s->regs.dp_src_bkgd_clr, bpp);
+        }
+        s->host_data_cur_x++;
+    }
+    if (s->host_data_cur_x >= s->host_data_w) {
+        s->host_data_cur_x = 0;
+        s->host_data_cur_y++;
+    }
+    return s->host_data_cur_y < s->host_data_h;
+}
+
 static void ppc_mac_gpu_host_data_write(PPCMacGPUState *s, uint32_t val)
 {
     if (!s->host_data_active) {
@@ -5428,8 +5478,9 @@ static void ppc_mac_gpu_host_data_write(PPCMacGPUState *s, uint32_t val)
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
     uint32_t bpp = s->host_data_bpp ? s->host_data_bpp : 4;
 
-    if (bpp < 4) {
-        if (!host_data_put_narrow(s, vram, val, bpp, s->host_data_offset,
+    if (s->host_data_mono || bpp < 4) {
+        if (s->host_data_mono ? !host_data_put_mono(s, vram, val, bpp) :
+            !host_data_put_narrow(s, vram, val, bpp, s->host_data_offset,
                                   s->host_data_pitch, s->host_data_dst_x,
                                   s->host_data_dst_y, s->host_data_w,
                                   s->host_data_h, &s->host_data_cur_x,
@@ -6352,6 +6403,9 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
         s->host_data_cur_x = 0;
         s->host_data_cur_y = 0;
         s->host_data_bpp = gmc_dst_bpp(s->regs.dp_gui_master_cntl);
+        s->host_data_mono = host_data_mono_mode(s->regs.dp_gui_master_cntl);
+        /* written on the CPU: rendering pending there goes first */
+        r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y, blit_h), true, 1);
         s->host_data_active = true;
 
         gpu_debug_log("2D_HOST_BLT dst=0x%x+%u dxy=%u,%u %ux%u",
@@ -6872,6 +6926,8 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
         s->host_data_cur_x = 0;
         s->host_data_cur_y = 0;
         s->host_data_bpp = gmc_dst_bpp(gmc);
+        s->host_data_mono = host_data_mono_mode(gmc);
+        r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y, blit_h), true, 1);
         s->host_data_active = true;
         return;
     }
@@ -10478,6 +10534,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                         s->host_data_cur_x = pix_idx % blit_w;
                         s->host_data_cur_y = pix_idx / blit_w;
                         s->host_data_bpp = bpp;
+                        s->host_data_mono = 0;
                         s->host_data_active = true;
                     } else {
                         /* All inline data written, mark dirty */

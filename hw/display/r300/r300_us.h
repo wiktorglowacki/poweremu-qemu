@@ -97,8 +97,10 @@ typedef struct R300FSDesc {
 uint32_t r300_us_num_targets(const R300State *st);
 
 /* The program copies texture unit 0 unchanged to render target A;
- * *coord is the temporary holding the texture coordinates. */
-bool r300_us_plain_copy(const R300State *st, unsigned *coord);
+ * *coord is the temporary holding the texture coordinates.  *alpha is 1,
+ * or the constant the program scales the texel's alpha by (a copy only
+ * when the draw blends with that alpha). */
+bool r300_us_plain_copy(const R300State *st, unsigned *coord, float *alpha);
 
 /* US_OUT_FMT of render target k (target A's for a multiwrite target left
  * UNUSED). */

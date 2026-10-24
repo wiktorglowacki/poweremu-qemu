@@ -1620,6 +1620,7 @@ static bool copy_state(const R300State *st, unsigned *coord)
     uint32_t cb = r300_reg(st, RB3D_CBLEND);
     uint32_t ab = r300_reg(st, RB3D_ABLEND);
     uint32_t fb = r300_reg(st, FG_FOG_BLEND);
+    float alpha = 1.0f;
     bool no_blend = !(cb & 1) && !((cb >> 3) & 7);
     bool alpha_over = cb == 0x27260007 && ab == 0x27210000;
     static int fog_copy = -1;
@@ -1638,7 +1639,8 @@ static bool copy_state(const R300State *st, unsigned *coord)
            (r300_reg(st, RB3D_COLOR_CHANNEL_MASK) & 0xF) == 0xF &&
            (r300_reg(st, SC_CLIP_RULE) & 0xFFFF) == 0xFFFF &&
            !(r300_reg(st, VAP_CLIP_CNTL) & 0x3F) &&     /* user clip planes */
-           r300_us_num_targets(st) == 1 && r300_us_plain_copy(st, coord);
+           r300_us_num_targets(st) == 1 && r300_us_plain_copy(st, coord, &alpha) &&
+           (alpha == 1.0f || alpha_over);
 }
 
 /*
@@ -1657,8 +1659,19 @@ static void copy_detect(const R300FSDesc *desc, const Route *route,
     bool nearest = ((td->filter0 >> 9) & 3) == 1 && ((td->filter0 >> 11) & 3) == 1;
     /* MorphOS ATIRadeon sets s1/t1 to (w - 1/256)/w with linear filtering on 1:1 blits. */
     float tol = nearest ? 1e-3f : 8e-3f;
+    static int col = -1;
 
-    if (k < 0 || !route->vary[k].is_tex || !v || pkt->vs_glsl ||
+    if (col < 0) {
+        /* PPCGPU_CPU_WPA_GA=0: coordinates from texture interpolators only */
+        const char *e = getenv("PPCGPU_CPU_WPA_GA");
+        col = !(e && e[0] == '0');
+    }
+    /*
+     * WritePixelArrayAlpha routes its coordinates through a colour
+     * interpolator; v[] holds those values as well (flat shading would give
+     * every vertex the same ones, which the offset test below rejects).
+     */
+    if (k < 0 || (!route->vary[k].is_tex && !col) || !v || pkt->vs_glsl ||
         pkt->num_verts != 6 || pkt->num_line_verts || pkt->prim_class ||
         (pkt->cull & (R300_CULL_FRONT | R300_CULL_BACK)) ||
         pkt->num_cb != 1 || pkt->aa_samples > 1 || pkt->rt_tiling || pkt->rt_bpp != 4 ||

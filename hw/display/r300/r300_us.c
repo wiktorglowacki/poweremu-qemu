@@ -507,7 +507,31 @@ static bool us_mad_is_src0(uint32_t inst, unsigned src, unsigned one, unsigned z
                          (b == zero && a == one)));
 }
 
-bool r300_us_plain_copy(const R300State *st, unsigned *coord)
+/*
+ * Alpha MAD src * k + 0 (either order) with k the alpha of a US constant
+ * in [0, 1]: MorphOS's WritePixelArrayAlpha scales the texel's alpha by
+ * its global alpha this way (oc.a = t.a * c0.a).  *k: that constant.
+ */
+static bool us_mad_alpha_scaled(const R300State *st, uint32_t ai, uint32_t aa, float *k)
+{
+    unsigned a = ai & 0x1F, b = (ai >> 7) & 0x1F, c = (ai >> 14) & 0x1F;
+    unsigned sel = a == 9 ? b : b == 9 ? a : 0, addr;
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_CPU_WPA_GA");     /* 0: global alpha on the GPU */
+        on = !(e && e[0] == '0');
+    }
+    if (!on || (ai & 0x3FFFFFFFu & ~((0x1Fu) | (0x1Fu << 7) | (0x1Fu << 14))) != 0 ||
+        c != 16 || (sel != 10 && sel != 11)) {
+        return false;
+    }
+    addr = (aa >> (6 * (sel - 9))) & 0x3F;
+    *k = r300_float24(r300_reg(st, 0x4C00 + 16 * (addr & 31) + 12));
+    return (addr & 32) && *k >= 0.0f && *k <= 1.0f;
+}
+
+bool r300_us_plain_copy(const R300State *st, unsigned *coord, float *alpha)
 {
     USNode nd[4];
 
@@ -518,6 +542,7 @@ bool r300_us_plain_copy(const R300State *st, unsigned *coord)
     unsigned t = (ti >> 6) & 0x1F, i = nd[0].alu_start;
 
     *coord = ti & 0x1F;
+    *alpha = 1.0f;
     if (((ti >> 15) & 7) != 1 || ((ti >> 11) & 0xF) != 0) {
         return false;
     }
@@ -529,7 +554,8 @@ bool r300_us_plain_copy(const R300State *st, unsigned *coord)
 
         /* clamp (bit 30) is harmless: texels of an 8-bit format are in [0, 1] */
         return (ra & 0x3F) == t && (aa & 0x3F) == t &&
-               us_mad_is_src0(ri, 0, 21, 20) && us_mad_is_src0(ai, 9, 17, 16) &&
+               us_mad_is_src0(ri, 0, 21, 20) &&
+               (us_mad_is_src0(ai, 9, 17, 16) || us_mad_alpha_scaled(st, ai, aa, alpha)) &&
                ((ra >> 26) & 7) == 7 && ((ra >> 29) & 3) == 0 &&
                ((aa >> 24) & 1) && ((aa >> 25) & 3) == 0 && !((aa >> 27) & 1);
     }
