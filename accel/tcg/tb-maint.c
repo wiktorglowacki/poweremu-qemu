@@ -655,9 +655,18 @@ static struct page_collection *page_collection_lock(tb_page_addr_t start,
         }
         assert_page_locked(pd);
         PAGE_FOR_EACH_TB(unused, unused, pd, tb, n) {
-            if (page_trylock_add(set, tb_page_addr0(tb)) ||
-                (tb_page_addr1(tb) != -1 &&
-                 page_trylock_add(set, tb_page_addr1(tb)))) {
+            tb_page_addr_t a0 = tb_page_addr0(tb);
+            tb_page_addr_t a1 = tb_page_addr1(tb);
+
+            /*
+             * @index is already in the set, so looking it up again would
+             * only find it: only the other page of a TB that straddles a
+             * page boundary can add a lock.
+             */
+            if (((a0 >> TARGET_PAGE_BITS) != index &&
+                 page_trylock_add(set, a0)) ||
+                (a1 != -1 && (a1 >> TARGET_PAGE_BITS) != index &&
+                 page_trylock_add(set, a1))) {
                 /* drop all locks, and reacquire in order */
                 q_tree_foreach(set->tree, page_entry_unlock, NULL);
                 goto retry;
@@ -1146,9 +1155,25 @@ bool tb_invalidate_phys_page_unwind(tb_page_addr_t addr, uintptr_t pc)
     return false;
 }
 #else
+/* The part [*@start, *@last] of its page @n (0 or 1) that @tb covers. */
+static void tb_range_on_page(TranslationBlock *tb, unsigned n,
+                             tb_page_addr_t *start, tb_page_addr_t *last)
+{
+    /* NOTE: this is subtle as a TB may span two physical pages */
+    *start = tb_page_addr0(tb);
+    *last = *start + tb->size - 1;
+    if (n == 0) {
+        *last = MIN(*last, *start | ~TARGET_PAGE_MASK);
+    } else {
+        *start = tb_page_addr1(tb);
+        *last = *start + (*last & ~TARGET_PAGE_MASK);
+    }
+}
+
 /*
  * @p must be non-NULL.
- * Call with all @pages locked.
+ * Call with all @pages locked, or with @pages NULL and only @p locked when
+ * no TB on @p that overlaps [@start, @last] reaches another page.
  */
 static void
 tb_invalidate_phys_page_range__locked(struct page_collection *pages,
@@ -1173,15 +1198,7 @@ tb_invalidate_phys_page_range__locked(struct page_collection *pages,
     PAGE_FOR_EACH_TB(start, last, p, tb, n) {
         tb_page_addr_t tb_start, tb_last;
 
-        /* NOTE: this is subtle as a TB may span two physical pages */
-        tb_start = tb_page_addr0(tb);
-        tb_last = tb_start + tb->size - 1;
-        if (n == 0) {
-            tb_last = MIN(tb_last, tb_start | ~TARGET_PAGE_MASK);
-        } else {
-            tb_start = tb_page_addr1(tb);
-            tb_last = tb_start + (tb_last & ~TARGET_PAGE_MASK);
-        }
+        tb_range_on_page(tb, n, &tb_start, &tb_last);
         if (!(tb_last < start || tb_start > last)) {
 #ifdef TARGET_HAS_PRECISE_SMC
             if (current_tb == tb &&
@@ -1208,7 +1225,15 @@ tb_invalidate_phys_page_range__locked(struct page_collection *pages,
 
 #ifdef TARGET_HAS_PRECISE_SMC
     if (current_tb_modified) {
-        page_collection_unlock(pages);
+        /*
+         * cpu_loop_exit_noexc() does not return, so release what the
+         * caller locked: tb_invalidate_phys_range_fast() holds only @p.
+         */
+        if (pages) {
+            page_collection_unlock(pages);
+        } else {
+            page_unlock(p);
+        }
         /* Force execution of one insn next time.  */
         current_cpu->cflags_next_tb = 1 | CF_NOIRQ | curr_cflags(current_cpu);
         mmap_unlock();
@@ -1272,6 +1297,43 @@ static void tb_invalidate_phys_page_fast__locked(struct page_collection *pages,
  * Called via softmmu_template.h when code areas are written to with
  * iothread mutex not held.
  */
+/* $TCG_CODE_PAGE_LOCK=0: every hit takes the page collection lock. */
+static bool tcg_code_page_lock = true;
+
+static void __attribute__((constructor)) tcg_code_page_lock_init(void)
+{
+    const char *e = getenv("TCG_CODE_PAGE_LOCK");
+
+    tcg_code_page_lock = !(e && e[0] == '0');
+}
+
+/*
+ * Whether a TB on page @index (locked) that overlaps [@start, @last], and so
+ * is to be invalidated, also covers another page, whose lock that needs.
+ */
+static bool page_range_has_straddling_tb(PageDesc *p, tb_page_addr_t index,
+                                         tb_page_addr_t start,
+                                         tb_page_addr_t last)
+{
+    TranslationBlock *tb;
+    PageForEachNext n;
+
+    PAGE_FOR_EACH_TB(unused, unused, p, tb, n) {
+        tb_page_addr_t a1 = tb_page_addr1(tb);
+        tb_page_addr_t tb_start, tb_last;
+
+        if ((tb_page_addr0(tb) >> TARGET_PAGE_BITS) == index &&
+            (a1 == -1 || (a1 >> TARGET_PAGE_BITS) == index)) {
+            continue;
+        }
+        tb_range_on_page(tb, n, &tb_start, &tb_last);
+        if (!(tb_last < start || tb_start > last)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void tb_invalidate_phys_range_fast(ram_addr_t ram_addr,
                                    unsigned size,
                                    uintptr_t retaddr)
@@ -1281,7 +1343,8 @@ void tb_invalidate_phys_range_fast(ram_addr_t ram_addr,
 
     /* A write beside the code on a page with TBs: nothing to invalidate. */
     if ((ram_addr >> TARGET_PAGE_BITS) == (last >> TARGET_PAGE_BITS)) {
-        PageDesc *p = page_find(ram_addr >> TARGET_PAGE_BITS);
+        tb_page_addr_t index = ram_addr >> TARGET_PAGE_BITS;
+        PageDesc *p = page_find(index);
         bool hit = false;
 
         if (p) {
@@ -1295,9 +1358,24 @@ void tb_invalidate_phys_range_fast(ram_addr_t ram_addr,
              * bytes would be a race the same store could lose anyway.)
              */
             hit = qatomic_read(&p->code_bitmap) & mask;
-            if (hit) {
+            if (hit || (tcg_code_page_lock && !qatomic_read(&p->first_tb))) {
                 page_lock(p);
                 hit = p->code_bitmap & mask;
+                /*
+                 * The page collection (a tree, three allocations and a
+                 * lookup per TB on the page) is only needed for a TB to
+                 * invalidate that reaches into another page.  A page left
+                 * with no TB only has its code protection dropped; with
+                 * PPC's default icbi invalidation that is every icbi on a
+                 * page that holds no translated code.
+                 */
+                if ((hit || !p->first_tb) && tcg_code_page_lock &&
+                    !page_range_has_straddling_tb(p, index, ram_addr, last)) {
+                    tb_invalidate_phys_page_range__locked(NULL, p, ram_addr,
+                                                          last, retaddr);
+                    page_unlock(p);
+                    return;
+                }
                 page_unlock(p);
             }
         }
