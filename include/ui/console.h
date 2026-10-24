@@ -4,6 +4,7 @@
 #include "ui/qemu-pixman.h"
 #include "qom/object.h"
 #include "qemu/notify.h"
+#include "qemu/seqlock.h"
 #include "qapi/qapi-types-ui.h"
 #include "ui/input.h"
 #include "ui/surface.h"
@@ -385,6 +386,7 @@ void graphic_console_set_hwops(QemuConsole *con,
                                void *opaque);
 void graphic_console_close(QemuConsole *con);
 
+extern QemuSeqLock graphic_hw_update_seq;
 void graphic_hw_update(QemuConsole *con);
 void graphic_hw_update_done(QemuConsole *con);
 void graphic_hw_invalidate(QemuConsole *con);

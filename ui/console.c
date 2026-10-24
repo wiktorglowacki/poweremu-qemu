@@ -152,6 +152,8 @@ void graphic_hw_update_done(QemuConsole *con)
     }
 }
 
+QemuSeqLock graphic_hw_update_seq;
+
 void graphic_hw_update(QemuConsole *con)
 {
     bool async = false;
@@ -159,7 +161,9 @@ void graphic_hw_update(QemuConsole *con)
         return;
     }
     if (con->hw_ops->gfx_update) {
+        seqlock_write_begin(&graphic_hw_update_seq);
         con->hw_ops->gfx_update(con->hw);
+        seqlock_write_end(&graphic_hw_update_seq);
         async = con->hw_ops->gfx_update_async;
     }
     if (!async) {

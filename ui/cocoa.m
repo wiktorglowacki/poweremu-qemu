@@ -46,7 +46,6 @@
 #include "qemu-version.h"
 #include "qemu/cutils.h"
 #include "qemu/main-loop.h"
-#include "qemu/seqlock.h"
 #include "qemu/module.h"
 #include "qemu/error-report.h"
 #include <Carbon/Carbon.h>
@@ -106,7 +105,6 @@ static CGInterpolationQuality zoom_interpolation = kCGInterpolationNone;
 static NSTextField *pauseLabel;
 
 static bool allow_events;
-static QemuSeqLock surface_seq;
 
 static NSInteger cbchangecount = -1;
 static QemuClipboardInfo *cbinfo;
@@ -622,11 +620,11 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     }
     __block CFDataRef data = NULL;
     for (int i = 0; !copy_bql && !data && i < 3; i++) {
-        unsigned seq = seqlock_read_begin(&surface_seq);
+        unsigned seq = seqlock_read_begin(&graphic_hw_update_seq);
         data = CFDataCreate(NULL,
                             (const UInt8 *)pixman_image_get_data(pixman_image),
                             (CFIndex)stride * h);
-        if (seqlock_read_retry(&surface_seq, seq)) {
+        if (seqlock_read_retry(&graphic_hw_update_seq, seq)) {
             CFRelease(data);
             data = NULL;
         }
@@ -2333,9 +2331,7 @@ static void cocoa_refresh(DisplayChangeListener *dcl)
     NSAutoreleasePool * pool = [[NSAutoreleasePool alloc] init];
 
     COCOA_DEBUG("qemu_cocoa: cocoa_refresh\n");
-    seqlock_write_begin(&surface_seq);
     graphic_hw_update(dcl->con);
-    seqlock_write_end(&surface_seq);
 
     if (cbchangecount != [[NSPasteboard generalPasteboard] changeCount]) {
         qemu_clipboard_info_unref(cbinfo);
