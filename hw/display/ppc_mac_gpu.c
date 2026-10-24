@@ -463,6 +463,7 @@ static struct {
     unsigned pkts;
     int64_t yield_at;
     bool handoff;
+    bool yield_waiter;
     int slice_us;
     /* Statistics (BQL): catch-ups the guest forced, by register. */
     uint32_t syncs, kicks;
@@ -10928,15 +10929,11 @@ static void ppc_mac_gpu_cp_handoff(void)
 
 static bool ppc_mac_gpu_cp_yield(PPCMacGPUState *s, uint32_t pos_dw)
 {
-    int64_t now;
     unsigned epoch;
     int nest;
 
-    if (++cp.pkts & 15) {
-        return false;
-    }
-    now = g_get_monotonic_time();
-    if (now < cp.yield_at) {
+    if (!(cp.yield_waiter && bql_contended()) &&
+        ((++cp.pkts & 15) || g_get_monotonic_time() < cp.yield_at)) {
         return false;
     }
     /* Publish progress: a catch-up starts here, and the guest may reuse
@@ -11318,6 +11315,8 @@ static void ppc_mac_gpu_cp_start(PPCMacGPUState *s)
     e = getenv("PPCGPU_CP_HANDOFF");
     cp.handoff = !(e && e[0] == '0');
     cp.slice_us = cp.handoff ? 500 : CP_SLICE_US;
+    e = getenv("PPCGPU_CP_YIELD_WAITER");
+    cp.yield_waiter = cp.handoff && !(e && e[0] == '0');
     e = getenv("PPCGPU_CP_WPTR_SYNC");
     cp.wptr_sync = cp.steal && !(e && e[0] == '0');
     qemu_event_init(&cp.kick, false);
