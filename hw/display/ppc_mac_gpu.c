@@ -2439,6 +2439,7 @@ static void ppc_mac_gpu_overlay(PPCMacGPUState *s, uint8_t *vram,
 static bool ppc_gpu_dirty_scanout = true;   /* read from env in realize */
 static bool ppc_gpu_flip_kick = true;
 static bool ppc_gpu_async_present = true;
+static bool ppc_gpu_po_alias = true;
 
 static void ppc_mac_gpu_scanout_cursor(PPCMacGPUState *s, uint32_t stride,
                                       int y0, int y1)
@@ -13592,9 +13593,17 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
     case R200_DST_OFFSET:
         s->regs.dst_offset = val;
+        if (ppc_gpu_po_alias) {
+            s->regs.dst_pitch_offset = (s->regs.dst_pitch_offset & ~0x3FFFFFu) |
+                                       (val >> 10 & 0x3FFFFF);
+        }
         break;
     case R200_DST_PITCH:
         s->regs.dst_pitch = val;
+        if (ppc_gpu_po_alias) {
+            s->regs.dst_pitch_offset = (s->regs.dst_pitch_offset & ~0x3FC00000u) |
+                                       (val >> 6 & 0xFF) << 22;
+        }
         break;
     case R200_DST_WIDTH:
         s->regs.dst_width = val;
@@ -13635,9 +13644,17 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     }
     case R200_SRC_OFFSET:
         s->regs.src_offset = val;
+        if (ppc_gpu_po_alias) {
+            s->regs.src_pitch_offset = (s->regs.src_pitch_offset & ~0x3FFFFFu) |
+                                       (val >> 10 & 0x3FFFFF);
+        }
         break;
     case R200_SRC_PITCH:
         s->regs.src_pitch = val;
+        if (ppc_gpu_po_alias) {
+            s->regs.src_pitch_offset = (s->regs.src_pitch_offset & ~0x3FC00000u) |
+                                       (val >> 6 & 0xFF) << 22;
+        }
         break;
     case R200_SRC_Y_X:
         s->regs.src_y_x = val;
@@ -15337,6 +15354,7 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
     ppc_gpu_dirty_scanout = ppc_gpu_env_on("PPCGPU_DIRTY_SCANOUT");
     ppc_gpu_flip_kick = ppc_gpu_env_on("PPCGPU_FLIP_KICK");
     ppc_gpu_async_present = ppc_gpu_env_on("PPCGPU_ASYNC_PRESENT");
+    ppc_gpu_po_alias = ppc_gpu_env_on("PPCGPU_PO_ALIAS");
     s->scanout_log_owner = !s->renderer || !s->renderer->set_dirty_source;
 
     /* Set PCI config space fields */
