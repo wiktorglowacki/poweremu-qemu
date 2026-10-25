@@ -1389,7 +1389,7 @@ static bool vk_tiled_rt_enabled(void);
 
 static uint32_t vk_vram_tiling(int cls, uint32_t tiling)
 {
-    return tiling & (cls == IMG_RT && !vk_tiled_rt_enabled() ? 2 : 3);
+    return tiling & (cls == IMG_RT && !vk_tiled_rt_enabled() && !(tiling & 32) ? 2 : 3);
 }
 
 /*
@@ -1780,13 +1780,6 @@ static bool vk_tile_fits(const VkImg *im)
 static bool vk_tile_copy(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0,
                          uint32_t x1, uint32_t y1, bool to_vram)
 {
-    /*
-     * Off by default: the 2D engine and the guest's own copies in this
-     * device read these buffers linearly (verified on MorphOS's TinyGL
-     * window: its bitmap carries the tile bit, the copy to the screen is
-     * linear), so VRAM stays linear for macro tiling.  PPCGPU_TILED_RT=1
-     * writes the card's tiled layout instead.
-     */
     if (!vk_vram_tiling(im->cls, im->tiling) || !vk_tile_init() ||
         !vk_tile_fits(im)) {
         return false;
@@ -4083,7 +4076,9 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                 h = (V.vram_size - td->gpu_addr - (uint64_t)w * b) / td->pitch_bytes + 1;
             }
             VkImg *im = vk_img_get(IMG_TEX, td->gpu_addr, w, h, td->pitch_bytes,
-                                   vk_tex_format(td->kind), b, td->tiling & 2, 0, NULL);
+                                   vk_tex_format(td->kind), b,
+                                   td->tiling == 1 && r300_macro_layout ? 1 : td->tiling & 2,
+                                   0, NULL);
             if (im) {
                 view = im->view;
             } else if (!vk_range_pending(td->gpu_addr, (uint64_t)td->gpu_addr + td->size_bytes)) {
@@ -4123,8 +4118,9 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     /* Colour buffers and the depth buffer. */
     uint32_t drect[4] = { sx0, sy0, sx1, sy1 };     /* as vk_img_written gets it */
     for (uint32_t k = 0; k < ncb; k++) {
+        uint32_t tl = k ? pkt->cb[k].tiling : pkt->rt_tiling;
         att[k] = vk_img_get(IMG_RT, addr[k], fbw, fbh, bpr[k], fmt[k], bpp[k],
-                            k ? pkt->cb[k].tiling : pkt->rt_tiling, rt_max_h,
+                            tl | (tl == 1 && ns <= 1 && r300_macro_layout ? 32 : 0), rt_max_h,
                             ns > 1 ? NULL : drect);
         if (!att[k]) {
             if (k == 0) {
@@ -4549,6 +4545,8 @@ static void *vk_init(uint8_t *vram_ptr, uint64_t vram_size)
         memset(map, 0, vk_overlap() ? 4 * (33 + VK_OVL_PIXELS) : 16);
     }
     V.hwz = vk_hwz() && vk_tile_init();
+    const char *e = getenv("PPCGPU_VK_MACRO");
+    r300_macro_layout = !(e && e[0] == '0') && vk_tile_init();
     qemu_log("ppc-mac-gpu vulkan: depth/stencil tested %s (%s, %s state)\n",
              V.hwz ? "in hardware" : "in the shader",
              V.zf24 == VK_FORMAT_D24_UNORM_S8_UINT ? "D24S8" : "D32FS8",

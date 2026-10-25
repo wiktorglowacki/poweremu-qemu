@@ -272,6 +272,8 @@ void r300_aa_positions(const R300State *st, float pos[6][2]);
 uint32_t r300_msaa_offset(uint32_t x, uint32_t y, uint32_t ns,
                           uint32_t pitch_px, uint32_t bpp, uint32_t sample);
 
+extern bool r300_macro_layout;
+
 static inline uint32_t r300_macro_offset(uint32_t xb, uint32_t y, uint32_t pitch)
 {
     return (y >> 3) * pitch * 8 + (xb >> 8) * 2048 + (xb & 63) + (y & 1) * 64 +

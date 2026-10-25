@@ -2172,6 +2172,8 @@ void r300_aa_positions(const R300State *st, float pos[6][2])
     }
 }
 
+bool r300_macro_layout;
+
 uint32_t r300_msaa_offset(uint32_t x, uint32_t y, uint32_t ns,
                           uint32_t pitch_px, uint32_t bpp, uint32_t sample)
 {
@@ -2375,16 +2377,14 @@ static uint8_t *r300_tex_untile(const R300TexDesc *td, const uint8_t *src,
     case 8: tw = 2; th = 2; break;
     default: tw = 2; th = 1; break;
     }
-    if (!micro) {
-        tw = 256 / bpp;             /* macro only: 256-byte rows, 8 high */
-        th = 8;
-    }
     uint64_t band = (uint64_t)pitch * th;
     uint8_t *lin = malloc((size_t)pitch * rows);
     for (uint32_t y = 0; y < rows; y++) {
         for (uint32_t x = 0; x < cols; x++) {
             uint64_t a;
-            if (micro && macro) {
+            if (!micro) {
+                a = r300_macro_offset(x * bpp, y, pitch);
+            } else if (micro && macro) {
                 uint32_t tx = x / tw, ty = y / th;
                 a = (uint64_t)(ty / 8) * band * 8 + (uint64_t)(tx / 8) * 2048 +
                     ((ty % 8) * 8 + (tx % 8)) * 32 +
@@ -2409,11 +2409,11 @@ uint8_t *r300_tex_level_bytes(const R300TexDesc *td, const uint8_t *src,
                                  uint32_t *bpr)
 {
     /*
-     * Only micro tiling is a layout in memory here: MorphOS's driver writes
-     * textures micro tiled with its own CPU code.  A bitmap's macro tile
-     * flag names memory this device's 2D and 3D paths keep linear.
+     * MorphOS's driver writes textures micro tiled with its own CPU code.
      */
-    if ((td->tiling & 2) && td->kind != R300_TEXK_RAW) {
+    if (((td->tiling & 2) || (td->tiling == 1 && r300_macro_layout && td->levels == 1 &&
+                              !td->host_data && td->kind < R300_TEXK_DXT1)) &&
+        td->kind != R300_TEXK_RAW) {
         uint8_t *lin = r300_tex_untile(td, src, l, w, h);
         uint8_t *out = r300_tex_level_bytes_linear(td, lin, l, w, h, bpr);
         free(lin);

@@ -2535,6 +2535,15 @@ static void ppc_mac_gpu_display_update(void *opaque)
     r200_rate.update_us += g_get_monotonic_time() - t_in;
 }
 
+static void *scanout_row(void *dst, const uint8_t *fb, uint32_t stride, uint32_t y,
+                         uint32_t bytes)
+{
+    for (uint32_t xb = 0; xb < bytes; xb += 64) {
+        memcpy((uint8_t *)dst + xb, fb + r300_macro_offset(xb, y, stride), 64);
+    }
+    return dst;
+}
+
 static void ppc_mac_gpu_display_update_inner(void *opaque)
 {
     PPCMacGPUState *s = opaque;
@@ -2700,6 +2709,8 @@ static void ppc_mac_gpu_display_update_inner(void *opaque)
     uint32_t height = s->disp.height;
     uint32_t stride = s->disp.stride;
     uint32_t bpp_bytes = (s->disp.bpp + 7) / 8;
+    bool tiled = r300_macro_layout && (s->regs.crtc_offset_cntl & (1u << 15)) &&
+                 !(stride % 256);
 
     /*
      * Expand palette indices and 1555/565 into the shadow buffer.
@@ -2732,8 +2743,11 @@ static void ppc_mac_gpu_display_update_inner(void *opaque)
             line16_generic = getenv("PPCGPU_LINE16_GENERIC") != NULL;
         }
         if ((uint64_t)s->disp.offset + (uint64_t)stride * height <= s->vram_size) {
+            g_autofree uint8_t *row = tiled ? g_malloc(stride) : NULL;
             for (uint32_t y = 0; y < height; y++) {
-                const uint8_t *sp = vram_ptr + s->disp.offset + (uint64_t)y * stride;
+                const uint8_t *sp = tiled ? scanout_row(row, vram_ptr + s->disp.offset, stride, y,
+                                                        stride) :
+                                    vram_ptr + s->disp.offset + (uint64_t)y * stride;
                 uint32_t *dp = (uint32_t *)s->shadow_buf + (uint64_t)y * width;
                 if (bpp_bytes == 1) {
                     for (uint32_t x = 0; x < width; x++) {
@@ -3097,7 +3111,7 @@ static void ppc_mac_gpu_display_update_inner(void *opaque)
         snap = memory_region_snapshot_and_clear_dirty(
                    &s->vram, s->disp.offset, frame_size, DIRTY_MEMORY_VGA);
     }
-    if (snap && s->scanout_dirty_valid && !mode_changed &&
+    if (snap && s->scanout_dirty_valid && !mode_changed && !tiled &&
         s->scanout_offset == s->disp.offset) {
         partial = true;
         for (int y = 0; y < (int)height; y++) {
@@ -3121,8 +3135,12 @@ static void ppc_mac_gpu_display_update_inner(void *opaque)
                                             &first, &last)) {
             lo = (first - s->disp.offset) / stride;
             hi = DIV_ROUND_UP(last - s->disp.offset, stride);
+            if (tiled) {
+                lo &= ~7;
+                hi = MIN(ROUND_UP(hi, 8), (int)height);
+            }
         }
-    } else if (gen_partial && s->r300_card_bytes) {
+    } else if (gen_partial && s->r300_card_bytes && !tiled) {
         /*
          * A page flip: the shadow holds the other buffer, and generations
          * cannot say where two buffers differ, but the bytes can.  A
@@ -3202,12 +3220,17 @@ static void ppc_mac_gpu_display_update_inner(void *opaque)
     if (y0 != 0 || y1 != (int)height) {
         r200_rate.co_partials++;
     }
+    g_autofree uint32_t *row = tiled && !s->r300_card_bytes ? g_malloc(stride) : NULL;
     for (y = y0; y < y1; y++) {
-        if (s->r300_card_bytes) {
+        if (tiled && s->r300_card_bytes) {
+            scanout_row(dst + y * stride_u32, (const uint8_t *)src, stride, y,
+                        ROUND_UP(width * 4, 64));
+        } else if (s->r300_card_bytes) {
             memcpy(dst + y * stride_u32, src + y * stride_u32, width * 4);
         } else {
-            ppc_mac_gpu_bswap_line32(dst + y * stride_u32,
-                                    src + y * stride_u32, width);
+            ppc_mac_gpu_bswap_line32(dst + y * stride_u32, tiled ?
+                                     scanout_row(row, (const uint8_t *)src, stride, y, stride) :
+                                     src + y * stride_u32, width);
         }
     }
     {
@@ -6167,6 +6190,39 @@ static bool mc_rect_is_tiled(PPCMacGPUState *s, uint32_t offset,
     return mc_find_tiled_surface(s, addr, &surf_base, &surf_pitch) >= 0;
 }
 
+static uint64_t blit_px(uint32_t off, uint32_t pitch, bool mt, uint32_t x, uint32_t y,
+                        uint32_t bpp)
+{
+    return off + (mt ? r300_macro_offset(x * bpp, y, pitch) :
+                  (uint64_t)y * pitch + (uint64_t)x * bpp);
+}
+
+static void blit_rect_macro(PPCMacGPUState *s, uint8_t *vram,
+                            uint32_t so, uint32_t sp, bool smt, uint32_t sx, uint32_t sy,
+                            uint32_t dof, uint32_t dp, bool dmt, uint32_t dx, uint32_t dy,
+                            uint32_t w, uint32_t h, uint32_t bpp, bool rev_rows, bool rev_cols)
+{
+    for (uint32_t r = 0; r < h; r++) {
+        uint32_t row = rev_rows ? h - 1 - r : r;
+        for (uint32_t c = 0, n; c < w; c += n) {
+            uint32_t col = rev_cols ? w - 1 - c : c;
+            n = rev_cols ? 1 : w - c;
+            if (smt) {
+                n = MIN(n, (64 - (sx + col) * bpp % 64) / bpp);
+            }
+            if (dmt) {
+                n = MIN(n, (64 - (dx + col) * bpp % 64) / bpp);
+            }
+            n = MAX(n, 1u);
+            uint64_t a = blit_px(so, sp, smt, sx + col, sy + row, bpp);
+            uint64_t b = blit_px(dof, dp, dmt, dx + col, dy + row, bpp);
+            if (a + n * bpp <= s->vram_size && b + n * bpp <= s->vram_size) {
+                memmove(vram + b, vram + a, n * bpp);
+            }
+        }
+    }
+}
+
 /*
  * Fast path for rectangle copies between untiled VRAM surfaces.
  *
@@ -6681,6 +6737,12 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
             return;
         }
     }
+    bool src_mt = r300_macro_layout && s->r300 && src_po >> 30 == 1 && !(src_pitch % 256);
+    bool dst_mt = r300_macro_layout && s->r300 && dst_po >> 30 == 1 && !(dst_pitch % 256);
+    uint32_t sy0 = src_mt ? src_y & ~7u : src_y;
+    uint32_t sh = src_mt ? ROUND_UP(src_y + blit_h, 8) - sy0 : blit_h;
+    uint32_t dy0 = dst_mt ? dst_y & ~7u : dst_y;
+    uint32_t dh = dst_mt ? ROUND_UP(dst_y + blit_h, 8) - dy0 : blit_h;
 
     /* Path instrumentation: log MMIO combined blit with its packed state */
     g_blit_stats.mmio_count++;
@@ -6741,20 +6803,20 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
         uint32_t gbpp = gmc_dst_bpp(s->regs.dp_gui_master_cntl);
         bool gart = (s->regs.aic_ctrl & 1) && src_offset >= s->regs.aic_lo_addr &&
                     src_offset <= s->regs.aic_hi_addr;
-        if (rop3 == 0xCC && src_type != 3 && !gart) {
+        if (rop3 == 0xCC && src_type != 3 && !gart && !src_mt && !dst_mt) {
             gpu_done = r200_gpu_copy(s, src_offset, src_pitch ? src_pitch : dst_pitch,
                                      src_x, src_y, dst_offset, dst_pitch, dst_x, dst_y,
                                      blit_w, blit_h, gbpp);
-        } else if (rop3 == 0xF0) {
+        } else if (rop3 == 0xF0 && !dst_mt) {
             gpu_done = r200_gpu_fill(s, dst_offset, dst_pitch, dst_x, dst_y, blit_w, blit_h,
                                      s->regs.dp_brush_frgd_clr, gbpp);
         }
     }
     if (!gpu_done) {
-        r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y, blit_h), true, 1);
+        r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dy0, dh), true, 1);
         if (rop3 == 0xCC && src_type != 3 && src_offset < s->vram_size) {
             r200_vram_access(s, R200_ROWS(src_offset, src_pitch ? src_pitch : dst_pitch,
-                                          src_y, blit_h), false, 1);
+                                          sy0, sh), false, 1);
         }
     }
     seq_log("REG  rop=%02x src=%06x/%u (%u,%u) dst=%06x/%u (%u,%u) %ux%u",
@@ -7067,7 +7129,11 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
                 rev_cols = (dst_y == src_y) && (dst_x > src_x);
             }
 
-            if (!gpu_done && !blit_rect_untiled(s, vram, src_offset, src_pitch,
+            if (!gpu_done && (src_mt || dst_mt)) {
+                blit_rect_macro(s, vram, src_offset, src_pitch, src_mt, src_x, src_y,
+                                dst_offset, dst_pitch, dst_mt, dst_x, dst_y, blit_w, blit_h,
+                                bpp, rev_rows, rev_cols);
+            } else if (!gpu_done && !blit_rect_untiled(s, vram, src_offset, src_pitch,
                                                 src_x, src_y, dst_offset, dst_pitch,
                                                 dst_x, dst_y, blit_w, blit_h, bpp))
             for (uint32_t r = 0; r < blit_h; r++) {
@@ -7087,8 +7153,8 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
         }
         /* Mark display dirty */
         if (!gpu_done || !r200_gpu2d_clean_dirty(s)) {
-            vram_rect_dirty(s, dst_offset, dst_pitch, dst_x, dst_y,
-                            blit_w, blit_h, bpp);
+            vram_rect_dirty(s, dst_offset, dst_pitch, dst_mt ? 0 : dst_x, dy0,
+                            dst_mt ? dst_pitch / bpp : blit_w, dh, bpp);
         }
 
         /*
@@ -7203,13 +7269,19 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
     } else if (rop3 == 0xF0) {
         /* Pattern fill (solid color from DP_BRUSH_FRGD_CLR) */
         uint32_t color = s->regs.dp_brush_frgd_clr;
-        if (!gpu_done) {
+        for (uint32_t r = 0; !gpu_done && dst_mt && r < blit_h; r++) {
+            for (uint32_t c = 0; c < blit_w; c++) {
+                fill_vram_px(s, vram, blit_px(dst_offset, dst_pitch, true, dst_x + c,
+                                              dst_y + r, bpp), color, bpp);
+            }
+        }
+        if (!gpu_done && !dst_mt) {
             fill_vram_rect(s, vram, dst_offset, dst_pitch, dst_x, dst_y,
                            blit_w, blit_h, color, bpp);
         }
         if (!gpu_done || !r200_gpu2d_clean_dirty(s)) {
-            vram_rect_dirty(s, dst_offset, dst_pitch, dst_x, dst_y,
-                            blit_w, blit_h, bpp);
+            vram_rect_dirty(s, dst_offset, dst_pitch, dst_mt ? 0 : dst_x, dy0,
+                            dst_mt ? dst_pitch / bpp : blit_w, dh, bpp);
         }
         r200_fill_notify(s, dst_offset, dst_pitch, dst_x, dst_y,
                          blit_w, blit_h, bpp, color);
