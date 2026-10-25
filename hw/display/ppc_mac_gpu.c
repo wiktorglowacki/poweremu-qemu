@@ -4078,6 +4078,22 @@ static FILE *r300_drawlog(void)
     return f;
 }
 
+static void r300_drawlog_reject(PPCMacGPUState *s, const R300DrawPacket *pkt,
+                                const char *reason)
+{
+    FILE *f = r300_drawlog();
+
+    if (!f) {
+        return;
+    }
+    fprintf(f, "REJECT D%llu %s rt=%08x/%08x gpu=%08x sc=%08x/%08x size=%ux%u\n",
+            (unsigned long long)s->r3->draws, reason,
+            r300_reg(s->r3, 0x4E28), r300_reg(s->r3, 0x4E38),
+            pkt->rt_gpu_addr, r300_reg(s->r3, 0x43E0), r300_reg(s->r3, 0x43E4),
+            pkt->rt_width, pkt->rt_height);
+    fflush(f);
+}
+
 static void r300_drawlog_draw(PPCMacGPUState *s, uint32_t opcode,
                               const uint32_t *d, uint32_t body_dw)
 {
@@ -4732,6 +4748,9 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     if (!build_ok) {
         static int fail_dumps;
         r300_warn_once(err, NULL);
+        if (!strcmp(err, "empty colour buffer")) {
+            r300_drawlog_reject(s, &pkt, err);
+        }
         if (s->r3_dump && fail_dumps++ < 3) {
             fprintf(s->r3_dump, "--- draw failed (%s): op %02x vf %08x vtx_size %u "
                     "psc %08x %08x %08x %08x ext %08x %08x, %u arrays:",
@@ -4761,6 +4780,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     if (!r300_to_vram(s, &pkt.rt_gpu_addr,
                       (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height * ns)) {
         r300_warn_once("colour buffer outside VRAM", NULL);
+        r300_drawlog_reject(s, &pkt, "colour buffer outside VRAM");
         r300_draw_free(&pkt);
         return;
     }
