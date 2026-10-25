@@ -1676,7 +1676,7 @@ static void copy_detect(const R300FSDesc *desc, const Route *route,
         (pkt->cull & (R300_CULL_FRONT | R300_CULL_BACK)) ||
         pkt->num_cb != 1 || pkt->aa_samples > 1 || pkt->rt_tiling || pkt->rt_bpp != 4 ||
         !td->bound || td->kind != R300_TEXK_RGBA8 || td->levels != 1 ||
-        td->dim != R300_TEXDIM_2D || td->tiling) {
+        td->dim != R300_TEXDIM_2D || (td->tiling && td->tiling != 2)) {
         return;
     }
     uint32_t fb = pkt->uniforms.fog_blend;

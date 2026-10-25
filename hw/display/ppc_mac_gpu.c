@@ -3817,6 +3817,8 @@ static bool ppc_mac_gpu_gart_translate(PPCMacGPUState *s, uint32_t gpu_addr,
                                         hwaddr *phys_addr);
 static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s, uint32_t gpu_addr,
                                       hwaddr *phys_addr);
+static bool ppc_mac_gpu_agp_translate_checked(PPCMacGPUState *s, uint32_t gpu_addr,
+                                             hwaddr *phys_addr, bool require_valid);
 
 /* A dword the card writes back to guest GPU memory (VRAM or AGP/GART),
  * bytes as given (lowest address first). */
@@ -4409,7 +4411,7 @@ static bool r300_cpu_copy(PPCMacGPUState *s, const R300DrawPacket *pkt)
         on = !(e && e[0] == '0');
         wpa = !(we && we[0] == '0');
     }
-    if (!w || s->r3_zpass_active || dst_hi > s->vram_size ||
+    if (!w || td->tiling || s->r3_zpass_active || dst_hi > s->vram_size ||
         src + (h - 1) * tpitch + w * 4 > td->size_bytes) {
         return false;
     }
@@ -4517,6 +4519,140 @@ static bool r300_cpu_copy(PPCMacGPUState *s, const R300DrawPacket *pkt)
     }
     ppc_mac_gpu_vram_set_dirty(s, dst, dst_hi - dst);
     return true;
+}
+
+/* A recognized, unblended RGBA8 copy into linear AGP memory.  Use the same
+ * byte operations as r300_tex_level_bytes, r300_tpost/tswz and r300_pack.
+ * Macro layouts and general shaders still need renderer target support. */
+static uint8_t *r300_readback_pixels(const R300DrawPacket *pkt, const uint8_t *src)
+{
+    const R300TexDesc *td = &pkt->tex[0];
+    const R300FSUniforms *u = &pkt->uniforms;
+    uint32_t w = pkt->copy_w, h = pkt->copy_h;
+    int64_t sx = (int64_t)pkt->copy_x + pkt->copy_tx;
+    int64_t sy = (int64_t)pkt->copy_y + pkt->copy_ty;
+    uint64_t bytes = (uint64_t)w * h * 4;
+    uint64_t extent = (uint64_t)td->lvl_pitch[0] * ((td->height + 1ull) & ~1ull);
+
+    if (!src || !w || !h || w > 64 * MiB / 4 ||
+        h > 64 * MiB / ((uint64_t)w * 4) || pkt->warn ||
+        pkt->num_cb != 1 || pkt->aa_samples != 1 || pkt->depth.attach ||
+        pkt->rt_tiling || pkt->rt_bpp != 4 || pkt->rt_view != R300_RTV_RGBA8 ||
+        (u->cblend & 0x39) || (u->alpha_func & (1u << 11)) ||
+        (u->fog_blend & 1) || (u->rop & 4) || u->zpass_count ||
+        u->chanmask != 15 || u->clip_rule != 0xffff ||
+        (u->rt_endian != 0 && u->rt_endian != 2) ||
+        !td->bound || !td->card_bytes || td->kind != R300_TEXK_RGBA8 ||
+        td->levels != 1 || td->dim != R300_TEXDIM_2D || td->tiling != 2 ||
+        (u->tex_dim[0][3] & 31) || u->tex_info[0][1] > 1 ||
+        ((td->filter0 >> 9) & 3) != 1 || ((td->filter0 >> 11) & 3) != 1 ||
+        !td->lvl_pitch[0] || td->lvl_pitch[0] % 16 ||
+        (uint64_t)td->width * 4 > td->lvl_pitch[0] || extent > td->size_bytes ||
+        sx < 0 || sy < 0 || sx + w > td->width || sy + h > td->height ||
+        (uint64_t)pkt->copy_x + w > pkt->rt_width ||
+        (uint64_t)pkt->copy_x + w > pkt->rt_pitch ||
+        (uint64_t)pkt->copy_y + h > pkt->rt_height) {
+        return NULL;
+    }
+    uint8_t *out = g_try_malloc(bytes);
+    if (!out) {
+        return NULL;
+    }
+    unsigned lane = td->endian == 1 ? 1 : td->endian == 2 ? 3 : td->endian == 3 ? 2 : 0;
+    for (uint32_t y = 0; y < h; y++) {
+        for (uint32_t x = 0; x < w; x++) {
+            uint64_t tx = sx + x, ty = sy + y;
+            uint64_t a = (ty / 2) * td->lvl_pitch[0] * 2 +
+                         (tx / 4) * 32 + (ty % 2) * 16 + (tx % 4) * 4;
+            uint8_t hw[4], color[4];
+            for (unsigned c = 0; c < 4; c++) {
+                unsigned k = u->tex_info[0][1] ? 3 - c : c;
+                hw[c] = src[(a + k) ^ lane];
+            }
+            for (unsigned c = 0; c < 4; c++) {
+                unsigned k = u->tex_swz[0][c];
+                color[c] = k < 4 ? hw[k] : k == 5 ? 255 : 0;
+            }
+            for (unsigned c = 0; c < 4; c++) {
+                unsigned k = u->out_sel[c] & 3;
+                out[((uint64_t)y * w + x) * 4 + (u->rt_endian == 2 ? 3 - c : c)] =
+                    color[k ? k - 1 : 3];
+            }
+        }
+    }
+    return out;
+}
+
+/* Preflight/write a span page by page; no wrapped GPU address or unreported
+ * physical-memory transaction failure.  The caller preflights every row
+ * before the first write, including writable RAM coverage.  Missing PTEs
+ * or non-RAM pages in an unchanged mapping cause no partial copy.  A changed
+ * mapping or failed physical write can still fail after earlier writes. */
+static bool r300_agp_span(PPCMacGPUState *s, uint32_t addr, const uint8_t *src,
+                          uint32_t len, bool write)
+{
+    MemTxAttrs attrs = { .memory = true };
+    RCU_READ_LOCK_GUARD();
+
+    if ((uint64_t)addr + len > (1ull << 32)) {
+        return false;
+    }
+    while (len) {
+        hwaddr phys, xlat;
+        uint32_t n = MIN(len, 0x1000 - (addr & 0xfff));
+        hwaddr mapped = n;
+        if (!ppc_mac_gpu_agp_translate_checked(s, addr, &phys, true)) {
+            return false;
+        }
+        MemoryRegion *mr = address_space_translate(&address_space_memory,
+                                                   phys, &xlat, &mapped,
+                                                   true, attrs);
+        if (!memory_region_is_ram(mr) ||
+            !memory_access_is_direct(mr, true, attrs) || mapped < n ||
+            (write && address_space_write(&address_space_memory, phys,
+                                           attrs, src, n) != MEMTX_OK)) {
+            return false;
+        }
+        addr += n;
+        src += n;
+        len -= n;
+    }
+    return true;
+}
+
+static bool r300_agp_copy(PPCMacGPUState *s, const R300DrawPacket *pkt)
+{
+    const R300TexDesc *td = &pkt->tex[0];
+    uint32_t off = td->gpu_addr, w = pkt->copy_w, h = pkt->copy_h;
+    uint64_t pitch = (uint64_t)pkt->rt_pitch * 4;
+
+    if (!w || !h || s->r3_zpass_active || td->size_bytes > 64 * MiB ||
+        !pitch || pitch > UINT32_MAX || pkt->copy_y > UINT32_MAX / pitch ||
+        !r300_to_vram(s, &off, td->size_bytes)) {
+        return false;
+    }
+    uint64_t dst = pkt->rt_gpu_addr + (uint64_t)pkt->copy_y * pitch + pkt->copy_x * 4ull;
+    if (dst >= (1ull << 32) ||
+        w * 4ull > (1ull << 32) - dst ||
+        h - 1ull > ((1ull << 32) - dst - w * 4ull) / pitch) {
+        return false;
+    }
+    /* Finish pending tiled FBO writes before reading their backing bytes. */
+    r200_vram_access(s, off, (uint64_t)off + td->size_bytes, false, 12);
+    uint8_t *pixels = r300_readback_pixels(pkt,
+        (const uint8_t *)memory_region_get_ram_ptr(&s->vram) + off);
+    if (!pixels) {
+        return false;
+    }
+    bool ok = true;
+    for (unsigned pass = 0; pass < 2 && ok; pass++) {
+        for (uint32_t y = 0; y < h && ok; y++) {
+            ok = r300_agp_span(s, dst + y * pitch, pixels + (uint64_t)y * w * 4,
+                               w * 4, pass != 0);
+        }
+    }
+    g_free(pixels);
+    return ok;
 }
 
 /* After the GPU made a copy r300_cpu_copy is learning from: which byte
@@ -4779,6 +4915,11 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     uint32_t ns = pkt.aa_samples;
     if (!r300_to_vram(s, &pkt.rt_gpu_addr,
                       (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height * ns)) {
+        if (r300_agp_copy(s, &pkt)) {
+            r300_draw_free(&pkt);
+            s->regs.stall_draws++;
+            return;
+        }
         r300_warn_once("colour buffer outside VRAM", NULL);
         r300_drawlog_reject(s, &pkt, "colour buffer outside VRAM");
         r300_draw_free(&pkt);
@@ -5336,9 +5477,9 @@ static bool ppc_mac_gpu_gart_translate(PPCMacGPUState *s,
  * uni-north bridge reads PTEs in little-endian (GPU-native) format,
  * matching how the AIC GART PTEs are stored.
  */
-static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s,
-                                       uint32_t gpu_addr,
-                                       hwaddr *phys_addr)
+static bool ppc_mac_gpu_agp_translate_checked(PPCMacGPUState *s,
+                                             uint32_t gpu_addr,
+                                             hwaddr *phys_addr, bool require_valid)
 {
     /* Check if address falls within MC_AGP_LOCATION range.
      *   bits [15:0] = AGP start >> 16
@@ -5374,8 +5515,10 @@ static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s,
     /* Read GART PTE from system RAM */
     hwaddr pte_addr = gart_table + page_idx * 4;
     uint32_t pte_raw = 0;
+    MemTxAttrs attrs = require_valid ? (MemTxAttrs){ .memory = true } :
+                                      MEMTXATTRS_UNSPECIFIED;
     MemTxResult r = address_space_read(&address_space_memory, pte_addr,
-                                        MEMTXATTRS_UNSPECIFIED, &pte_raw, 4);
+                                        attrs, &pte_raw, 4);
     if (r != MEMTX_OK) {
         return false;
     }
@@ -5389,7 +5532,7 @@ static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s,
     uint32_t pte_val = le32_to_cpu(pte_raw);
     hwaddr phys_page = (hwaddr)(pte_val & 0xFFFFF000U);
 
-    if (phys_page == 0) {
+    if (phys_page == 0 || (require_valid && !(pte_val & 1))) {
         return false;
     }
 
@@ -5406,6 +5549,14 @@ static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s,
 
     *phys_addr = phys_page | page_off;
     return true;
+}
+
+static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s, uint32_t gpu_addr,
+                                      hwaddr *phys_addr)
+{
+    /* Preserve the existing read/writeback translation policy.  New bulk
+     * readback writes additionally require the UniNorth PTE valid bit. */
+    return ppc_mac_gpu_agp_translate_checked(s, gpu_addr, phys_addr, false);
 }
 
 /*
