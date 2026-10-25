@@ -1505,7 +1505,9 @@ static const char vk_tile_glsl[] =
 "        return p.addr + (y / th) * p.pitch * th + (x / tw) * 32u +\n"
 "               ((y % th) * tw + (x % tw)) * p.bpp;\n"
 "    }\n"
-"    return p.addr + (y / 8u) * p.pitch * 8u + (xb / 256u) * 2048u + (y % 8u) * 256u + (xb % 256u);\n"
+"    return p.addr + (y / 8u) * p.pitch * 8u + (xb / 256u) * 2048u + (xb & 63u) + (y & 1u) * 64u +\n"
+"           ((((xb >> 6) ^ (y >> 2)) & 1u) << 7) + ((((xb >> 7) ^ (y >> 1)) & 1u) << 8) +\n"
+"           ((((xb >> 7) ^ (y >> 3)) & 1u) << 9) + ((((xb >> 8) ^ (y >> 2)) & 1u) << 10);\n"
 "}\n";
 
 static const char vk_tile_main[] =
