@@ -2713,6 +2713,12 @@ static void vk_img_written(VkImg *im, uint32_t x0, uint32_t y0,
      */
     uint64_t lo = im->addr + (uint64_t)y0 * im->pitch + (uint64_t)x0 * im->bpp;
     uint64_t hi = im->addr + (uint64_t)(y1 - 1) * im->pitch + (uint64_t)x1 * im->bpp;
+    uint32_t band = vk_tile_band(im->cls, im->tiling, im->bpp);
+    if (band > 1) {
+        /* A tiled row can touch every page in its physical band. */
+        lo = im->addr + (uint64_t)QEMU_ALIGN_DOWN(y0, band) * im->pitch;
+        hi = im->addr + (uint64_t)QEMU_ALIGN_UP(y1, band) * im->pitch;
+    }
     uint64_t wlo = im->addr, whi = vk_img_hi(im);
     V.gen++;
     for (uint64_t p = vk_pg(lo); p <= vk_pg(hi - 1) && p < V.npages; p++) {
