@@ -1387,6 +1387,11 @@ static uint64_t vk_img_hash(uint32_t addr, uint32_t w, uint32_t h, uint32_t pitc
 
 static bool vk_tiled_rt_enabled(void);
 
+static uint32_t vk_vram_tiling(int cls, uint32_t tiling)
+{
+    return tiling & (cls == IMG_RT && !vk_tiled_rt_enabled() ? 2 : 3);
+}
+
 /*
  * Rows per band of the tiled VRAM layout vk_tile_copy moves im's texels
  * through (vk_tile_glsl's tiled()), 1 for a linear one.  A band is
@@ -1397,8 +1402,8 @@ static uint32_t vk_tile_band(int cls, uint32_t tiling, uint32_t bpp)
 {
     uint32_t th = bpp == 1 ? 4 : 2;
 
-    tiling &= 3;
-    if (!tiling || (cls == IMG_RT && !vk_tiled_rt_enabled())) {
+    tiling = vk_vram_tiling(cls, tiling);
+    if (!tiling) {
         return 1;
     }
     return tiling == 1 ? 8 : tiling == 2 ? th : th * 8;
@@ -1765,7 +1770,7 @@ static bool vk_tiled_rt_enabled(void)
  */
 static bool vk_tile_fits(const VkImg *im)
 {
-    uint32_t th = im->bpp == 1 ? 4 : 2, t = im->tiling & 3;
+    uint32_t th = im->bpp == 1 ? 4 : 2, t = vk_vram_tiling(im->cls, im->tiling);
 
     return !(im->pitch % (t == 1 ? 256 : t == 2 ? 32 / th : 256 / th));
 }
@@ -1777,10 +1782,10 @@ static bool vk_tile_copy(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0
      * Off by default: the 2D engine and the guest's own copies in this
      * device read these buffers linearly (verified on MorphOS's TinyGL
      * window: its bitmap carries the tile bit, the copy to the screen is
-     * linear), so VRAM stays linear for everything.  PPCGPU_TILED_RT=1
+     * linear), so VRAM stays linear for macro tiling.  PPCGPU_TILED_RT=1
      * writes the card's tiled layout instead.
      */
-    if ((im->cls == IMG_RT && !vk_tiled_rt_enabled()) || !vk_tile_init() ||
+    if (!vk_vram_tiling(im->cls, im->tiling) || !vk_tile_init() ||
         !vk_tile_fits(im)) {
         return false;
     }
@@ -1818,7 +1823,8 @@ static bool vk_tile_copy(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0
             .imageExtent = { w, h, 1 },
         };
         uint64_t lo = vk_zs_copy(cb, im, y, h, 32, false);
-        uint32_t pc[9] = { im->addr - lo, im->pitch, x0, y, w_pad, h, im->bpp, im->tiling,
+        uint32_t pc[9] = { im->addr - lo, im->pitch, x0, y, w_pad, h, im->bpp,
+                           vk_vram_tiling(im->cls, im->tiling),
                            to_vram ? 0 : 1 };
         uint32_t words = w_pad * im->bpp / 4 * h;
         if (to_vram) {
@@ -4155,7 +4161,8 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         uint32_t zw = ns > 1 ? ns * zd->pitch : MIN(pkt->rt_width, zd->pitch);
         att[ncb] = vk_img_get(IMG_RT, zd->gpu_addr, zw, fbh,
                               ns * zd->pitch * zd->bpp, zf, zd->bpp,
-                              zd->tiling | (hz ? (u.zinfo[3] & R300_ZFMT_ENDIAN_MASK) << 2 : 0),
+                              (zd->tiling & (vk_tiled_rt_enabled() ? 3 : 1)) |
+                              (hz ? (u.zinfo[3] & R300_ZFMT_ENDIAN_MASK) << 2 : 0),
                               rt_max_h, NULL);
         if (att[ncb] && (zw == fbw || z_narrow)) {
             fmt[ncb] = zf;
