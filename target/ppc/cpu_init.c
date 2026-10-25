@@ -7281,6 +7281,10 @@ static void ppc_cpu_reset_hold(Object *obj, ResetType type)
 
 #if !defined(CONFIG_USER_ONLY)
     env->nip = env->hreset_vector | env->excp_prefix;
+    if (g_strcmp0(getenv("PPC_RESET_BATS"), "0")) {
+        memset(env->IBAT, 0, sizeof(env->IBAT));
+        memset(env->DBAT, 0, sizeof(env->DBAT));
+    }
 
     if (tcg_enabled()) {
         cpu_breakpoint_remove_all(cs, BP_CPU);
