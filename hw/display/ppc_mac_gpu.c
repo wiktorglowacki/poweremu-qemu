@@ -309,6 +309,8 @@ static struct {
     uint64_t gpu_vs;         /* R300 draws whose vertex program ran on the GPU */
     uint64_t co_copies, co_partials, co_skips, co_defers;  /* scanout path */
     uint64_t co_rows;        /* scanout rows copied */
+    uint64_t read_checks;    /* VRAM reads of the draw builder */
+    uint64_t read_skips;     /* ... that the memo answered without the renderer */
     int64_t since;
 } r200_rate;
 
@@ -2561,13 +2563,17 @@ static void ppc_mac_gpu_display_update_inner(void *opaque)
                 qemu_log("ppc-mac-gpu rate: %.1f flips/s, %.1f present-ops/s, "
                          "%.0f draws/s (%.0f%% GPU vertex programs), "
                          "%.0f 2D ops/s, %.0f flushes/s, GPU wait %.1f%%, "
-                         "display update %.1f ms/s\n",
+                         "display update %.1f ms/s, "
+                         "VRAM reads %.0f/s (%.0f%% memo)\n",
                          r200_rate.flips / sec,
                          r200_rate.presents / sec, r200_rate.draws / sec,
                          100.0 * r200_rate.gpu_vs / r200_rate.draws,
                          r200_rate.ops2d / sec, r200_rate.flushes / sec,
                          r200_rate.flush_us / (sec * 1e4),
-                         r200_rate.update_us / (sec * 1e3));
+                         r200_rate.update_us / (sec * 1e3),
+                         r200_rate.read_checks / sec,
+                         r200_rate.read_checks ?
+                         100.0 * r200_rate.read_skips / r200_rate.read_checks : 0.0);
                 if (r200_rate.co_copies || r200_rate.co_skips ||
                     r200_rate.co_defers) {
                     qemu_log("ppc-mac-gpu scanout: %.0f full + %.0f partial "
@@ -3596,6 +3602,185 @@ static void r300_ap0_update(PPCMacGPUState *s);
 static void r300_zconv(PPCMacGPUState *s, bool to_card);
 static bool r300_to_vram(PPCMacGPUState *s, uint32_t *addr, uint64_t len);
 
+/*
+ * Vertex and index data a draw rendered: MorphOS TinyGL copies vertex
+ * arrays into VRAM with a textured-quad draw, then draws from them.  That
+ * draw must be in VRAM before the CPU builds the next one, or it reads the
+ * previous upload (CroMagRally: white or green fades, sky dome missing).
+ * r300_cpu_copy makes those uploads on the CPU, so this rarely waits.
+ * PPCGPU_READ_SYNC=0: off, both the per-read check and the array-wide one.
+ */
+static bool r200_read_sync(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_READ_SYNC");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/*
+ * The draw builder fetches a vertex one attribute at a time, and every
+ * attribute of a TinyGL mesh lands in a few VRAM arrays; asking the
+ * renderer "is anything pending over these bytes" for each of them cost
+ * ~3% of the vCPU in Doom 3, all of it answered "no".  A range that has
+ * been checked once in this draw cannot have become busy since: recording
+ * GPU work is what makes a range busy, and nothing records any between the
+ * start of a draw packet and its vertices being fetched.  PPCGPU_READ_MEMO=0
+ * (or the async draw thread, which records out of band) makes every read
+ * check for itself again, as before.
+ */
+static bool r200_read_memo(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_READ_MEMO");
+        on = !(e && e[0] == '0') && !r200_async_enabled();
+    }
+    return on;
+}
+
+/* PPCGPU_READ_MEMO_CHECK=1: also ask the renderer on a memo hit, and log
+ * any range the memo would have skipped while work was pending. */
+static bool r200_read_memo_check(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_READ_MEMO_CHECK");
+        on = e && e[0] == '1';
+    }
+    return on;
+}
+
+static void r200_read_memo_clear(PPCMacGPUState *s)
+{
+    s->r3_read_clean_n = 0;
+}
+
+static bool r200_read_checked(const PPCMacGPUState *s, uint64_t lo, uint64_t hi)
+{
+    for (unsigned i = 0; i < s->r3_read_clean_n; i++) {
+        if (lo >= s->r3_read_clean[i].lo && hi <= s->r3_read_clean[i].hi) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Remember [lo, hi) as checked.  Overlapping or touching entries are
+ * merged: the union of two checked ranges is checked, holes included, so
+ * a later read anywhere in the merged range may skip the check too.
+ */
+static void r200_read_remember(PPCMacGPUState *s, uint64_t lo, uint64_t hi)
+{
+    bool merged = true;
+
+    if (s->r3_read_clean_n == ARRAY_SIZE(s->r3_read_clean)) {
+        s->r3_read_clean_n = 0;         /* full: forget, check again instead */
+    }
+    while (merged) {
+        merged = false;
+        for (unsigned i = 0; i < s->r3_read_clean_n; i++) {
+            if (lo <= s->r3_read_clean[i].hi && s->r3_read_clean[i].lo <= hi) {
+                lo = MIN(lo, s->r3_read_clean[i].lo);
+                hi = MAX(hi, s->r3_read_clean[i].hi);
+                s->r3_read_clean[i] = s->r3_read_clean[--s->r3_read_clean_n];
+                merged = true;
+                break;
+            }
+        }
+    }
+    s->r3_read_clean[s->r3_read_clean_n].lo = lo;
+    s->r3_read_clean[s->r3_read_clean_n].hi = hi;
+    s->r3_read_clean_n++;
+}
+
+/*
+ * A CPU-side read of [lo, hi) has to see the GPU's rendering of those
+ * bytes; the renderer says whether any unfinished batch touches them, and
+ * only then is the engine drained.
+ */
+static void r200_vram_sync_read(PPCMacGPUState *s, uint64_t lo, uint64_t hi)
+{
+    bool memo = r200_read_memo();
+
+    r200_rate.read_checks++;
+    if (memo && r200_read_checked(s, lo, hi)) {
+        r200_rate.read_skips++;
+        if (r200_read_memo_check() && s->renderer &&
+            s->renderer->range_busy_r200 &&
+            s->renderer->range_busy_r200(s->renderer_opaque, lo, hi, false)) {
+            static unsigned n;
+            if (n++ < 200) {
+                qemu_log("ppc-mac-gpu CHECK: read [0x%08" PRIx64 ", 0x%08" PRIx64
+                         ") skipped a pending range\n", lo, hi);
+            }
+        }
+        return;
+    }
+    r200_vram_access(s, lo, hi, false, 12);
+    if (memo) {
+        r200_read_remember(s, lo, hi);
+    }
+}
+
+/*
+ * The check a draw's vertex fetch needs, made once for the arrays it will
+ * read instead of once per attribute per vertex: the extent is an upper
+ * bound on what the fetch can touch (nvtx is exact for a non-indexed draw
+ * and an estimate for an indexed one; VAP_VTX_SIZE covers the elements
+ * that share the last array), and a read outside it is still checked, so a
+ * bound that is too small costs a check and never correctness.  Touching
+ * extents are merged: TinyGL packs a mesh's arrays into one VRAM buffer,
+ * which is then one check.  The bound stays tight on purpose -- a check
+ * that reaches into a neighbouring buffer would flush for it.
+ */
+static void r300_arrays_sync(PPCMacGPUState *s, uint32_t nvtx)
+{
+    struct {
+        uint64_t lo, hi;
+    } iv[R300_MAX_ARRAYS], t;
+    uint32_t vtx_size = r300_reg(s->r3, 0x20B4);    /* VAP_VTX_SIZE, dwords */
+    unsigned n = 0;
+
+    if (!r200_read_sync() || !r200_read_memo()) {
+        return;                 /* PPCGPU_READ_MEMO=0: the old per-read checks */
+    }
+    /* 16 PSC elements, each up to 15 skipped and 8 read dwords: nothing
+     * real reaches past the last array's element that far. */
+    vtx_size = MIN(MAX(vtx_size, 1), 384);
+    for (unsigned k = 0; k < s->r3_arrays.count && k < R300_MAX_ARRAYS; k++) {
+        uint32_t lo = s->r3_arrays.a[k].addr;
+        uint32_t size = MAX(s->r3_arrays.a[k].size_dw, vtx_size);
+        uint64_t bytes = ((uint64_t)(nvtx ? nvtx - 1 : 0) *
+                          s->r3_arrays.a[k].stride_dw + size) * 4;
+        unsigned j;
+
+        if (!r300_to_vram(s, &lo, 0)) {
+            continue;                   /* the array is in the GART */
+        }
+        iv[n].lo = lo;
+        iv[n].hi = MIN((uint64_t)lo + bytes, s->vram_size);
+        if (iv[n].hi <= iv[n].lo) {
+            continue;
+        }
+        for (j = n; j > 0 && iv[j - 1].lo > iv[j].lo; j--) {
+            t = iv[j]; iv[j] = iv[j - 1]; iv[j - 1] = t;
+        }
+        n++;
+    }
+    for (unsigned i = 0; i < n; i++) {
+        if (i + 1 < n && iv[i + 1].lo <= iv[i].hi) {
+            iv[i + 1].lo = iv[i].lo;
+            iv[i + 1].hi = MAX(iv[i].hi, iv[i + 1].hi);
+        } else {
+            r200_vram_sync_read(s, iv[i].lo, iv[i].hi);
+        }
+    }
+}
+
 /* Raw guest GPU memory (VRAM or AGP), bytes as they lie. */
 static bool r300_read_raw(void *opaque, uint32_t gpu_addr, void *dst,
                           uint32_t len)
@@ -3605,21 +3790,8 @@ static bool r300_read_raw(void *opaque, uint32_t gpu_addr, void *dst,
     uint8_t *out = dst;
 
     if (r300_to_vram(s, &off, len)) {
-        /*
-         * Vertex and index data a draw rendered: MorphOS TinyGL copies
-         * vertex arrays into VRAM with a textured-quad draw, then draws
-         * from them.  That draw must be in VRAM before the CPU builds the
-         * next one, or it reads the previous upload (CroMagRally: white
-         * or green fades, sky dome missing).  r300_cpu_copy makes those
-         * uploads here, so this rarely waits.  PPCGPU_READ_SYNC=0: off.
-         */
-        static int sync = -1;
-        if (sync < 0) {
-            const char *e = getenv("PPCGPU_READ_SYNC");
-            sync = !(e && e[0] == '0');
-        }
-        if (sync) {
-            r200_vram_access(s, off, (uint64_t)off + len, false, 12);
+        if (r200_read_sync()) {
+            r200_vram_sync_read(s, off, (uint64_t)off + len);
         }
         memcpy(dst, (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
                     off, len);
@@ -3825,13 +3997,39 @@ static void r300_cmask_clear(PPCMacGPUState *s)
     }
 }
 
+/* PPCGPU_BAR_DIRECT=0: ask the PCI core for BAR0 through its accessor. */
+static bool r300_bar_direct(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_BAR_DIRECT");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/*
+ * MorphOS submits framebuffer addresses in the PCI aperture, so this falls
+ * back to BAR0 for nearly every draw.  The vertex fetch calls it once per
+ * attribute, where the accessor's call, assert and memcpy were ~0.5% of the
+ * vCPU: BAR0 is a plain little-endian dword of the config space this device
+ * owns, and nothing masks or synthesizes it, so read it in place.
+ */
+static uint32_t r300_bar0(PPCMacGPUState *s)
+{
+    if (r300_bar_direct()) {
+        return pci_get_long(s->pci.config + PCI_BASE_ADDRESS_0);
+    }
+    return pci_default_read_config(&s->pci, PCI_BASE_ADDRESS_0, 4);
+}
+
 static bool r300_to_vram(PPCMacGPUState *s, uint32_t *addr, uint64_t len)
 {
     uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
 
     if (*addr < fb_base || (uint64_t)*addr - fb_base + len > s->vram_size) {
         /* MorphOS submits framebuffer addresses in the PCI aperture. */
-        fb_base = pci_default_read_config(&s->pci, PCI_BASE_ADDRESS_0, 4) & ~0xFu;
+        fb_base = r300_bar0(s) & ~0xFu;
         if (*addr < fb_base || (uint64_t)*addr - fb_base + len > s->vram_size) {
             return false;
         }
@@ -4447,6 +4645,11 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
             s->r3->glsl_flags &= ~R300_GLSL_GPU_VS;
         }
     }
+    if (opcode != 0x35 && s->r3_arrays.count) {
+        /* Everything this draw is about to read out of VRAM, checked
+         * before the first attribute is fetched. */
+        r300_arrays_sync(s, d[0] >> 16);
+    }
     bool build_ok = idx ?
         r300_draw_build_indexed(s->r3, &s->r3_arrays, d[0], idx, r300_read_raw,
                                 s, &pkt, &err) :
@@ -4863,6 +5066,11 @@ static bool ppc_mac_gpu_r300_packet3(PPCMacGPUState *s, uint32_t opcode,
     static uint32_t op_seen[256];
     bool draw = opcode == 0x34 || opcode == 0x35 || opcode == 0x36;
 
+    if (draw) {
+        /* Nothing has been recorded since the last draw packet, so the
+         * ranges its builder found clean are clean for this one too. */
+        r200_read_memo_clear(s);
+    }
     if (s->r3_dump && op_seen[opcode & 0xFF]++ == 0) {
         fprintf(s->r3_dump, "--- first type-3 opcode 0x%02X (%u dwords):",
                 opcode, body_dw);
@@ -11108,6 +11316,10 @@ static void ppc_mac_gpu_cp_run(PPCMacGPUState *s)
 {
     unsigned epoch = ++cp.epoch;    /* a yielded CP thread gives up its copy */
 
+    /* This thread records GPU work too, which invalidates what the vCPU's
+     * draw builder has already found clean. */
+    qatomic_set(&s->r3_read_clean_n, 0);
+
     for (;;) {
         uint32_t wptr = qatomic_load_acquire(&s->regs.cp_rb_wptr);
         uint32_t rptr = s->regs.cp_rb_rptr;
@@ -14485,6 +14697,7 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
     PPCMacGPUState *s = PPC_MAC_GPU(dev);
 
     cp.epoch++;                 /* a CP thread mid-ring drops what it has */
+    r200_read_memo_clear(s);
     qemu_spin_lock(&s->csq_ring_lock);
     s->csq_ring_tail = s->csq_ring_count = 0;
     qemu_spin_unlock(&s->csq_ring_lock);

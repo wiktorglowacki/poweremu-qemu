@@ -719,6 +719,14 @@ struct PPCMacGPUState {
     uint32_t r3_indx_vf;        /* DRAW_INDX_2 waiting for INDX_BUFFER (0: none) */
     uint32_t r3_indx_buf[3];    /* INDX_BUFFER waiting for its DRAW_INDX_2 */
     bool r3_indx_buf_pending;
+    /* VRAM ranges the current draw's builder has already found free of
+     * pending GPU work (r300_read_raw), so a mesh does not re-check every
+     * attribute it fetches.  Emptied when a draw packet starts, when the CP
+     * thread carries the ring out, and on reset. */
+    struct {
+        uint64_t lo, hi;
+    } r3_read_clean[8];
+    unsigned r3_read_clean_n;
     uint32_t r3_zb_offset, r3_zb_height;   /* depth buffer extent seen at draws */
     uint32_t r3_zb_ns;          /* GB_AA_CONFIG samples at the last depth draw */
     uint32_t r3_cb_aa_off, r3_cb_aa_ns; /* last multisampled colour buffer, samples */
