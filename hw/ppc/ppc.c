@@ -516,9 +516,9 @@ static uint64_t ns_to_tb(uint32_t freq, int64_t clock)
  * Each read used to go through cpu_get_clock(): a seqlock and a vDSO
  * clock_gettime (16 ns on the Ryzen host, with its ordered rdtsc).  On x86
  * hosts whose kernel clocksource is the TSC, a read now extrapolates from
- * a per-thread base pair (TSC, virtual ns) with a plain rdtsc (7 ns) and
- * an ns-per-tick ratio, and re-reads the real clock once a millisecond,
- * so the error cannot accumulate.  The ratio is re-measured against
+ * a per-thread base pair (TSC, virtual ns) with a plain rdtsc and an
+ * ns-per-tick ratio, and re-reads the real clock once a millisecond, so
+ * the error cannot accumulate.  The ratio is re-measured against
  * CLOCK_MONOTONIC every 16 ms and so follows NTP slewing; the TSC of a
  * pair is the midpoint of reads around the clock read, and a pair whose
  * reads were interrupted is not used.  Measured error at the end of a
@@ -528,9 +528,19 @@ static uint64_t ns_to_tb(uint32_t freq, int64_t clock)
  * as is, as before.  Stores and the decrementer timer keep using the real
  * virtual clock.  PPC_FAST_TB=0 turns it off; PPC_TB_STATS=1 prints the
  * read rates and the extrapolation error once a second.
- * ponytail: worth only 0.1-0.3% of the vCPU (MorphOS makes 20k reads/s
- * idle, 100-200k under load, mostly in wait loops); drop it if it ever
- * gets in the way.
+ *
+ * What a read costs now, measured on the 9950X3D with the handle below:
+ * 7.5 ns in a bare-metal mftb loop, of which 6.9 ns is the rdtsc itself
+ * (a tight host loop of rdtsc alone is 6.9 ns; CLOCK_MONOTONIC is 15.5 ns,
+ * CLOCK_MONOTONIC_COARSE is 2.3 ns but only 1 ms wide).  The rest of the
+ * path, the helper call, the multiply, the clamp and ns_to_tb, is ~0.6 ns,
+ * so there is nothing left to win here while the read has to see the host
+ * clock every time: a cached or coarse timebase would be cheaper only by
+ * quantising guest time to the coarse clock's millisecond, which is the
+ * guest's own tick.  The Doom 3 profile (2.9% of the vCPU in tb_read_clock,
+ * ~3.6M reads/s) is therefore a count of reads, not of QEMU work; making
+ * each one cheaper cannot remove more than the rdtsc, and wait loops that
+ * poll it just poll more often.
  */
 #define FTB_WINDOW_NS   (1 * SCALE_MS)
 #define FTB_CALIB_NS    (16 * SCALE_MS)
@@ -572,7 +582,7 @@ static void ftb_init(void)
 #endif
 }
 
-static int64_t ftb_resync(uint64_t t1)
+static int64_t __attribute__((noinline)) ftb_resync(uint64_t t1)
 {
     int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint64_t t2 = cpu_get_host_ticks();
@@ -624,41 +634,59 @@ static int64_t ftb_resync(uint64_t t1)
     return ns;
 }
 
-static int64_t tb_read_clock(int kind)
+static void __attribute__((noinline)) ftb_account(int kind, int64_t ns)
 {
-    uint64_t d;
+    double s;
+
+    ftb_count[kind]++;
+    if (ns - ftb_count_t0 < NANOSECONDS_PER_SECOND) {
+        return;
+    }
+    s = (ns - ftb_count_t0) / 1e9;
+    fprintf(stderr, "ppc-tb: %s tbl %.0f tbu %.0f decr %.0f"
+            " resync %.0f per s, error %" PRId64 "..%" PRId64 " ns\n",
+            ftb_on ? "fast" : "slow", ftb_count[0] / s,
+            ftb_count[1] / s, ftb_count[2] / s, ftb_count[3] / s,
+            ftb_err_min, ftb_err_max);
+    memset(ftb_count, 0, sizeof(ftb_count));
+    ftb_count_t0 = ns;
+    ftb_err_min = ftb_err_max = 0;
+}
+
+/*
+ * The read every mftb/mfdec lands in: no calls, no stack frame, only the
+ * reads and the multiply.  The resync and the statistics are calls out of
+ * line, so this inlines into the helper.
+ */
+static inline int64_t ftb_now(void)
+{
+    uint64_t tsc = cpu_get_host_ticks();
+    uint64_t d = tsc - ftb_tsc;
+    int64_t ns;
+
+    if (likely(d < ftb_window)) {
+        ns = ftb_ns + ((d * ftb_mult) >> 32);
+    } else {
+        ns = ftb_resync(tsc);
+    }
+    if (unlikely(ns < ftb_last && ftb_last - ns < FTB_WINDOW_NS)) {
+        ns = ftb_last;
+    }
+    ftb_last = ns;
+    return ns;
+}
+
+static inline int64_t tb_read_clock(int kind)
+{
     int64_t ns;
 
     if (!ftb_on) {
         ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     } else {
-        uint64_t tsc = cpu_get_host_ticks();
-
-        d = tsc - ftb_tsc;
-        if (likely(d < ftb_window)) {
-            ns = ftb_ns + ((d * ftb_mult) >> 32);
-        } else {
-            ns = ftb_resync(tsc);
-        }
-        if (ns < ftb_last && ftb_last - ns < FTB_WINDOW_NS) {
-            ns = ftb_last;
-        }
-        ftb_last = ns;
+        ns = ftb_now();
     }
     if (unlikely(ftb_stats)) {
-        ftb_count[kind]++;
-        if (ns - ftb_count_t0 >= NANOSECONDS_PER_SECOND) {
-            double s = (ns - ftb_count_t0) / 1e9;
-
-            fprintf(stderr, "ppc-tb: %s tbl %.0f tbu %.0f decr %.0f"
-                    " resync %.0f per s, error %" PRId64 "..%" PRId64 " ns\n",
-                    ftb_on ? "fast" : "slow", ftb_count[0] / s,
-                    ftb_count[1] / s, ftb_count[2] / s, ftb_count[3] / s,
-                    ftb_err_min, ftb_err_max);
-            memset(ftb_count, 0, sizeof(ftb_count));
-            ftb_count_t0 = ns;
-            ftb_err_min = ftb_err_max = 0;
-        }
+        ftb_account(kind, ns);
     }
     return ns;
 }
