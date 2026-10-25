@@ -2440,6 +2440,7 @@ static bool ppc_gpu_dirty_scanout = true;   /* read from env in realize */
 static bool ppc_gpu_flip_kick = true;
 static bool ppc_gpu_async_present = true;
 static bool ppc_gpu_po_alias = true;
+static bool ppc_gpu_hd_mono = true;
 
 static void ppc_mac_gpu_scanout_cursor(PPCMacGPUState *s, uint32_t stride,
                                       int y0, int y1)
@@ -5650,7 +5651,7 @@ static inline void fill_vram_px(PPCMacGPUState *s, uint8_t *vram,
 static uint8_t host_data_mono_mode(uint32_t gmc)
 {
     uint32_t dt = (gmc >> 12) & 3;
-    return dt > 1 ? 0 : (dt + 1) | ((gmc >> 14) & 1) << 2;
+    return dt > 1 || !ppc_gpu_hd_mono ? 0 : (dt + 1) | ((gmc >> 14) & 1) << 2;
 }
 
 /* One dword of mono host data: up to 32 pixels of the current row (a row
@@ -6614,7 +6615,9 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
         s->host_data_bpp = gmc_dst_bpp(s->regs.dp_gui_master_cntl);
         s->host_data_mono = host_data_mono_mode(s->regs.dp_gui_master_cntl);
         /* written on the CPU: rendering pending there goes first */
-        r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y, blit_h), true, 1);
+        if (ppc_gpu_hd_mono) {
+            r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y, blit_h), true, 1);
+        }
         s->host_data_active = true;
 
         gpu_debug_log("2D_HOST_BLT dst=0x%x+%u dxy=%u,%u %ux%u",
@@ -7136,7 +7139,9 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
         s->host_data_cur_y = 0;
         s->host_data_bpp = gmc_dst_bpp(gmc);
         s->host_data_mono = host_data_mono_mode(gmc);
-        r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y, blit_h), true, 1);
+        if (ppc_gpu_hd_mono) {
+            r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y, blit_h), true, 1);
+        }
         s->host_data_active = true;
         return;
     }
@@ -15355,6 +15360,7 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
     ppc_gpu_flip_kick = ppc_gpu_env_on("PPCGPU_FLIP_KICK");
     ppc_gpu_async_present = ppc_gpu_env_on("PPCGPU_ASYNC_PRESENT");
     ppc_gpu_po_alias = ppc_gpu_env_on("PPCGPU_PO_ALIAS");
+    ppc_gpu_hd_mono = ppc_gpu_env_on("PPCGPU_HD_MONO");
     s->scanout_log_owner = !s->renderer || !s->renderer->set_dirty_source;
 
     /* Set PCI config space fields */
