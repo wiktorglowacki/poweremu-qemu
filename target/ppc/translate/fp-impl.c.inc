@@ -1032,6 +1032,33 @@ static void gen_fmrgow(DisasContext *ctx)
 
 /***                  Floating-Point status & ctrl register                ***/
 
+static bool native_fpscr_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPC_NATIVE_FPSCR");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+static bool native_fpscr(DisasContext *ctx, target_ulong mask)
+{
+    return native_fp_on() && ctx->fp_fast && native_fpscr_on() &&
+           !(mask & FP_FPRF);
+}
+
+static void gen_fpscr_summary(TCGv v)
+{
+    TCGv t = tcg_temp_new();
+
+    tcg_gen_andi_tl(v, v, (target_ulong)FPSCR_MTFS_MASK);
+    tcg_gen_andi_tl(t, v, FPSCR_IX);
+    tcg_gen_setcondi_tl(TCG_COND_NE, t, t, 0);
+    tcg_gen_shli_tl(t, t, FPSCR_VX);
+    tcg_gen_or_tl(v, v, t);
+}
+
 /* mcrfs */
 static void gen_mcrfs(DisasContext *ctx)
 {
@@ -1049,6 +1076,17 @@ static void gen_mcrfs(DisasContext *ctx)
     bfa = crfS(ctx->opcode);
     nibble = 7 - bfa;
     shift = 4 * nibble;
+    if (native_fpscr(ctx, (target_ulong)0xf << shift)) {
+        tcg_gen_shri_tl(tmp, cpu_fpscr, shift);
+        tcg_gen_trunc_tl_i32(cpu_crf[crfD(ctx->opcode)], tmp);
+        tcg_gen_andi_i32(cpu_crf[crfD(ctx->opcode)],
+                         cpu_crf[crfD(ctx->opcode)], 0xf);
+        tcg_gen_andi_tl(tmp, cpu_fpscr,
+                        ~(target_ulong)((0xFull << shift) & FP_EX_CLEAR_BITS));
+        gen_fpscr_summary(tmp);
+        tcg_gen_mov_tl(cpu_fpscr, tmp);
+        return;
+    }
     gen_fprf_sync();
     tcg_gen_shri_tl(tmp, cpu_fpscr, shift);
     tcg_gen_trunc_tl_i32(cpu_crf[crfD(ctx->opcode)], tmp);
@@ -1211,6 +1249,19 @@ static void gen_mtfsb0(DisasContext *ctx)
         return;
     }
     crb = 31 - crbD(ctx->opcode);
+    if (!Rc(ctx->opcode) && crb > FPSCR_VE && crb != FPSCR_FEX &&
+        crb != FPSCR_VX && native_fpscr(ctx, 1u << crb)) {
+        TCGv t = tcg_temp_new(), b = tcg_temp_new();
+
+        tcg_gen_st16_i32(tcg_constant_i32(0), tcg_env,
+                         offsetof(CPUPPCState, fp_status.float_exception_flags));
+        tcg_gen_andi_tl(t, cpu_fpscr, ~(target_ulong)(1u << crb));
+        gen_fpscr_summary(t);
+        tcg_gen_andi_tl(b, cpu_fpscr, 1u << crb);
+        tcg_gen_movcond_tl(TCG_COND_NE, cpu_fpscr, b, tcg_constant_tl(0),
+                           t, cpu_fpscr);
+        return;
+    }
     gen_reset_fpstatus();
     if (likely(crb != FPSCR_FEX && crb != FPSCR_VX)) {
         gen_helper_fpscr_clrbit(tcg_env, tcg_constant_i32(crb));
@@ -1303,6 +1354,18 @@ static void gen_mtfsfi(DisasContext *ctx)
         return;
     }
     sh = (8 * w) + 7 - bf;
+    if (!Rc(ctx->opcode) && !w &&
+        !(((uint64_t)FPIMM(ctx->opcode) << (4 * sh)) &
+          (FP_ENABLES | FP_NI | FP_RN)) &&
+        native_fpscr(ctx, (target_ulong)0xf << (4 * sh))) {
+        TCGv t = tcg_temp_new();
+
+        tcg_gen_andi_tl(t, cpu_fpscr, ~((target_ulong)0xf << (4 * sh)));
+        tcg_gen_ori_tl(t, t, (target_ulong)FPIMM(ctx->opcode) << (4 * sh));
+        gen_fpscr_summary(t);
+        tcg_gen_mov_tl(cpu_fpscr, t);
+        return;
+    }
     t0 = tcg_constant_i64(((uint64_t)FPIMM(ctx->opcode)) << (4 * sh));
     t1 = tcg_constant_i32(1 << sh);
     gen_helper_store_fpscr(tcg_env, t0, t1);

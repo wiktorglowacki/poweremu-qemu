@@ -1237,9 +1237,23 @@ static uint32_t fpd_tail(volatile uint64_t *buf, int follow)
         asm volatile("mtfsb1 19\n\tmffs 5\n\tstfd 5,32(%0)"
                      : : "b"(buf) : "fr5", "memory");
         break;
-    default:    /* FPCC to CR1 */
+    case 3:     /* FPCC to CR1 */
         asm volatile("mcrfs 1,4\n\tmffs 5\n\tstfd 5,32(%1)\n\tmfcr %0"
                      : "=r"(cr) : "b"(buf) : "fr5", "cr1", "memory");
+        break;
+    case 4:     /* clear VXCVI and FX */
+        asm volatile("mtfsb0 23\n\tmtfsb0 0\n\tmffs 5\n\tstfd 5,32(%0)"
+                     : : "b"(buf) : "fr5", "memory");
+        break;
+    case 5:     /* exception fields to CR, clearing them */
+        asm volatile("mcrfs 6,5\n\tmcrfs 7,0\n\tmcrfs 1,1\n\tmffs 5\n\t"
+                     "stfd 5,32(%1)\n\tmfcr %0"
+                     : "=r"(cr) : "b"(buf) : "fr5", "cr1", "cr6", "cr7", "memory");
+        break;
+    default:    /* whole fields */
+        asm volatile("mtfsfi 5,0\n\tmtfsfi 0,1\n\tmtfsfi 7,0\n\tmffs 5\n\t"
+                     "stfd 5,32(%0)"
+                     : : "b"(buf) : "fr5", "memory");
         break;
     }
     return cr;
@@ -1267,7 +1281,7 @@ static void fp_diff(uint32_t *seed)
                     buf[0] = a; buf[1] = c; buf[2] = b;
                     buf[5] = 0x7ff8dead0000beefull;   /* old f1 */
                     buf[6] = fpscr_in[st];
-                    int follow = it & 3;
+                    int follow = it % 7;
                     uint32_t cr;
 
                     fpd_one(buf, op, form);

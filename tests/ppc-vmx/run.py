@@ -142,7 +142,7 @@ def fpdiff(img, out, strict=False):
             bad += 1
             if bad <= 10:
                 st, op, form = (r0[5] >> 16) & 15, (r0[5] >> 8) & 0xff, r0[5] & 0xff
-                follow = ('mffs', 'fcmpu', 'mtfsb1', 'mcrfs')[(r0[5] >> 20) & 15]
+                follow = ('mffs', 'fcmpu', 'mtfsb1', 'mcrfs', 'mtfsb0', 'mcrfs x3', 'mtfsfi')[(r0[5] >> 20) & 15]
                 print(f'MISMATCH {FPD_OPS[op]} form {form} fpscr_in {st} then {follow} '
                       f'(cr {r0[5] >> 32:08x}/{r1[5] >> 32:08x}): '
                       f'a={r0[0]:016x} c={r0[1]:016x} b={r0[2]:016x}')
