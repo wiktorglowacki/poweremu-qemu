@@ -1796,11 +1796,17 @@ static bool vk_tile_copy(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0
     if (x1 <= x0 || y1 <= y0) {
         return true;
     }
+    static int band32 = -1;
+    if (band32 < 0) {
+        const char *e = getenv("PPCGPU_VK_BAND32");
+        band32 = e && e[0] == '1';
+    }
+    uint32_t band = band32 ? 32 : vk_tile_band(im->cls, im->tiling, im->bpp);
     uint32_t w = x1 - x0;
     uint32_t w_pad = ROUND_UP(x1, align) - x0;
     uint32_t rows_max = MAX((uint32_t)(((VkDeviceSize)16 << 20) / ((VkDeviceSize)w_pad * im->bpp)), 1u);
     if (!vk_tile_staging(MAX((VkDeviceSize)w_pad * im->bpp * MIN(y1 - y0, rows_max),
-                             (VkDeviceSize)(MIN(y1 - y0, rows_max) + 32) * im->pitch))) {
+                             (VkDeviceSize)(MIN(y1 - y0, rows_max) + 2 * band) * im->pitch))) {
         return false;
     }
     if (!V.tile_logged) {
@@ -1817,7 +1823,7 @@ static bool vk_tile_copy(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0
             .imageOffset = { (int32_t)x0, (int32_t)y, 0 },
             .imageExtent = { w, h, 1 },
         };
-        uint64_t lo = vk_zs_copy(cb, im, y, h, 32, false);
+        uint64_t lo = vk_zs_copy(cb, im, y, h, band, false);
         uint32_t pc[9] = { im->addr - lo, im->pitch, x0, y, w_pad, h, im->bpp,
                            vk_vram_tiling(im->cls, im->tiling),
                            to_vram ? 0 : 1 };
@@ -1833,7 +1839,7 @@ static bool vk_tile_copy(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0
         vkCmdDispatch(cb, DIV_ROUND_UP(words, 64), 1, 1);
         vk_full_barrier(cb);
         if (to_vram) {
-            vk_zs_copy(cb, im, y, h, 32, true);
+            vk_zs_copy(cb, im, y, h, band, true);
         } else {
             vkCmdCopyBufferToImage(cb, V.tile_buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
             vk_full_barrier(cb);
