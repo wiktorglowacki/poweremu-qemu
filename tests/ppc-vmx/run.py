@@ -101,7 +101,7 @@ FPD_BASE = 0x01000000
 FPD_REC = 6 * 8
 FPD_OPS = ['fadd', 'fadds', 'fsub', 'fsubs', 'fmul', 'fmuls', 'fdiv', 'fdivs',
            'fmadd', 'fmadds', 'fmsub', 'fmsubs', 'fnmadd', 'fnmadds',
-           'fnmsub', 'fnmsubs', 'frsp']
+           'fnmsub', 'fnmsubs', 'frsp', 'fctiwz', 'fctiw']
 
 
 def fpdiff(img, out, strict=False):

@@ -1139,6 +1139,11 @@ static uint64_t fpd_pool(uint32_t *seed)
         0x380fffffffffffffull, 0xb80ffffff0000000ull,  /* just under 2^-126 */
         0x47efffffefffffffull, 0xc7effffff0000000ull,  /* near single max */
         0x3ff0000010000000ull, 0x3ff0000030000000ull,  /* single ties */
+        0x41dfffffffc00000ull, 0x41e0000000000000ull,  /* 2^31 - 1, 2^31 */
+        0xc1e0000000000000ull, 0xc1e0000000200000ull,  /* -2^31, -2^31 - 1 */
+        0x3fe0000000000000ull, 0xbfefffffffffffffull,  /* 0.5, -0.99.. */
+        0x3ff8000000000000ull, 0xc004000000000000ull,  /* 1.5, -2.5 */
+        0x41cfffffffc00000ull, 0xc1d0000000200000ull,  /* 2^30 - 0.5, -2^30 - 0.5 */
     };
     uint32_t r = rnd(seed);
     uint64_t m = (uint64_t)rnd(seed) << 32 | rnd(seed);
@@ -1205,6 +1210,8 @@ static void fpd_one(volatile uint64_t *buf, int op, int form)
     case 14: switch (form) { FPD_OP3("fnmsub") }  break;
     case 15: switch (form) { FPD_OP3("fnmsubs") } break;
     case 16: switch (form) { FPD_OPR("frsp") }    break;
+    case 17: switch (form) { FPD_OPR("fctiwz") }  break;
+    case 18: switch (form) { FPD_OPR("fctiw") }   break;
     }
 }
 
@@ -1255,7 +1262,7 @@ static void fp_diff(uint32_t *seed)
             } else if ((k & 15) == 1) {
                 b = a ^ 0x8000000000000000ull;
             }
-            for (int op = 0; op < 17; op++) {
+            for (int op = 0; op < 19; op++) {
                 for (int form = 0; form < 4; form++) {
                     buf[0] = a; buf[1] = c; buf[2] = b;
                     buf[5] = 0x7ff8dead0000beefull;   /* old f1 */

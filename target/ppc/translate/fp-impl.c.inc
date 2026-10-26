@@ -386,6 +386,73 @@ static void native_frsp(DisasContext *ctx, int frt, int frb)
     tcg_gen_or_tl(cpu_fpscr, cpu_fpscr, tl);
 }
 
+#define NATIVE_FCTIWZ (-3)
+#define NATIVE_FCTIW (-4)
+
+static bool native_fcti_on(bool z)
+{
+    static int on[2] = { -1, -1 };
+    if (on[z] < 0) {
+        const char *e = getenv(z ? "PPC_NATIVE_FCTIWZ" : "PPC_NATIVE_FCTIW");
+        on[z] = !(e && e[0] == '0');
+    }
+    return on[z];
+}
+
+static void native_fcti(DisasContext *ctx, int frt, int frb, bool z)
+{
+    NativeFPSlow *sp = &ctx->nfp[ctx->n_nfp++];
+    TCGv_i64 x = tcg_temp_new_i64(), e = tcg_temp_new_i64();
+    TCGv_i64 m = tcg_temp_new_i64(), r = tcg_temp_new_i64();
+    TCGv_i64 s = tcg_temp_new_i64();
+    TCGv_i32 r32 = tcg_temp_new_i32();
+    TCGv tl = tcg_temp_new();
+
+    *sp = (NativeFPSlow) {
+        .slow = gen_new_label(), .next = ctx->base.pc_next,
+        .op = z ? NATIVE_FCTIWZ : NATIVE_FCTIW,
+        .frt = frt, .x = frb, .y = frb, .z = -1,
+    };
+
+    get_fpr(x, frb);
+    tcg_gen_extract_i64(e, x, 52, 11);
+    tcg_gen_brcondi_i64(TCG_COND_GEU, e, 1023 + 31 - !z, sp->slow);
+
+    tcg_gen_extract_i64(m, x, 0, 52);
+    tcg_gen_ori_i64(m, m, 1ull << 52);
+    tcg_gen_subfi_i64(e, 1075, e);
+    tcg_gen_umin_i64(e, e, tcg_constant_i64(63));
+    tcg_gen_shr_i64(r, m, e);
+    tcg_gen_subfi_i64(e, 64, e);
+    tcg_gen_shl_i64(m, m, e);
+    if (!z) {
+        tcg_gen_andi_i64(s, r, 1);
+        tcg_gen_add_i64(s, m, s);
+        tcg_gen_setcondi_i64(TCG_COND_GTU, s, s, 1ull << 63);
+        tcg_gen_add_i64(r, r, s);
+    }
+    tcg_gen_sari_i64(s, x, 63);
+    tcg_gen_xor_i64(r, r, s);
+    tcg_gen_sub_i64(r, r, s);
+    tcg_gen_st_i64(r, tcg_env, fpr_offset(frt));
+    if (ctx->insns_flags2 & PPC2_VSX) {
+        tcg_gen_st_i64(tcg_constant_i64(0), tcg_env, vsr64_offset(frt, false));
+    }
+
+    tcg_gen_shli_i64(s, x, 1);
+    tcg_gen_movcond_i64(TCG_COND_EQ, m, s, tcg_constant_i64(0), s, m);
+    tcg_gen_setcondi_i64(TCG_COND_NE, s, m, 0);
+    tcg_gen_extrl_i64_i32(r32, s);
+    tcg_gen_shli_i32(r32, r32, 4);
+    tcg_gen_st16_i32(r32, tcg_env,
+                     offsetof(CPUPPCState, fp_status.float_exception_flags));
+    tcg_gen_neg_i64(s, s);
+    tcg_gen_andi_i64(s, s, FP_XX | FP_FX | FP_FI);
+    tcg_gen_trunc_i64_tl(tl, s);
+    tcg_gen_andi_tl(cpu_fpscr, cpu_fpscr, ~(target_ulong)FP_FI);
+    tcg_gen_or_tl(cpu_fpscr, cpu_fpscr, tl);
+}
+
 /* After the TB's exit: each slow path, then on to the next instruction. */
 static void native_fp_emit_slow_paths(DisasContext *ctx)
 {
@@ -402,6 +469,19 @@ static void native_fp_emit_slow_paths(DisasContext *ctx)
         if (sp->op == NATIVE_FCMPU) {
             gen_reset_fpstatus();
             gen_helper_fcmpu(tcg_env, t0, t1, tcg_constant_i32(sp->frt));
+            gen_helper_float_check_status(tcg_env);
+            gen_update_nip(ctx, sp->next);
+            tcg_gen_lookup_and_goto_ptr();
+            continue;
+        }
+        if (sp->op == NATIVE_FCTIWZ || sp->op == NATIVE_FCTIW) {
+            gen_reset_fpstatus();
+            if (sp->op == NATIVE_FCTIWZ) {
+                gen_helper_fctiwz(t3, tcg_env, t0);
+            } else {
+                gen_helper_fctiw(t3, tcg_env, t0);
+            }
+            set_fpr(sp->frt, t3);
             gen_helper_float_check_status(tcg_env);
             gen_update_nip(ctx, sp->next);
             tcg_gen_lookup_and_goto_ptr();
@@ -649,11 +729,45 @@ TRANS(FSQRTS, do_helper_fsqrt, gen_helper_FSQRTS);
 
 /***                     Floating-Point round & convert                    ***/
 /* fctiw */
-GEN_FLOAT_B(ctiw, 0x0E, 0x00, 0, PPC_FLOAT);
+static void gen_fcti(DisasContext *ctx, bool z)
+{
+    TCGv_i64 t0, t1;
+
+    if (unlikely(!ctx->fpu_enabled)) {
+        gen_exception(ctx, POWERPC_EXCP_FPU);
+        return;
+    }
+    if (!Rc(ctx->opcode) && native_fp(ctx) && native_fcti_on(z)) {
+        native_fcti(ctx, rD(ctx->opcode), rB(ctx->opcode), z);
+        return;
+    }
+    t0 = tcg_temp_new_i64();
+    t1 = tcg_temp_new_i64();
+    gen_reset_fpstatus();
+    get_fpr(t0, rB(ctx->opcode));
+    if (z) {
+        gen_helper_fctiwz(t1, tcg_env, t0);
+    } else {
+        gen_helper_fctiw(t1, tcg_env, t0);
+    }
+    set_fpr(rD(ctx->opcode), t1);
+    gen_helper_float_check_status(tcg_env);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_cr1_from_fpscr(ctx);
+    }
+}
+
+static void gen_fctiw(DisasContext *ctx)
+{
+    gen_fcti(ctx, false);
+}
 /* fctiwu */
 GEN_FLOAT_B(ctiwu, 0x0E, 0x04, 0, PPC2_FP_CVT_ISA206);
 /* fctiwz */
-GEN_FLOAT_B(ctiwz, 0x0F, 0x00, 0, PPC_FLOAT);
+static void gen_fctiwz(DisasContext *ctx)
+{
+    gen_fcti(ctx, true);
+}
 /* fctiwuz */
 GEN_FLOAT_B(ctiwuz, 0x0F, 0x04, 0, PPC2_FP_CVT_ISA206);
 /* frsp */
