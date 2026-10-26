@@ -803,6 +803,7 @@ enum {
     HFLAGS_TM = 8,   /* computed from MSR_TM */
     HFLAGS_BE = 9,   /* MSR_BE -- from elsewhere on embedded ppc */
     HFLAGS_SE = 10,  /* MSR_SE -- from elsewhere on embedded ppc */
+    HFLAGS_FP_RN = 11,  /* 11..12: FPSCR[RN] if HFLAGS_FP_NOX */
     HFLAGS_FP = 13,  /* MSR_FP */
     HFLAGS_PR = 14,  /* MSR_PR */
     HFLAGS_PMCC0 = 15,  /* MMCR0 PMCC bit 0 */
@@ -812,6 +813,7 @@ enum {
     HFLAGS_INSN_CNT = 19, /* PMU instruction count enabled */
     HFLAGS_BHRB_ENABLE = 20, /* Summary flag for enabling BHRB */
     HFLAGS_FP_FAST = 21, /* FPSCR: no FP exception enabled, NI=0, RN=0 */
+    HFLAGS_FP_NOX = 22,  /* FPSCR: no FP exception enabled, NI=0 */
     HFLAGS_VSX = 23, /* MSR_VSX if cpu has VSX */
     HFLAGS_VR = 25,  /* MSR_VR if cpu has VRE */
 

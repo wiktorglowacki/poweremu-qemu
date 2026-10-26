@@ -206,6 +206,7 @@ typedef struct NativeFPSlow {
 struct DisasContext {
     DisasContextBase base;
     bool fp_fast;           /* HFLAGS_FP_FAST */
+    int fp_rn;              /* HFLAGS_FP_RN, -1 without HFLAGS_FP_NOX */
     int n_nfp;
     NativeFPSlow nfp[64];
     target_ulong cia;  /* current instruction address */
@@ -6674,6 +6675,8 @@ static void ppc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
 
     ctx->spr_cb = env->spr_cb;
     ctx->fp_fast = (hflags >> HFLAGS_FP_FAST) & 1;
+    ctx->fp_rn = (hflags >> HFLAGS_FP_NOX) & 1 ? (hflags >> HFLAGS_FP_RN) & 3
+                                              : -1;
     ctx->n_nfp = 0;
     ctx->pr = (hflags >> HFLAGS_PR) & 1;
     ctx->mem_idx = (hflags >> HFLAGS_DMMU_IDX) & 7;

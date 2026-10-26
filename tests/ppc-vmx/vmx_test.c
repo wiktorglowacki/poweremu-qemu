@@ -1250,10 +1250,16 @@ static uint32_t fpd_tail(volatile uint64_t *buf, int follow)
                      "stfd 5,32(%1)\n\tmfcr %0"
                      : "=r"(cr) : "b"(buf) : "fr5", "cr1", "cr6", "cr7", "memory");
         break;
-    default:    /* whole fields */
+    case 6:     /* whole fields */
         asm volatile("mtfsfi 5,0\n\tmtfsfi 0,1\n\tmtfsfi 7,0\n\tmffs 5\n\t"
                      "stfd 5,32(%0)"
                      : : "b"(buf) : "fr5", "memory");
+        break;
+    default:    /* a + b rounded down instead of the result */
+        asm volatile("lfd 2,0(%0)\n\tlfd 4,16(%0)\n\tmtfsfi 7,3\n\t"
+                     "fadd 5,2,4\n\tmtfsfi 7,0\n\tstfd 5,24(%0)\n\t"
+                     "mffs 5\n\tstfd 5,32(%0)"
+                     : : "b"(buf) : "fr2", "fr4", "fr5", "memory");
         break;
     }
     return cr;
@@ -1264,10 +1270,10 @@ static void fp_diff(uint32_t *seed)
     volatile uint64_t *buf = (volatile uint64_t *)FPD_BUF;
     volatile uint64_t *out = (volatile uint64_t *)FPD_BASE;
     uint32_t n = 0;
-    /* FPSCR states: fast mode, then round-toward-zero (helper only) */
-    static const uint64_t fpscr_in[2] = { 0, 1 };
+    /* FPSCR states: fast mode, then the other rounding modes */
+    static const uint64_t fpscr_in[4] = { 0, 1, 2, 3 };
 
-    for (int st = 0; st < 2; st++) {
+    for (int st = 0; st < 4; st++) {
         for (int it = 0; it < (st ? 300 : 3000); it++) {
             uint64_t a = fpd_pool(seed), c = fpd_pool(seed), b = fpd_pool(seed);
             uint32_t k = rnd(seed);
@@ -1281,7 +1287,7 @@ static void fp_diff(uint32_t *seed)
                     buf[0] = a; buf[1] = c; buf[2] = b;
                     buf[5] = 0x7ff8dead0000beefull;   /* old f1 */
                     buf[6] = fpscr_in[st];
-                    int follow = it % 7;
+                    int follow = it % 8;
                     uint32_t cr;
 
                     fpd_one(buf, op, form);

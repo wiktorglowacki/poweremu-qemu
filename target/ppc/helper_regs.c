@@ -190,6 +190,10 @@ static uint32_t hreg_compute_hflags_value(CPUPPCState *env)
                         FP_NI | FP_RN))) {
         hflags |= 1 << HFLAGS_FP_FAST;
     }
+    if (!(env->fpscr & (FP_ENABLES | FP_NI))) {
+        hflags |= 1 << HFLAGS_FP_NOX;
+        hflags |= (env->fpscr & FP_RN) << HFLAGS_FP_RN;
+    }
     if (env->spr[SPR_LPCR] & LPCR_HR) {
         hflags |= 1 << HFLAGS_HR;
     }
