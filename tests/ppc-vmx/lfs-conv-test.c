@@ -32,7 +32,8 @@ static bool ppc_todouble_inline(uint32_t arg, uint64_t *out)
     a = x & 0x7fffffff;
     t = a - 0x00800000;
     if (t >= 0x7f000000) {
-        return false;
+        *out = x << 32;
+        return a == 0;
     }
     *out = a << 29;
     *out += (uint64_t)896 << 52;
@@ -49,7 +50,8 @@ static bool ppc_tosingle_inline(uint64_t arg, uint32_t *out)
     t = arg >> 52;
     t &= 0x7ff;
     if (t <= 896) {
-        return false;
+        *out = (uint32_t)(arg >> 32) & 0x80000000;
+        return t < 874;
     }
     u = arg >> 29;
     u &= 0x3fffffff;

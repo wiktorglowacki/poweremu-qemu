@@ -1244,6 +1244,16 @@ static bool native_fp_conv_on(void)
 #endif
 }
 
+static bool native_fp_zero_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPC_NATIVE_FP_ZERO");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
 /* ppc_todouble() of a normal single, one TCG op per line of it. */
 static void gen_native_todouble(TCGv_i64 dest, TCGv_i32 src)
 {
@@ -1268,6 +1278,11 @@ static void gen_native_todouble(TCGv_i64 dest, TCGv_i32 src)
     tcg_gen_br(done);
 
     gen_set_label(slow);
+    if (native_fp_zero_on()) {
+        tcg_gen_extu_i32_i64(dest, src);
+        tcg_gen_shli_i64(dest, dest, 32);
+        tcg_gen_brcondi_i32(TCG_COND_TSTEQ, src, 0x7fffffff, done);
+    }
     gen_helper_todouble(dest, src);
     gen_set_label(done);
 }
@@ -1295,6 +1310,14 @@ static void gen_native_tosingle(TCGv_i32 dest, TCGv_i64 src)
     tcg_gen_br(done);
 
     gen_set_label(slow);
+    if (native_fp_zero_on()) {
+        TCGv_i64 v = tcg_temp_new_i64();
+
+        tcg_gen_extrh_i64_i32(dest, src);
+        tcg_gen_andi_i32(dest, dest, 0x80000000);
+        tcg_gen_shli_i64(v, src, 1);
+        tcg_gen_brcondi_i64(TCG_COND_LTU, v, 874ull << 53, done);
+    }
     gen_helper_tosingle(dest, src);
     gen_set_label(done);
 }
