@@ -6797,6 +6797,37 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
                     blit_w, blit_h);
             return;
         }
+        static int agp_dst = -1;
+        if (agp_dst < 0) {
+            const char *e = getenv("PPCGPU_AGP_DST");
+            agp_dst = !(e && e[0] == '0');
+        }
+        if (agp_dst && agp_loc && dst_pitch && src_offset < s->vram_size &&
+            dst_offset >= ((agp_loc & 0xFFFF) << 16) &&
+            dst_offset <= ((((agp_loc >> 16) & 0xFFFF) << 16) | 0xFFFF)) {
+            uint32_t bpp = gmc_dst_bpp(s->regs.dp_gui_master_cntl);
+            uint32_t pitch = src_pitch ? src_pitch : dst_pitch;
+            const uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+            g_autofree uint8_t *row = g_malloc0((size_t)blit_w * bpp);
+            r200_vram_access(s, R200_ROWS(src_offset, pitch, sy0, sh), false, 1);
+            for (uint32_t r = 0; r < blit_h; r++) {
+                for (uint32_t c = 0; c < blit_w; c++) {
+                    uint64_t a = blit_px(src_offset, pitch, src_mt, src_x + c, src_y + r, bpp);
+                    if (a + bpp <= s->vram_size) {
+                        memcpy(row + (size_t)c * bpp, vram + a, bpp);
+                    }
+                }
+                for (uint32_t i = 0; s->r300_card_bytes && i + 4 <= blit_w * bpp; i += 4) {
+                    stl_he_p(row + i, r300_swap_mode(ldl_he_p(row + i), s->r300_src_swap));
+                }
+                r300_agp_span(s, dst_offset + (dst_y + r) * dst_pitch + dst_x * bpp, row,
+                              blit_w * bpp, true);
+            }
+            seq_log("REG  rop=cc to agp src=%06x/%u (%u,%u) dst=%08x/%u (%u,%u) %ux%u",
+                    src_offset, pitch, src_x, src_y, dst_offset, dst_pitch, dst_x, dst_y,
+                    blit_w, blit_h);
+            return;
+        }
     }
     bool gpu_done = false;
     {
