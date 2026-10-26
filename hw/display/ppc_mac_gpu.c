@@ -4935,9 +4935,17 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     if (pkt.warn & R300_WARN_VARYINGS) r300_warn_once("too many interpolants", NULL);
     if (pkt.warn & R300_WARN_FLOW)     r300_warn_once("vertex program flow control ran away", NULL);
 
-    uint32_t ns = pkt.aa_samples;
+    uint32_t ns = pkt.aa_samples, bnd[4] = { 0, 0, 0, pkt.rt_height }, ga = pkt.rt_gpu_addr;
+    static int rt_fit = -1;
+    if (rt_fit < 0) {
+        const char *e = getenv("PPCGPU_RT_FIT");
+        rt_fit = !(e && e[0] == '0');
+    }
+    if (rt_fit && !r300_to_vram(s, &ga, (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height * ns)) {
+        r300_draw_bounds(&pkt, bnd);
+    }
     if (!r300_to_vram(s, &pkt.rt_gpu_addr,
-                      (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height * ns)) {
+                      (uint64_t)pkt.rt_pitch * pkt.rt_bpp * bnd[3] * ns)) {
         if (r300_agp_copy(s, &pkt)) {
             r300_draw_free(&pkt);
             s->regs.stall_draws++;
@@ -4952,7 +4960,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     for (uint32_t k = 1; k < pkt.num_cb; k++) {
         R300ColorDesc *c = &pkt.cb[k];
         if (!r300_to_vram(s, &c->gpu_addr,
-                          (uint64_t)c->pitch * c->bpp * pkt.rt_height * ns)) {
+                          (uint64_t)c->pitch * c->bpp * bnd[3] * ns)) {
             r300_warn_once("render target B-D outside VRAM", NULL);
             pkt.num_cb = k;
             break;
