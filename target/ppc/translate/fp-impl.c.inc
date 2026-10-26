@@ -1407,12 +1407,14 @@ static void gen_mtfsfi(DisasContext *ctx)
  */
 static bool native_fp_conv_on(void)
 {
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(__aarch64__)
     static int on = -1;
     if (on < 0) {
         const char *strict = getenv("PPC_STRICT_FP");
         const char *nat = getenv("PPC_NATIVE_FP");
-        on = !(strict && strict[0] == '1') && !(nat && nat[0] == '0');
+        const char *lfs = getenv("PPC_NATIVE_LFS");
+        on = !(strict && strict[0] == '1') && !(nat && nat[0] == '0')
+             && !(lfs && lfs[0] == '0');
     }
     return on;
 #else
