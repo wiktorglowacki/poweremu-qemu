@@ -286,6 +286,7 @@ static struct {
     bool pass_z16;
 
     VkImg img[VK_MAX_IMG];
+    uint64_t zimg[VK_MAX_IMG / 64];
     VkTexFull texfull[VK_MAX_TEXFULL];
     uint64_t clock;
     VkRP rps[VK_MAX_RP];
@@ -1980,6 +1981,14 @@ static void vk_writeback_range(uint64_t lo, uint64_t hi)
     vk_writeback_others(lo, hi, NULL);
 }
 
+static void vk_img_z(VkImg *im, bool z)
+{
+    int i = im - V.img;
+
+    im->z = z;
+    V.zimg[i / 64] = (V.zimg[i / 64] & ~(1ull << i % 64)) | (uint64_t)z << i % 64;
+}
+
 static void vk_img_free(VkImg *im)
 {
     if (im->dirty) {
@@ -1994,6 +2003,7 @@ static void vk_img_free(VkImg *im)
     vk_trash(NULL, TRASH_VIEW, (uint64_t)(uintptr_t)im->view);
     vk_trash(NULL, TRASH_IMAGE, (uint64_t)(uintptr_t)im->img);
     vk_trash(NULL, TRASH_MEM, (uint64_t)(uintptr_t)im->mem);
+    vk_img_z(im, false);
     memset(im, 0, sizeof(*im));
 }
 
@@ -2943,20 +2953,33 @@ static bool vk_busy_r200(void *opaque)
     return vk_wait_busy_r200(opaque, 0);
 }
 
+static bool vk_z_pending(uint64_t lo, uint64_t hi)
+{
+    static int all = -1;
+
+    if (all < 0) {
+        all = g_strcmp0(getenv("PPCGPU_VK_ZMASK"), "0") == 0;
+    }
+    for (int w = 0; vk_lazy_z() && w < VK_MAX_IMG / 64; w++) {
+        for (uint64_t b = all ? ~0ull : V.zimg[w]; b; b &= b - 1) {
+            VkImg *im = &V.img[w * 64 + ctz64(b)];
+            if (im->live && im->dirty && im->z &&
+                lo < vk_img_hi(im) && im->addr < hi) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static bool vk_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi, bool write_access)
 {
     if (!V.vram || hi <= lo) {
         return false;
     }
     hi = MIN(hi, V.vram_size);
-    if (vk_lazy_z()) {
-        for (int i = 0; i < VK_MAX_IMG; i++) {
-            VkImg *im = &V.img[i];
-            if (im->live && im->dirty && im->z &&
-                lo < vk_img_hi(im) && im->addr < hi) {
-                return true;
-            }
-        }
+    if (vk_z_pending(lo, hi)) {
+        return true;
     }
     for (uint64_t p = vk_pg(lo); p <= vk_pg(hi - 1) && p < V.npages; p++) {
         if (vk_page_pending_write(p)) {
@@ -3925,14 +3948,8 @@ static VkFormat vk_rt_format(uint32_t view)
 
 static bool vk_range_pending(uint64_t lo, uint64_t hi)
 {
-    if (vk_lazy_z()) {
-        for (int i = 0; i < VK_MAX_IMG; i++) {
-            VkImg *im = &V.img[i];
-            if (im->live && im->dirty && im->z &&
-                lo < vk_img_hi(im) && im->addr < hi) {
-                return true;
-            }
-        }
+    if (vk_z_pending(lo, hi)) {
+        return true;
     }
     for (uint64_t p = vk_pg(lo); p <= vk_pg(hi - 1) && p < V.npages; p++) {
         if (vk_page_pending_write(p)) {
@@ -4136,7 +4153,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             vk_warn(1u << 8, "render target B-D unusable");
             return -1;
         }
-        att[k]->z = false;
+        vk_img_z(att[k], false);
     }
     uint32_t natt = ncb;
     bool z16 = zd->bpp == 2;
@@ -4177,7 +4194,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         if (att[ncb] && (zw == fbw || z_narrow)) {
             fmt[ncb] = zf;
             natt++;
-            att[ncb]->z = true;
+            vk_img_z(att[ncb], true);
         } else {
             vk_warn(1u << 9, "depth buffer not usable in place");
             want_z = false;
