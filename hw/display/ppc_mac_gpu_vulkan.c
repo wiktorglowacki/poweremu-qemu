@@ -288,6 +288,7 @@ static struct {
     VkImg img[VK_MAX_IMG];
     uint64_t zimg[VK_MAX_IMG / 64];
     VkTexFull texfull[VK_MAX_TEXFULL];
+    uint16_t tf_hint[4096];
     uint64_t clock;
     VkRP rps[VK_MAX_RP];
     unsigned nrp;
@@ -3712,8 +3713,16 @@ static VkImageView vk_texture_full(const R300TexDesc *td)
     uint64_t gen = td->host_data || !vk_texfull_gen() ? 0 :
                    vk_range_gen(td->gpu_addr, (uint64_t)td->gpu_addr + td->size_bytes);
 
+    static int hint_on = -1;
+    uint16_t *hint = &V.tf_hint[(td->gpu_addr * 2654435761u) >> 20];
+    int max = vk_texfull_max();
+
+    if (hint_on < 0) {
+        hint_on = g_strcmp0(getenv("PPCGPU_VK_TF_HINT"), "0") != 0;
+    }
     V.stat_tf_calls++;
-    for (int i = 0; gen && i < vk_texfull_max(); i++) {
+    for (int j = 0; gen && j < max; j++) {
+        int i = *hint + j < max ? *hint + j : *hint + j - max;
         VkTexFull *t = &V.texfull[i];
         if (t->live && t->gen == gen && t->size == td->size_bytes &&
             !memcmp(&t->key, &key, offsetof(VkTexKey, hash))) {
@@ -3727,6 +3736,7 @@ static VkImageView vk_texture_full(const R300TexDesc *td)
                 break;
             }
             t->used = ++V.clock;
+            *hint = hint_on ? i : 0;
             return t->view;
         }
     }
