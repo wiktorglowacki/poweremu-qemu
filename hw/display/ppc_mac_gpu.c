@@ -3818,8 +3818,8 @@ static bool r300_read_raw(void *opaque, uint32_t gpu_addr, void *dst,
         if (r200_read_sync()) {
             r200_vram_sync_read(s, off, (uint64_t)off + len);
         }
-        memcpy(dst, (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
-                    off, len);
+        memcpy(dst, (s->vram_ptr ? s->vram_ptr :
+                     (uint8_t *)memory_region_get_ram_ptr(&s->vram)) + off, len);
         return true;
     }
     while (len) {
@@ -15269,6 +15269,9 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
         /* Fallback: normal QEMU-managed RAM */
         memory_region_init_ram(&s->vram, obj, "ppc-mac-gpu-vram",
                                s->vram_size, &error_fatal);
+    }
+    if (g_strcmp0(getenv("PPCGPU_VRAM_PTR"), "0")) {
+        s->vram_ptr = memory_region_get_ram_ptr(&s->vram);
     }
     if (s->r300) {
         /* Two apertures onto VRAM, as on a real Radeon (see r300_ap1_ops). */

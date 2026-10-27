@@ -677,6 +677,7 @@ struct PPCMacGPUState {
 
     /* Memory regions */
     MemoryRegion vram;          /* BAR0: VRAM aperture */
+    uint8_t *vram_ptr;
     MemoryRegion vram_bar;      /* r300: BAR0 = aperture 0 (vram) + aperture 1 */
     bool r300_card_bytes;      /* native driver owns physical card-byte VRAM */
     bool morphos_color_compat; /* opt-in native RGBA8 compatibility profile */
