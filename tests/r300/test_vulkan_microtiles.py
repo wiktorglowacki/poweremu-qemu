@@ -51,7 +51,7 @@ typedef struct {
     uint64_t gen;
 } VkImg;
 static struct {
-    uint64_t gen, npages, page_wgen[4], page_gen[4], page_gprev[4], page_wr[4][2];
+    uint64_t gen, npages, page_wgen[4], page_gen[4], page_gprev[4], page_wr[4][2], blk_gen[1];
     uint32_t page_wseq[4], page_src[4];
 } V;
 static struct Batch { uint32_t seq; } batch = { 7 };

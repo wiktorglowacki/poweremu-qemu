@@ -246,6 +246,7 @@ static struct {
     VkBuffer vram_buf;
     uint64_t npages;
     uint64_t *page_gen;         /* write generation of each page */
+    uint64_t *blk_gen;          /* ... newest of each 64 pages */
     /* The page's last draw: its generation, the drawn image's VRAM bytes,
      * and the page's generation before that image's run of draws. */
     uint64_t *page_wgen, *page_gprev, (*page_wr)[2];
@@ -942,6 +943,7 @@ void *ppc_mac_gpu_vulkan_alloc_vram(uint64_t vram_size, void **opaque_out)
     V.vram_size = vram_size;
     V.npages = DIV_ROUND_UP(vram_size, VK_PAGE);
     V.page_gen = g_new0(uint64_t, V.npages);
+    V.blk_gen = g_new0(uint64_t, V.npages / 64 + 1);
     V.page_wgen = g_new0(uint64_t, V.npages);
     V.page_gprev = g_new0(uint64_t, V.npages);
     V.page_wr = g_malloc0(sizeof(*V.page_wr) * V.npages);
@@ -1206,6 +1208,7 @@ static inline bool vk_page_pending_write(uint64_t p)
 static void vk_page_cpu(uint64_t p)
 {
     V.page_gen[p] = V.gen;
+    V.blk_gen[p / 64] = V.gen;
     V.page_src[p] = 1;
     if (vk_check() && vk_page_pending_write(p)) {
         static int n;
@@ -1308,10 +1311,22 @@ static uint64_t vk_page_gen_for(uint64_t p, uint64_t lo, uint64_t hi)
     return V.page_gen[p];
 }
 
+/* PPCGPU_VK_BLKGEN=0: a range's generation is the newest of each of its pages */
 static uint64_t vk_range_gen(uint64_t lo, uint64_t hi)
 {
-    uint64_t g = 0;
-    for (uint64_t p = vk_pg(lo); p <= vk_pg(hi - 1) && p < V.npages; p++) {
+    static int blk = -1;
+    uint64_t g = 0, p = vk_pg(lo), e = MIN(vk_pg(hi - 1) + 1, V.npages);
+
+    if (blk < 0) {
+        blk = g_strcmp0(getenv("PPCGPU_VK_BLKGEN"), "0") != 0;
+    }
+    for (; p < e && (p % 64 || !blk); p++) {
+        g = MAX(g, V.page_gen[p]);
+    }
+    for (; p + 64 <= e; p += 64) {
+        g = MAX(g, V.blk_gen[p / 64]);
+    }
+    for (; p < e; p++) {
         g = MAX(g, V.page_gen[p]);
     }
     return g;
@@ -2831,6 +2846,7 @@ static void vk_img_written(VkImg *im, uint32_t x0, uint32_t y0,
         }
         V.page_wgen[p] = V.gen;
         V.page_gen[p] = V.gen;
+        V.blk_gen[p / 64] = V.gen;
         V.page_wseq[p] = s;
         V.page_src[p] = 2;
     }
@@ -3125,6 +3141,7 @@ static void vk_gpu_wrote(uint64_t lo, uint64_t hi)
     V.gen++;
     for (uint64_t p = vk_pg(lo); p <= vk_pg(hi - 1) && p < V.npages; p++) {
         V.page_gen[p] = V.gen;
+        V.blk_gen[p / 64] = V.gen;
         V.page_wseq[p] = s;
         V.page_src[p] = 3;
     }
