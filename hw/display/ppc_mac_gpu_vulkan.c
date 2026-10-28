@@ -65,7 +65,7 @@
 #include "r300/r300_spirv.h"
 
 #define VK_PAGE             PPC_MAC_GPU_DIRTY_PAGE
-#define VK_MAX_IMG          128
+#define VK_MAX_IMG          1024
 #define VK_MAX_TEXFULL      512
 #define VK_MAX_FB           64
 #define VK_MAX_RP           32
@@ -289,6 +289,7 @@ static struct {
     uint16_t img_head[1024];
     uint16_t img_next[VK_MAX_IMG];
     uint64_t zimg[VK_MAX_IMG / 64];
+    uint64_t dimg[VK_MAX_IMG / 64];
     VkTexFull texfull[VK_MAX_TEXFULL];
     uint16_t tf_hint[4096];
     uint64_t clock;
@@ -1940,6 +1941,14 @@ static void vk_check_apart(const VkImg *im, const uint32_t *a, const uint32_t *b
     }
 }
 
+static void vk_img_dirty(VkImg *im, bool d)
+{
+    int i = im - V.img;
+
+    im->dirty = d;
+    V.dimg[i / 64] = (V.dimg[i / 64] & ~(1ull << i % 64)) | (uint64_t)d << i % 64;
+}
+
 static void vk_copy_to_vram_nb(VkImg *im)
 {
     VkCommandBuffer cb = vk_batch()->cb;
@@ -1972,14 +1981,14 @@ static void vk_copy_to_vram_nb(VkImg *im)
         }
         V.stat_writebacks++;
     }
-    im->dirty = false;
+    vk_img_dirty(im, false);
     im->ndr = 0;
 }
 
 static void vk_copy_to_vram(VkImg *im)
 {
     if (!im->ndr) {
-        im->dirty = false;
+        vk_img_dirty(im, false);
         return;
     }
     vk_end_pass();
@@ -1991,10 +2000,12 @@ static void vk_copy_to_vram(VkImg *im)
 /* Write back every image but skip with rendering newer than VRAM in [lo, hi). */
 static void vk_writeback_others(uint64_t lo, uint64_t hi, const VkImg *skip)
 {
-    for (int i = 0; i < VK_MAX_IMG; i++) {
-        VkImg *im = &V.img[i];
-        if (im != skip && im->live && im->dirty && lo < vk_img_hi(im) && im->addr < hi) {
-            vk_copy_to_vram(im);
+    for (int w = 0; w < VK_MAX_IMG / 64; w++) {
+        for (uint64_t b = V.dimg[w]; b; b &= b - 1) {
+            VkImg *im = &V.img[w * 64 + ctz64(b)];
+            if (im != skip && lo < vk_img_hi(im) && im->addr < hi) {
+                vk_copy_to_vram(im);
+            }
         }
     }
 }
@@ -2026,6 +2037,17 @@ static bool vk_img_hash_on(void)
 static uint16_t *vk_img_chain(uint32_t addr, uint32_t w)
 {
     return &V.img_head[((addr ^ w << 20) * 2654435761u) >> 22];
+}
+
+/* PPCGPU_VK_IMAGES=n: use only the first n image slots (default all) */
+static int vk_img_slots(void)
+{
+    static int n;
+    if (!n) {
+        const char *e = getenv("PPCGPU_VK_IMAGES");
+        n = e && atoi(e) > 0 ? MIN(atoi(e), VK_MAX_IMG) : VK_MAX_IMG;
+    }
+    return n;
 }
 
 static int vk_img_first(uint32_t addr, uint32_t w)
@@ -2559,7 +2581,7 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
     }
     if (!im) {
         /* a free slot, else the least recently used not in the open pass */
-        for (int i = 0; i < VK_MAX_IMG; i++) {
+        for (int i = 0; i < vk_img_slots(); i++) {
             VkImg *c = &V.img[i];
             bool busy = false;
             if (!c->live) {
@@ -2772,7 +2794,7 @@ static void vk_img_written(VkImg *im, uint32_t x0, uint32_t y0,
     y1 = MIN(y1, im->height);
     memcpy(im->dr[k], r, sizeof(r));
     im->ndr += k == im->ndr;
-    im->dirty = true;
+    vk_img_dirty(im, true);
     im->valid = true;
     /*
      * Always stamp, even for a draw inside a rectangle stamped at this

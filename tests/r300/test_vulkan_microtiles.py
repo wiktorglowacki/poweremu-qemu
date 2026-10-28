@@ -57,6 +57,7 @@ static struct {
 static struct Batch { uint32_t seq; } batch = { 7 };
 static struct Batch *vk_batch(void) { return &batch; }
 static uint64_t vk_pg(uint64_t addr) { return addr / 4096; }
+static void vk_img_dirty(VkImg *im, bool d) { im->dirty = d; }
 /* Isolate the production page-stamping loop for a nonempty first draw. */
 static int vk_dr_slot(VkImg *im, uint32_t *in, uint32_t *out)
 { (void)im; (void)in; (void)out; return 0; }
