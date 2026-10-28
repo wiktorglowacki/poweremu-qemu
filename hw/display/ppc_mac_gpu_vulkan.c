@@ -1231,15 +1231,36 @@ static void vk_harvest(void)
     }
 }
 
-static void vk_vram_written(void *opaque, uint64_t lo, uint64_t hi)
+/* PPCGPU_VK_CPU_OWNER=0: an exact device write makes its whole pages newer. */
+static void vk_vram_written(void *opaque, uint64_t lo, uint64_t hi, bool exact)
 {
+    static int owner = -1;
+
+    if (owner < 0) {
+        const char *e = getenv("PPCGPU_VK_CPU_OWNER");
+        owner = !(e && e[0] == '0');
+    }
     hi = MIN(hi, V.vram_size);
     if (!V.page_gen || lo >= hi) {
         return;
     }
     V.gen++;
     for (uint64_t p = vk_pg(lo); p <= vk_pg(hi - 1); p++) {
+        bool chain = V.page_wgen[p] == V.page_gen[p] && V.page_src[p] == 1;
+        uint64_t g = V.page_gen[p];
         vk_page_cpu(p);
+        if (!exact || !owner) {
+            continue;
+        }
+        if (chain) {
+            V.page_wr[p][0] = MIN(V.page_wr[p][0], lo);
+            V.page_wr[p][1] = MAX(V.page_wr[p][1], hi);
+        } else {
+            V.page_gprev[p] = g;
+            V.page_wr[p][0] = lo;
+            V.page_wr[p][1] = hi;
+        }
+        V.page_wgen[p] = V.gen;
     }
 }
 

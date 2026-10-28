@@ -3277,8 +3277,8 @@ static bool ppc_mac_gpu_gart_translate(PPCMacGPUState *s, uint32_t gpu_addr,
 static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s, uint32_t gpu_addr,
                                        hwaddr *phys_out);
 
-static void ppc_mac_gpu_vram_set_dirty(PPCMacGPUState *s, uint64_t off,
-                                       uint64_t len)
+static void ppc_mac_gpu_vram_wrote(PPCMacGPUState *s, uint64_t off,
+                                   uint64_t len, bool exact)
 {
     static int direct = -1;
 
@@ -3287,10 +3287,16 @@ static void ppc_mac_gpu_vram_set_dirty(PPCMacGPUState *s, uint64_t off,
         direct = !(e && e[0] == '0');
     }
     if (direct && s->renderer && s->renderer->vram_written) {
-        s->renderer->vram_written(s->renderer_opaque, off, off + len);
+        s->renderer->vram_written(s->renderer_opaque, off, off + len, exact);
     } else {
         memory_region_set_dirty(&s->vram, off, len);
     }
+}
+
+static void ppc_mac_gpu_vram_set_dirty(PPCMacGPUState *s, uint64_t off,
+                                       uint64_t len)
+{
+    ppc_mac_gpu_vram_wrote(s, off, len, false);
 }
 
 static void ppc_mac_gpu_scratch_writeback_val(PPCMacGPUState *s, int reg_idx,
@@ -4485,7 +4491,7 @@ static bool r300_cpu_copy(PPCMacGPUState *s, const R300DrawPacket *pkt)
                 }
             }
         }
-        ppc_mac_gpu_vram_set_dirty(s, dst, dst_hi - dst);
+        ppc_mac_gpu_vram_wrote(s, dst, dst_hi - dst, true);
         r200_rate.draws++;
         r200_perf.draws++;
         r200_perf.drew = true;
@@ -4540,7 +4546,7 @@ static bool r300_cpu_copy(PPCMacGPUState *s, const R300DrawPacket *pkt)
             o[x + 3] = t[x + p[3]];
         }
     }
-    ppc_mac_gpu_vram_set_dirty(s, dst, dst_hi - dst);
+    ppc_mac_gpu_vram_wrote(s, dst, dst_hi - dst, true);
     return true;
 }
 
