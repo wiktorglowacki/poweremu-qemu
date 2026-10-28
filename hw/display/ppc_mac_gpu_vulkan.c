@@ -286,6 +286,8 @@ static struct {
     bool pass_z16;
 
     VkImg img[VK_MAX_IMG];
+    uint16_t img_head[1024];
+    uint16_t img_next[VK_MAX_IMG];
     uint64_t zimg[VK_MAX_IMG / 64];
     VkTexFull texfull[VK_MAX_TEXFULL];
     uint16_t tf_hint[4096];
@@ -2011,8 +2013,39 @@ static void vk_img_z(VkImg *im, bool z)
     V.zimg[i / 64] = (V.zimg[i / 64] & ~(1ull << i % 64)) | (uint64_t)z << i % 64;
 }
 
+/* PPCGPU_VK_IMG_HASH=0: an image lookup walks every slot */
+static bool vk_img_hash_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = g_strcmp0(getenv("PPCGPU_VK_IMG_HASH"), "0") != 0;
+    }
+    return on;
+}
+
+static uint16_t *vk_img_chain(uint32_t addr, uint32_t w)
+{
+    return &V.img_head[((addr ^ w << 20) * 2654435761u) >> 22];
+}
+
+static int vk_img_first(uint32_t addr, uint32_t w)
+{
+    return vk_img_hash_on() ? *vk_img_chain(addr, w) : 1;
+}
+
+static int vk_img_after(int k)
+{
+    return vk_img_hash_on() ? V.img_next[k - 1] : k < VK_MAX_IMG ? k + 1 : 0;
+}
+
 static void vk_img_free(VkImg *im)
 {
+    uint16_t *p = vk_img_chain(im->addr, im->width);
+
+    while (*p != im - V.img + 1) {
+        p = &V.img_next[*p - 1];
+    }
+    *p = V.img_next[im - V.img];
     if (im->dirty) {
         vk_copy_to_vram(im);
     }
@@ -2501,8 +2534,8 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
         w > V.props.limits.maxImageDimension2D || h > V.props.limits.maxImageDimension2D) {
         return NULL;
     }
-    for (int i = 0; i < VK_MAX_IMG; i++) {
-        VkImg *c = &V.img[i];
+    for (int k = vk_img_first(addr, w); k; k = vk_img_after(k)) {
+        VkImg *c = &V.img[k - 1];
         if (c->live && c->cls == cls && c->addr == addr && c->width == w &&
             c->pitch == pitch && c->fmt == fmt && c->tiling == tiling &&
             (c->height == h || (c->height > h && (c->height <= max_h ||
@@ -2514,8 +2547,9 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
     if (!im && max_h) {
         /* The buffer's shorter images give way to this one (rendering
          * they hold goes to VRAM first, and this one loads from there). */
-        for (int i = 0; i < VK_MAX_IMG; i++) {
-            VkImg *c = &V.img[i];
+        for (int k = vk_img_first(addr, w), n; k; k = n) {
+            VkImg *c = &V.img[k - 1];
+            n = vk_img_after(k);
             if (c->live && c->cls == cls && c->addr == addr && c->width == w &&
                 c->pitch == pitch && c->fmt == fmt && c->tiling == tiling &&
                 c->height < h) {
@@ -2563,6 +2597,8 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
         im->live = true;
         im->cls = cls;
         im->addr = addr;
+        V.img_next[im - V.img] = *vk_img_chain(addr, w);
+        *vk_img_chain(addr, w) = im - V.img + 1;
         im->width = w;
         im->height = h;
         im->pitch = pitch;
