@@ -1659,12 +1659,17 @@ static void copy_detect(const R300FSDesc *desc, const Route *route,
     bool nearest = ((td->filter0 >> 9) & 3) == 1 && ((td->filter0 >> 11) & 3) == 1;
     /* MorphOS ATIRadeon sets s1/t1 to (w - 1/256)/w with linear filtering on 1:1 blits. */
     float tol = nearest ? 1e-3f : 8e-3f;
-    static int col = -1;
+    static int col = -1, fog_eps = -1;
 
     if (col < 0) {
         /* PPCGPU_CPU_WPA_GA=0: coordinates from texture interpolators only */
         const char *e = getenv("PPCGPU_CPU_WPA_GA");
         col = !(e && e[0] == '0');
+    }
+    if (fog_eps < 0) {
+        /* PPCGPU_CPU_COPY_FOG_EPS=0: any linear fog amount above 0 is not a copy */
+        const char *e = getenv("PPCGPU_CPU_COPY_FOG_EPS");
+        fog_eps = !(e && e[0] == '0');
     }
     /*
      * WritePixelArrayAlpha routes its coordinates through a colour
@@ -1683,7 +1688,8 @@ static void copy_detect(const R300FSDesc *desc, const Route *route,
     for (int i = 0; i < 6; i++) {
         const float *p = v[i].pos, *t = v[i].v[k];
         if (p[3] != 1.0f || !(p[2] >= 0.0f && p[2] <= 1.0f) ||
-            ((fb & 1) && ((fb >> 1) & 3) != 3 && v[i].aux[0] > 0.0f)) {
+            ((fb & 1) && ((fb >> 1) & 3) != 3 &&
+             v[i].aux[0] > (fog_eps && !((fb >> 1) & 3) ? 0.5f / 255 : 0.0f))) {
             return;
         }
         xy[i][0] = (p[0] + 1) * pkt->rt_width * 0.5f;
