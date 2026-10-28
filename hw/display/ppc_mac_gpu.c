@@ -4688,9 +4688,13 @@ static bool r300_agp_copy(PPCMacGPUState *s, const R300DrawPacket *pkt)
  * order turns the texels into what it stored. */
 static void r300_cpu_copy_learn(PPCMacGPUState *s, bool drawn)
 {
+    static int ambig = -1;
     int i = r3cc.learning;
     unsigned match = 0, found = 0;
 
+    if (ambig < 0) {
+        ambig = g_strcmp0(getenv("PPCGPU_CPU_COPY_AMBIG"), "1") == 0;
+    }
     r3cc.learning = -1;
     if (i < 0 || !drawn) {
         return;
@@ -4720,6 +4724,7 @@ static void r300_cpu_copy_learn(PPCMacGPUState *s, bool drawn)
             r3cc.k[i].perm = found;
         }
     }
+    r3cc.k[i].tries -= match > 1 && !ambig;
     if (r3cc.k[i].perm >= 0 || r3cc.k[i].tries == 64) {
         qemu_log("ppc-mac-gpu r300: texel copy %08x/%x/%05x/%08x/%u on the %s "
                  "(byte order %u%u%u%u)\n", r3cc.k[i].key[0], r3cc.k[i].key[1],
