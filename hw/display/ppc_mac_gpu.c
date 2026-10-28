@@ -15130,7 +15130,7 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
  * on (the CPU through the BARs, and the device's own writes, which it
  * marks with memory_region_set_dirty).
  */
-static void ppc_mac_gpu_vram_dirty(void *arg, unsigned long *bitmap,
+static bool ppc_mac_gpu_vram_dirty(void *arg, unsigned long *bitmap,
                                    uint64_t npages)
 {
     PPCMacGPUState *s = arg;
@@ -15143,7 +15143,7 @@ static void ppc_mac_gpu_vram_dirty(void *arg, unsigned long *bitmap,
      * all that is needed when nothing was written, the common case.
      */
     if (!memory_region_get_dirty(&s->vram, 0, s->vram_size, DIRTY_MEMORY_VGA)) {
-        return;
+        return false;
     }
     DirtyBitmapSnapshot *snap =
         memory_region_snapshot_and_clear_dirty(&s->vram, 0, s->vram_size,
@@ -15162,6 +15162,7 @@ static void ppc_mac_gpu_vram_dirty(void *arg, unsigned long *bitmap,
         }
     }
     g_free(snap);
+    return true;
 }
 
 static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)

@@ -1219,11 +1219,20 @@ static void vk_page_cpu(uint64_t p)
 
 static void vk_harvest(void)
 {
+    static int scan = -1;
+
+    if (scan < 0) {
+        scan = g_strcmp0(getenv("PPCGPU_VK_HARVEST_SCAN"), "1") == 0;
+    }
     if (!V.dirty_fn) {
         return;
     }
-    bitmap_zero(V.dirty_bm, V.npages);
-    V.dirty_fn(V.dirty_arg, V.dirty_bm, V.npages);
+    if (scan) {
+        bitmap_zero(V.dirty_bm, V.npages);
+    }
+    if (!V.dirty_fn(V.dirty_arg, V.dirty_bm, V.npages) && !scan) {
+        return;
+    }
     uint64_t p = find_first_bit(V.dirty_bm, V.npages);
     if (p >= V.npages) {
         return;
@@ -1232,6 +1241,7 @@ static void vk_harvest(void)
     for (; p < V.npages; p = find_next_bit(V.dirty_bm, V.npages, p + 1)) {
         vk_page_cpu(p);
     }
+    bitmap_zero(V.dirty_bm, V.npages);
 }
 
 /* PPCGPU_VK_CPU_OWNER=0: an exact device write makes its whole pages newer. */

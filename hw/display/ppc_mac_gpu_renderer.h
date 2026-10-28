@@ -31,7 +31,7 @@ struct R300DrawPacket;     /* hw/display/r300/r300_draw.h */
  * bits, pages of PPC_MAC_GPU_DIRTY_PAGE bytes) for each, and forgets them.
  */
 #define PPC_MAC_GPU_DIRTY_PAGE 4096
-typedef void (*PPCMacGPUDirtyFn)(void *arg, unsigned long *bitmap,
+typedef bool (*PPCMacGPUDirtyFn)(void *arg, unsigned long *bitmap,
                                  uint64_t npages);
 
 /*
