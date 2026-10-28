@@ -2836,19 +2836,22 @@ static void vk_img_written(VkImg *im, uint32_t x0, uint32_t y0,
         hi = im->addr + (uint64_t)QEMU_ALIGN_UP(y1, band) * im->pitch;
     }
     uint64_t wlo = im->addr, whi = vk_img_hi(im);
+    uint64_t *gen = V.page_gen, *wgen = V.page_wgen, *gprev = V.page_gprev, (*wr)[2] = V.page_wr;
+    uint64_t *blk = V.blk_gen;
+    uint32_t *wseq = V.page_wseq;
+    uint8_t *src = V.page_src;
     V.gen++;
-    for (uint64_t p = vk_pg(lo); p <= vk_pg(hi - 1) && p < V.npages; p++) {
-        if (V.page_wgen[p] != V.page_gen[p] || V.page_wr[p][0] != wlo ||
-            V.page_wr[p][1] != whi) {
-            V.page_gprev[p] = V.page_gen[p];    /* another writer came before */
-            V.page_wr[p][0] = wlo;
-            V.page_wr[p][1] = whi;
+    for (uint64_t p = vk_pg(lo), e = MIN(vk_pg(hi - 1) + 1, V.npages); p < e; p++) {
+        if (wgen[p] != gen[p] || wr[p][0] != wlo || wr[p][1] != whi) {
+            gprev[p] = gen[p];      /* another writer came before */
+            wr[p][0] = wlo;
+            wr[p][1] = whi;
         }
-        V.page_wgen[p] = V.gen;
-        V.page_gen[p] = V.gen;
-        V.blk_gen[p / 64] = V.gen;
-        V.page_wseq[p] = s;
-        V.page_src[p] = 2;
+        wgen[p] = V.gen;
+        gen[p] = V.gen;
+        blk[p / 64] = V.gen;
+        wseq[p] = s;
+        src[p] = 2;
     }
     im->gen = V.gen;
 }
