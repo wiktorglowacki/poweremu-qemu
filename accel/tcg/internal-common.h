@@ -26,7 +26,6 @@ extern bool icount_align_option;
  * every execution.  A hint table, direct mapped: a lost entry only costs
  * one more restart.
  */
-bool tcg_io_hint_lookup(vaddr pc);
 void tcg_io_hint_add(vaddr pc);
 
 /*

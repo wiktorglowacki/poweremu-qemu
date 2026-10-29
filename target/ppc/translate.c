@@ -222,6 +222,8 @@ struct DisasContext {
     bool need_access_type;
     int mem_idx;
     int access_type;
+    TCGv_ptr ldst_host;
+    int ldst_off;
     /* Translation flags */
     MemOp default_tcg_memop_mask;
 #if defined(TARGET_PPC64)
@@ -2692,6 +2694,107 @@ static TCGv do_ea_calc_ra(DisasContext *ctx, int ra)
 }
 #endif
 
+static void gen_host_ldst_i32(DisasContext *ctx, TCGv_i32 v, MemOp mop,
+                              bool st)
+{
+    TCGv_ptr p = ctx->ldst_host;
+    int o = ctx->ldst_off;
+    MemOp sz = mop & MO_SIZE;
+    bool bs = (mop & MO_BSWAP) && sz != MO_8;
+    TCGv_i32 t = v;
+
+    if (st) {
+        if (bs) {
+            t = tcg_temp_new_i32();
+            if (sz == MO_16) {
+                tcg_gen_bswap16_i32(t, v, 0);
+            } else {
+                tcg_gen_bswap32_i32(t, v);
+            }
+        }
+        if (sz == MO_8) {
+            tcg_gen_st8_i32(t, p, o);
+        } else if (sz == MO_16) {
+            tcg_gen_st16_i32(t, p, o);
+        } else {
+            tcg_gen_st_i32(t, p, o);
+        }
+        return;
+    }
+    if (sz == MO_8) {
+        tcg_gen_ld8u_i32(v, p, o);
+    } else if (sz == MO_16) {
+        tcg_gen_ld16u_i32(v, p, o);
+        if (bs) {
+            tcg_gen_bswap16_i32(v, v, TCG_BSWAP_IZ | TCG_BSWAP_OZ);
+        }
+    } else {
+        tcg_gen_ld_i32(v, p, o);
+        if (bs) {
+            tcg_gen_bswap32_i32(v, v);
+        }
+    }
+    tcg_gen_ext_i32(v, v, mop & (MO_SIZE | MO_SIGN));
+}
+
+static void gen_host_ldst_i64(DisasContext *ctx, TCGv_i64 v, MemOp mop,
+                              bool st)
+{
+    TCGv_ptr p = ctx->ldst_host;
+    int o = ctx->ldst_off;
+    MemOp sz = mop & MO_SIZE;
+    bool bs = (mop & MO_BSWAP) && sz != MO_8;
+    TCGv_i64 t = v;
+
+    if (st) {
+        if (bs) {
+            t = tcg_temp_new_i64();
+            if (sz == MO_16) {
+                tcg_gen_bswap16_i64(t, v, 0);
+            } else if (sz == MO_32) {
+                tcg_gen_bswap32_i64(t, v, 0);
+            } else {
+                tcg_gen_bswap64_i64(t, v);
+            }
+        }
+        if (sz == MO_8) {
+            tcg_gen_st8_i64(t, p, o);
+        } else if (sz == MO_16) {
+            tcg_gen_st16_i64(t, p, o);
+        } else if (sz == MO_32) {
+            tcg_gen_st32_i64(t, p, o);
+        } else {
+            tcg_gen_st_i64(t, p, o);
+        }
+        return;
+    }
+    if (sz == MO_8) {
+        tcg_gen_ld8u_i64(v, p, o);
+    } else if (sz == MO_16) {
+        tcg_gen_ld16u_i64(v, p, o);
+        if (bs) {
+            tcg_gen_bswap16_i64(v, v, TCG_BSWAP_IZ | TCG_BSWAP_OZ);
+        }
+    } else if (sz == MO_32) {
+        tcg_gen_ld32u_i64(v, p, o);
+        if (bs) {
+            tcg_gen_bswap32_i64(v, v, TCG_BSWAP_IZ | TCG_BSWAP_OZ);
+        }
+    } else {
+        tcg_gen_ld_i64(v, p, o);
+        if (bs) {
+            tcg_gen_bswap64_i64(v, v);
+        }
+    }
+    tcg_gen_ext_i64(v, v, mop & (MO_SIZE | MO_SIGN));
+}
+
+#if TARGET_LONG_BITS == 32
+#define gen_host_ldst_tl gen_host_ldst_i32
+#else
+#define gen_host_ldst_tl gen_host_ldst_i64
+#endif
+
 /***                             Integer load                              ***/
 #define DEF_MEMOP(op) ((op) | ctx->default_tcg_memop_mask)
 #define BSWAP_MEMOP(op) ((op) | (ctx->default_tcg_memop_mask ^ MO_BSWAP))
@@ -2718,7 +2821,11 @@ static void glue(gen_qemu_, glue(ldop, _i64))(DisasContext *ctx,    \
                                              TCGv_i64 val,          \
                                              TCGv addr)             \
 {                                                                   \
-    tcg_gen_qemu_ld_i64(val, addr, ctx->mem_idx, op);               \
+    if (ctx->ldst_host) {                                           \
+        gen_host_ldst_i64(ctx, val, op, false);                     \
+    } else {                                                        \
+        tcg_gen_qemu_ld_i64(val, addr, ctx->mem_idx, op);           \
+    }                                                               \
 }
 
 GEN_QEMU_LOAD_64(ld8u,  DEF_MEMOP(MO_UB))
@@ -2753,7 +2860,11 @@ static void glue(gen_qemu_, glue(stop, _i64))(DisasContext *ctx,  \
                                               TCGv_i64 val,       \
                                               TCGv addr)          \
 {                                                                 \
-    tcg_gen_qemu_st_i64(val, addr, ctx->mem_idx, op);             \
+    if (ctx->ldst_host) {                                         \
+        gen_host_ldst_i64(ctx, val, op, true);                    \
+    } else {                                                      \
+        tcg_gen_qemu_st_i64(val, addr, ctx->mem_idx, op);         \
+    }                                                             \
 }
 
 GEN_QEMU_STORE_64(st8,  DEF_MEMOP(MO_UB))
@@ -6696,6 +6807,7 @@ static void ppc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->fp_rn = (hflags >> HFLAGS_FP_NOX) & 1 ? (hflags >> HFLAGS_FP_RN) & 3
                                               : -1;
     ctx->n_nfp = 0;
+    ctx->ldst_host = NULL;
     ctx->pr = (hflags >> HFLAGS_PR) & 1;
     ctx->mem_idx = (hflags >> HFLAGS_DMMU_IDX) & 7;
     if (!(ctx->mem_idx & 2)) {
@@ -6759,7 +6871,7 @@ static bool is_prefix_insn(DisasContext *ctx, uint32_t insn)
     return opc1(insn) == 1;
 }
 
-static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
+static void ppc_decode_insn(DisasContextBase *dcbase, CPUState *cs)
 {
     DisasContext *ctx = container_of(dcbase, DisasContext, base);
     PowerPCCPU *cpu = POWERPC_CPU(cs);
@@ -6797,9 +6909,240 @@ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     if (!ok) {
         gen_invalid(ctx);
     }
+}
+
+#if !defined(CONFIG_USER_ONLY)
+#define LDST_GROUP_MAX 16
+#define LDST_GROUP_SPAN 1024
+
+typedef struct LdstGroup {
+    int n, ra, lo, hi;
+    bool ld, st;
+    int off[LDST_GROUP_MAX];
+} LdstGroup;
+
+static bool ldst_group_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("PPC_LDST_GROUP");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+static bool ldst_group_store(uint32_t w)
+{
+    int op = opc1(w);
+
+    return (op >= 36 && op <= 39) || op == 44 || op == 45 || op >= 52;
+}
+
+static int ldst_group_size(DisasContext *ctx, uint32_t w)
+{
+    static const int8_t size[12] = { 4, 1, 4, 1, 2, 2, 2, 0, 4, 8, 4, 8 };
+    int op = opc1(w);
+
+    if (op < 32 || op > 55 || !rA(w) ||
+        (op >= 48 && !(ctx->fpu_enabled && (ctx->insns_flags & PPC_FLOAT))) ||
+        ((op & 1) && op < 48 && !ldst_group_store(w) && rA(w) == rD(w))) {
+        return 0;
+    }
+    return size[(op - 32) >> 1];
+}
+
+static int ldst_group_dest(uint32_t w)
+{
+    switch (opc1(w)) {
+    case 7: case 8: case 12: case 13: case 14: case 15:
+        return rD(w);
+    case 20: case 21: case 23: case 24: case 25: case 26: case 27: case 28:
+    case 29:
+        return rA(w);
+    case 10: case 11:
+        return w & 0x00600000 ? -2 : -1;
+    case 31:
+        switch ((w >> 1) & 0x3ff) {
+        case 0: case 32:
+            return w & 0x00600001 ? -2 : -1;
+        case 40: case 235: case 266:
+            return rD(w);
+        case 104:
+            return rB(w) ? -2 : rD(w);
+        case 922: case 954:
+            return rB(w) ? -2 : rA(w);
+        case 24: case 28: case 60: case 124: case 316: case 444: case 536:
+        case 792: case 824:
+            return rA(w);
+        case 339: case 467:
+            if ((w & 1) || (SPR(w) != SPR_LR && SPR(w) != SPR_CTR)) {
+                return -2;
+            }
+            return ((w >> 1) & 0x3ff) == 339 ? rD(w) : -1;
+        }
+    }
+    return -2;
+}
+
+static bool ldst_group_scan(DisasContext *ctx, CPUPPCState *env, LdstGroup *g)
+{
+    target_ulong pc = ctx->base.pc_next;
+    int delta = 0, n = 0;
+
+    g->lo = INT_MAX;
+    g->hi = INT_MIN;
+    for (int k = 0; k < LDST_GROUP_MAX; k++, pc += 4) {
+        uint32_t w;
+        int size, d, o;
+
+        if ((k && !(pc & ~TARGET_PAGE_MASK)) ||
+            ctx->base.num_insns + k > ctx->base.max_insns ||
+            tcg_io_hint_lookup(pc)) {
+            break;
+        }
+        w = translator_ldl_swap(env, &ctx->base, pc, need_byteswap(ctx));
+        size = ldst_group_size(ctx, w);
+        if (k == 0) {
+            if (!size) {
+                return false;
+            }
+            g->ra = rA(w);
+        }
+        if (size) {
+            o = delta + SIMM(w);
+            if (rA(w) != g->ra ||
+                MAX(g->hi, o + size) - MIN(g->lo, o) > LDST_GROUP_SPAN) {
+                break;
+            }
+            g->lo = MIN(g->lo, o);
+            g->hi = MAX(g->hi, o + size);
+            g->off[k] = o;
+            g->n = k + 1;
+            n++;
+            if (ldst_group_store(w)) {
+                g->st = true;
+            } else {
+                g->ld = true;
+            }
+            if (opc1(w) & 1) {
+                delta = o;
+            } else if (opc1(w) < 48 && !ldst_group_store(w) &&
+                       rD(w) == g->ra) {
+                break;
+            }
+            continue;
+        }
+        d = ldst_group_dest(w);
+        if (d == -2 || (d == g->ra && (opc1(w) != 14 || rA(w) != g->ra))) {
+            break;
+        }
+        if (d == g->ra) {
+            delta += SIMM(w);
+        }
+    }
+    return n >= 4;
+}
+
+static void gen_extu_tl_ptr(TCGv_ptr p, TCGv v)
+{
+    TCGv_i64 t = tcg_temp_new_i64();
+
+    tcg_gen_extu_tl_i64(t, v);
+    tcg_gen_trunc_i64_ptr(p, t);
+}
+
+static TCGv_ptr gen_ldst_group_check(DisasContext *ctx, LdstGroup *g,
+                                     TCGLabel *slow)
+{
+    int f = (int)(offsetof(CPUNegativeOffsetState, tlb.f) +
+                  ctx->mem_idx * sizeof(CPUTLBDescFast)) -
+            (int)sizeof(CPUNegativeOffsetState);
+    int adj = HOST_BIG_ENDIAN ? sizeof(uintptr_t) - sizeof(target_ulong) : 0;
+    TCGv lo = tcg_temp_new(), t = tcg_temp_new(), c = tcg_temp_new();
+    TCGv_ptr e = tcg_temp_new_ptr(), z = tcg_temp_new_ptr();
+    TCGv_ptr host = tcg_temp_new_ptr();
+
+    tcg_gen_addi_tl(lo, cpu_gpr[g->ra], g->lo);
+    if (NARROW_MODE(ctx)) {
+        tcg_gen_ext32u_tl(lo, lo);
+    }
+    tcg_gen_ld_tl(t, tcg_env, f + offsetof(CPUTLBDescFast, mask) + adj);
+    tcg_gen_shri_tl(c, lo, TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS);
+    tcg_gen_and_tl(t, t, c);
+    gen_extu_tl_ptr(e, t);
+    tcg_gen_ld_ptr(z, tcg_env, f + offsetof(CPUTLBDescFast, table));
+    tcg_gen_add_ptr(e, e, z);
+    tcg_gen_ld_ptr(host, e, offsetof(CPUTLBEntry, addend));
+    gen_extu_tl_ptr(z, lo);
+    tcg_gen_add_ptr(host, host, z);
+    tcg_gen_addi_tl(t, lo, g->hi - g->lo - 1);
+    tcg_gen_andi_tl(t, t, TARGET_PAGE_MASK);
+    tcg_gen_movi_tl(c, 0);
+    for (int i = 0; i < 2; i++) {
+        if (i ? g->st : g->ld) {
+            tcg_gen_ld_tl(lo, e, adj + (i ? offsetof(CPUTLBEntry, addr_write)
+                                          : offsetof(CPUTLBEntry, addr_read)));
+            tcg_gen_xor_tl(lo, lo, t);
+            tcg_gen_or_tl(c, c, lo);
+        }
+    }
+    tcg_gen_brcondi_tl(TCG_COND_NE, c, 0, slow);
+    return host;
+}
+
+static bool ppc_ldst_group(DisasContext *ctx, CPUState *cs)
+{
+    target_ulong pc = ctx->base.pc_next;
+    int access_type = ctx->access_type;
+    TCGLabel *slow, *done;
+    LdstGroup g = { 0 };
+
+    if (!ldst_group_on() || ctx->base.plugin_enabled ||
+        !ldst_group_scan(ctx, cpu_env(cs), &g)) {
+        return false;
+    }
+    slow = gen_new_label();
+    done = gen_new_label();
+    ctx->ldst_host = gen_ldst_group_check(ctx, &g, slow);
+    for (int i = 0; i < g.n; i++) {
+        ctx->ldst_off = g.off[i] - g.lo;
+        ppc_decode_insn(&ctx->base, cs);
+    }
+    ctx->ldst_host = NULL;
+    tcg_gen_br(done);
+    gen_set_label(slow);
+    ctx->base.pc_next = pc;
+    ctx->access_type = access_type;
+    for (int i = 0; i < g.n; i++) {
+        if (i) {
+            tcg_gen_insn_start(ctx->base.pc_next);
+            ctx->base.insn_start = tcg_last_op();
+            ctx->base.num_insns++;
+        }
+        ppc_decode_insn(&ctx->base, cs);
+    }
+    gen_set_label(done);
+    return true;
+}
+#else
+static bool ppc_ldst_group(DisasContext *ctx, CPUState *cs)
+{
+    return false;
+}
+#endif
+
+static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
+{
+    DisasContext *ctx = container_of(dcbase, DisasContext, base);
+
+    if (!ppc_ldst_group(ctx, cs)) {
+        ppc_decode_insn(dcbase, cs);
+    }
 
     /* End the TB when crossing a page boundary. */
-    if (ctx->base.is_jmp == DISAS_NEXT && !(pc & ~TARGET_PAGE_MASK)) {
+    if (ctx->base.is_jmp == DISAS_NEXT &&
+        !(ctx->base.pc_next & ~TARGET_PAGE_MASK)) {
         ctx->base.is_jmp = DISAS_TOO_MANY;
     }
 }

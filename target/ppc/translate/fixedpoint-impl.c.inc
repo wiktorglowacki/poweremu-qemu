@@ -34,7 +34,9 @@ static bool do_ldst(DisasContext *ctx, int rt, int ra, TCGv displ, bool update,
 
     ea = do_ea_calc(ctx, ra, displ);
     mop ^= ctx->default_tcg_memop_mask;
-    if (store) {
+    if (ctx->ldst_host) {
+        gen_host_ldst_tl(ctx, cpu_gpr[rt], mop, store);
+    } else if (store) {
         tcg_gen_qemu_st_tl(cpu_gpr[rt], ea, ctx->mem_idx, mop);
     } else {
         tcg_gen_qemu_ld_tl(cpu_gpr[rt], ea, ctx->mem_idx, mop);

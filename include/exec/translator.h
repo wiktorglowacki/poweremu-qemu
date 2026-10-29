@@ -181,6 +181,8 @@ struct TCGLabel *translator_xpage_guard(DisasContextBase *db, int n);
  */
 bool translator_io_start(DisasContextBase *db);
 
+bool tcg_io_hint_lookup(vaddr pc);
+
 /*
  * Translator Load Functions
  *

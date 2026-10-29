@@ -1539,7 +1539,11 @@ static void gen_native_tosingle(TCGv_i32 dest, TCGv_i64 src)
 static void gen_qemu_ld32fs(DisasContext *ctx, TCGv_i64 dest, TCGv addr)
 {
     TCGv_i32 tmp = tcg_temp_new_i32();
-    tcg_gen_qemu_ld_i32(tmp, addr, ctx->mem_idx, DEF_MEMOP(MO_UL));
+    if (ctx->ldst_host) {
+        gen_host_ldst_i32(ctx, tmp, DEF_MEMOP(MO_UL), false);
+    } else {
+        tcg_gen_qemu_ld_i32(tmp, addr, ctx->mem_idx, DEF_MEMOP(MO_UL));
+    }
     if (native_fp_conv_on()) {
         gen_native_todouble(dest, tmp);
     } else {
@@ -1691,7 +1695,11 @@ static void gen_qemu_st32fs(DisasContext *ctx, TCGv_i64 src, TCGv addr)
     } else {
         gen_helper_tosingle(tmp, src);
     }
-    tcg_gen_qemu_st_i32(tmp, addr, ctx->mem_idx, DEF_MEMOP(MO_UL));
+    if (ctx->ldst_host) {
+        gen_host_ldst_i32(ctx, tmp, DEF_MEMOP(MO_UL), true);
+    } else {
+        tcg_gen_qemu_st_i32(tmp, addr, ctx->mem_idx, DEF_MEMOP(MO_UL));
+    }
 }
 
 /* stfdepx (external PID lfdx) */
