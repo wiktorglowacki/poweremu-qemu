@@ -238,6 +238,13 @@ static struct {
     VkCommandPool cmdpool;
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
+    struct {
+        uint32_t seq, nin, rov, mask;
+        VkBuffer ub, vb, auxb, vub;
+        VkImageView att[VK_MAX_ATT];
+        uint64_t tex[R300_NUM_TEX_UNITS][2];
+    } set_key, set_prev;
+    VkDescriptorSet set_last;
     VkPipelineCache pipecache;
 
     /* VRAM */
@@ -355,7 +362,7 @@ static struct {
     uint8_t *page_src;          /* who last wrote the page: 1 CPU, 2 draw, 3 2D */
     /* batches waited for, depth write-backs at commit, rebuilt textures:
      * lookups, hashes, builds */
-    uint64_t stat_batch_waits, stat_wb_z, stat_tf_calls, stat_tf_hashed, stat_tf_built;
+    uint64_t stat_batch_waits, stat_wb_z, stat_tf_calls, stat_tf_hashed, stat_tf_built, stat_set_hits;
 } V;
 
 typedef struct VkWaitItem {
@@ -722,15 +729,15 @@ static bool vk_ctx_init(void)
     b[nb++] = (VkDescriptorSetLayoutBinding){ R300_BIND_ZPASS,
         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, all, NULL };
     b[nb++] = (VkDescriptorSetLayoutBinding){ R300_BIND_VERTS,
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, all, NULL };
+        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1, all, NULL };
     b[nb++] = (VkDescriptorSetLayoutBinding){ R300_BIND_MS,
         VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, all, NULL };
     b[nb++] = (VkDescriptorSetLayoutBinding){ R300_BIND_VRAM,
         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, all, NULL };
     b[nb++] = (VkDescriptorSetLayoutBinding){ R300_BIND_AUX,
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, all, NULL };
+        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1, all, NULL };
     b[nb++] = (VkDescriptorSetLayoutBinding){ R300_BIND_VSU,
-        VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, NULL };
+        VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_VERTEX_BIT, NULL };
     for (uint32_t k = 0; k < VK_MAX_ATT; k++) {
         b[nb++] = (VkDescriptorSetLayoutBinding){ R300_BIND_FB0 + k,
             VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
@@ -4087,6 +4094,16 @@ static void vk_overlap_draw(R300FSUniforms *u, bool hz, bool pass_z, uint32_t nc
  *      ROP, partial channel mask, or multiple render targets) or tests
  *      depth/stencil in the shader
  */
+static bool vk_set_cache(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = g_strcmp0(getenv("PPCGPU_VK_SET_CACHE"), "1") == 0;
+    }
+    return on;
+}
+
 static int vk_draw_barrier_mode(void)
 {
     static int mode = -1;
@@ -4503,12 +4520,45 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     /* The descriptor set. */
     VkBatch *b = vk_batch();
     VkDescriptorSet set = VK_NULL_HANDLE;
-    for (;;) {
+    uint32_t nin = hz ? ncb : natt;
+    VkBuffer vsub = gpu_vs ? vub : ub;
+    static int descriptor_mask = -1;
+    if (descriptor_mask < 0) {
+#if defined(__APPLE__) && defined(__aarch64__)
+        descriptor_mask = g_strcmp0(getenv("PPCGPU_DESCRIPTOR_MASK"), "0") != 0;
+#else
+        descriptor_mask = g_strcmp0(getenv("PPCGPU_DESCRIPTOR_MASK"), "1") == 0;
+#endif
+    }
+    uint32_t mask = descriptor_mask && pkt->sampler_mask_valid
+                  ? pkt->sampler_mask : (1u << R300_NUM_TEX_UNITS) - 1;
+    V.set_key.seq = b->seq;
+    V.set_key.nin = nin;
+    V.set_key.rov = rov;
+    V.set_key.mask = mask;
+    V.set_key.ub = ub;
+    V.set_key.vb = vb;
+    V.set_key.auxb = auxb;
+    V.set_key.vub = vsub;
+    for (uint32_t k = 0; k < VK_MAX_ATT; k++) {
+        V.set_key.att[k] = k < nin ? att[k]->view : VK_NULL_HANDLE;
+    }
+    for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
+        V.set_key.tex[t][0] = (uint64_t)(uintptr_t)tii[t].sampler;
+        V.set_key.tex[t][1] = (uint64_t)(uintptr_t)tii[t].imageView;
+    }
+    bool set_hit = vk_set_cache() && V.set_last &&
+                   !memcmp(&V.set_key, &V.set_prev, sizeof(V.set_key));
+    if (set_hit) {
+        set = V.set_last;
+        V.stat_set_hits++;
+    }
+    for (; !set;) {
         if (b->pool_cur == b->pools->len) {
             VkDescriptorPoolSize ps[6] = {
-                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SETS_PER_POOL },
-                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2 * VK_SETS_PER_POOL },
-                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 * VK_SETS_PER_POOL },
+                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 3 * VK_SETS_PER_POOL },
+                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 2 * VK_SETS_PER_POOL },
+                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * VK_SETS_PER_POOL },
                 { VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, VK_MAX_ATT * VK_SETS_PER_POOL },
                 { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                   R300_NUM_TEX_UNITS * VK_SETS_PER_POOL },
@@ -4537,72 +4587,60 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         }
         b->pool_cur++;
     }
-    VkDescriptorBufferInfo bi[6] = {
-        { ub, uo, sizeof(R300FSUniforms) },
-        { V.zpass_buf, 0, vk_overlap() ? VK_WHOLE_SIZE : 16 },
-        { vb, vo, vbytes },
-        { ub, uo + ns * ustride, 16 },
-        { V.vram_buf, 0, VK_WHOLE_SIZE },
-        { auxb, auxo, MAX(aux_bytes, 16u) },
-    };
-    VkDescriptorImageInfo ai[VK_MAX_ATT];
-    VkWriteDescriptorSet wr[6 + 2 + R300_NUM_TEX_UNITS];
-    VkDescriptorBufferInfo vbi = { vub, vuo, sizeof(R300VSUniforms) };
-    uint32_t nwr = 0;
-    static const VkDescriptorType bt[6] = {
-        VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-    };
-    for (uint32_t i = 0; i < 6; i++) {
-        wr[nwr++] = (VkWriteDescriptorSet){
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = set, .dstBinding = i, .descriptorCount = 1,
-            .descriptorType = bt[i], .pBufferInfo = &bi[i] };
-    }
-    if (gpu_vs) {
-        wr[nwr++] = (VkWriteDescriptorSet){
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = set, .dstBinding = R300_BIND_VSU, .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &vbi };
-    }
-    uint32_t nin = hz ? ncb : natt;
-    for (uint32_t k = 0; k < nin; k++) {
-        ai[k] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, att[k]->view, VK_IMAGE_LAYOUT_GENERAL };
-    }
-    wr[nwr++] = (VkWriteDescriptorSet){
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = set, .dstBinding = rov ? R300_BIND_FBIMG0 : R300_BIND_FB0,
-        .descriptorCount = nin,
-        .descriptorType = rov ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
-                              : VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, .pImageInfo = ai };
-    static int descriptor_mask = -1;
-    if (descriptor_mask < 0) {
-#if defined(__APPLE__) && defined(__aarch64__)
-        descriptor_mask = g_strcmp0(getenv("PPCGPU_DESCRIPTOR_MASK"), "0") != 0;
-#else
-        descriptor_mask = g_strcmp0(getenv("PPCGPU_DESCRIPTOR_MASK"), "1") == 0;
-#endif
-    }
-    uint32_t mask = descriptor_mask && pkt->sampler_mask_valid
-                  ? pkt->sampler_mask : (1u << R300_NUM_TEX_UNITS) - 1;
-    for (uint32_t k = 0; k < R300_NUM_TEX_UNITS; ) {
-        if (!(mask & (1u << k))) {
-            k++;
-            continue;
+    if (!set_hit) {
+        VkDescriptorBufferInfo bi[7] = {
+            { ub, 0, sizeof(R300FSUniforms) },
+            { V.zpass_buf, 0, vk_overlap() ? VK_WHOLE_SIZE : 16 },
+            { vb, 0, VK_WHOLE_SIZE },
+            { ub, 0, 16 },
+            { V.vram_buf, 0, VK_WHOLE_SIZE },
+            { auxb, 0, VK_WHOLE_SIZE },
+            { vsub, 0, sizeof(R300VSUniforms) },
+        };
+        VkDescriptorImageInfo ai[VK_MAX_ATT];
+        VkWriteDescriptorSet wr[7 + 1 + R300_NUM_TEX_UNITS];
+        uint32_t nwr = 0;
+        static const VkDescriptorType bt[7] = {
+            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC,
+            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+        };
+        for (uint32_t i = 0; i < 7; i++) {
+            wr[nwr++] = (VkWriteDescriptorSet){
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = set, .dstBinding = i, .descriptorCount = 1,
+                .descriptorType = bt[i], .pBufferInfo = &bi[i] };
         }
-        uint32_t first = k++;
-        while (k < R300_NUM_TEX_UNITS && (mask & (1u << k))) {
-            k++;
+        for (uint32_t k = 0; k < nin; k++) {
+            ai[k] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, att[k]->view, VK_IMAGE_LAYOUT_GENERAL };
         }
         wr[nwr++] = (VkWriteDescriptorSet){
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = set, .dstBinding = R300_BIND_TEX0 + first,
-            .descriptorCount = k - first,
-            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .pImageInfo = &tii[first] };
+            .dstSet = set, .dstBinding = rov ? R300_BIND_FBIMG0 : R300_BIND_FB0,
+            .descriptorCount = nin,
+            .descriptorType = rov ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                  : VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, .pImageInfo = ai };
+        for (uint32_t k = 0; k < R300_NUM_TEX_UNITS; ) {
+            if (!(mask & (1u << k))) {
+                k++;
+                continue;
+            }
+            uint32_t first = k++;
+            while (k < R300_NUM_TEX_UNITS && (mask & (1u << k))) {
+                k++;
+            }
+            wr[nwr++] = (VkWriteDescriptorSet){
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = set, .dstBinding = R300_BIND_TEX0 + first,
+                .descriptorCount = k - first,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &tii[first] };
+        }
+        vkUpdateDescriptorSets(V.dev, nwr, wr, 0, NULL);
+        V.set_last = set;
+        V.set_prev = V.set_key;
     }
-    vkUpdateDescriptorSets(V.dev, nwr, wr, 0, NULL);
 
     /* The render pass: reuse the open one if it has these attachments. */
     VkCommandBuffer cb = b->cb;
@@ -4685,7 +4723,8 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     }
     for (uint32_t k = 0; k < ns; k++) {
         uint32_t cx = k * pkt->rt_pitch * (ns > 1);
-        uint32_t dyn[2] = { k * ustride, k * mstride };
+        uint32_t dyn[5] = { uo + k * ustride, vo, uo + ns * ustride + k * mstride, auxo,
+                            gpu_vs ? vuo : 0 };
         /* Clip space has y up (as Metal's): flip the viewport. */
         VkViewport vpt = { cx, pkt->rt_height, pkt->rt_width, -(float)pkt->rt_height, 0, 1 };
         VkRect2D sc = { { cx + sx0, sy0 }, { sx1 - sx0, sy1 - sy0 } };
@@ -4694,7 +4733,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         if (pkt->num_verts) {
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
             vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.layout, 0, 1,
-                                    &set, 2, dyn);
+                                    &set, 5, dyn);
             if (gpu_vs) {
                 vkCmdBindIndexBuffer(cb, ib, io, VK_INDEX_TYPE_UINT32);
                 vkCmdDrawIndexed(cb, pkt->num_verts, 1, 0, 0, 0);
@@ -4705,7 +4744,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         if (pkt->num_line_verts) {
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, lpipe);
             vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.layout, 0, 1,
-                                    &set, 2, dyn);
+                                    &set, 5, dyn);
             vkCmdDraw(cb, pkt->num_line_verts, 1, pkt->num_verts, 0);
         }
     }
@@ -4721,7 +4760,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                  "%llu write-backs, %llu flushes; %llu commits, %llu write-backs "
                  "at commit; uploads: %llu new, %llu cpu, %llu draw, %llu 2d, %llu RT; "
                  "%llu batch waits, %llu depth write-backs at commit; rebuilt "
-                 "textures: %llu lookups, %llu hashed, %llu built\n",
+                 "textures: %llu lookups, %llu hashed, %llu built; %llu descriptor sets reused\n",
                  (unsigned long long)V.stat_draws, (unsigned long long)V.stat_hwz,
                  (unsigned long long)V.stat_rov, (unsigned long long)V.stat_passes,
                  (unsigned long long)V.stat_barriers,
@@ -4732,7 +4771,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                  (unsigned long long)V.stat_up_src[3], (unsigned long long)V.stat_up_rt,
                  (unsigned long long)V.stat_batch_waits, (unsigned long long)V.stat_wb_z,
                  (unsigned long long)V.stat_tf_calls, (unsigned long long)V.stat_tf_hashed,
-                 (unsigned long long)V.stat_tf_built);
+                 (unsigned long long)V.stat_tf_built, (unsigned long long)V.stat_set_hits);
     }
     return 0;
 }
