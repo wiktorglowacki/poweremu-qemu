@@ -684,6 +684,34 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
     return;
 }
 
+const void *HELPER(link_tb)(CPUArchState *env, void *ptb, uint32_t n)
+{
+    CPUState *cpu = env_cpu(env);
+    TranslationBlock *tb = ptb, *next;
+    vaddr pc;
+    uint64_t cs_base;
+    uint32_t flags, cflags;
+
+    cpu->neg.can_do_io = true;
+    cpu_get_tb_cpu_state(env, &pc, &cs_base, &flags);
+    cflags = curr_cflags(cpu);
+    if (check_for_breakpoints(cpu, pc, &cflags)) {
+        cpu_loop_exit(cpu);
+    }
+    next = tb_lookup(cpu, pc, cs_base, flags, cflags);
+    if (next == NULL) {
+        return tcg_code_gen_epilogue;
+    }
+    if (tb_page_addr1(next) == -1) {
+        tb_add_jump(tb, n, next);
+        if (qatomic_read(&tb->jmp_dest[n]) == (uintptr_t)next) {
+            tb->link_gen[n] = cpu->tb_jmp_cache->link_gen;
+        }
+        qemu_thread_jit_execute();
+    }
+    return next->tc.ptr;
+}
+
 static inline bool cpu_handle_halt(CPUState *cpu)
 {
 #ifndef CONFIG_USER_ONLY

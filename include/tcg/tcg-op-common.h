@@ -73,6 +73,7 @@ void tcg_gen_goto_tb(unsigned idx);
  * this op is equivalent to calling tcg_gen_exit_tb() with 0 as the argument.
  */
 void tcg_gen_lookup_and_goto_ptr(void);
+void tcg_gen_link_tb(int n);
 /* Jump to TB code at ptr, found by the caller; the TB must allow goto_ptr. */
 void tcg_gen_goto_ptr(TCGv_ptr ptr);
 

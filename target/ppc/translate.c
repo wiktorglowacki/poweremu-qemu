@@ -3804,6 +3804,19 @@ static void gen_goto_tb(DisasContext *ctx, int n, target_ulong dest)
         tcg_gen_movi_tl(cpu_nip, dest & ~3);
         tcg_gen_exit_tb(ctx->base.tb, n);
     } else {
+        TCGLabel *slow = ctx->singlestep_enabled ? NULL :
+                         translator_xpage_guard(&ctx->base, n);
+
+        if (slow) {
+            pmu_count_insns(ctx);
+            tcg_gen_goto_tb(n);
+            tcg_gen_movi_tl(cpu_nip, dest & ~3);
+            tcg_gen_exit_tb(ctx->base.tb, n);
+            gen_set_label(slow);
+            tcg_gen_movi_tl(cpu_nip, dest & ~3);
+            tcg_gen_link_tb(n);
+            return;
+        }
         tcg_gen_movi_tl(cpu_nip, dest & ~3);
         gen_branch_lookup_and_goto_ptr(ctx);
     }

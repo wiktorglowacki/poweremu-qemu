@@ -169,6 +169,7 @@ bool translator_use_goto_tb(DisasContextBase *db, vaddr dest);
  */
 struct TCGv_i64_d;
 void translator_lookup_and_goto_ptr(DisasContextBase *db, struct TCGv_i64_d *pc);
+struct TCGLabel *translator_xpage_guard(DisasContextBase *db, int n);
 
 /**
  * translator_io_start

@@ -161,6 +161,43 @@ static bool tb_inline_lookup_on(void)
     return on;
 }
 
+static bool tb_xpage_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("QEMU_TB_XPAGE");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+TCGLabel *translator_xpage_guard(DisasContextBase *db, int n)
+{
+    TranslationBlock *tb = db->tb;
+    TCGLabel *slow;
+    TCGv_ptr jc;
+    TCGv_i64 g, l;
+
+    if ((tb_cflags(tb) & (CF_COUNT_MASK | CF_NO_GOTO_TB | CF_NO_GOTO_PTR | CF_SINGLE_STEP |
+                          CF_MEMI_ONLY | CF_USE_ICOUNT | CF_NOIRQ | CF_PCREL |
+                          CF_BP_PAGE)) ||
+        db->plugin_enabled || qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC) ||
+        !tb_inline_lookup_on() || !tb_xpage_on()) {
+        return NULL;
+    }
+    slow = gen_new_label();
+    jc = tcg_temp_new_ptr();
+    g = tcg_temp_new_i64();
+    l = tcg_temp_new_i64();
+    tcg_gen_ld_ptr(jc, tcg_env, offsetof(ArchCPU, parent_obj.tb_jmp_cache) -
+                                offsetof(ArchCPU, env));
+    tcg_gen_ld_i64(g, jc, offsetof(CPUJumpCache, link_gen));
+    tcg_gen_ld_i64(l, tcg_constant_ptr(&tb->link_gen[n]), 0);
+    tcg_gen_brcond_i64(TCG_COND_NE, g, l, slow);
+    return slow;
+}
+
 void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc)
 {
     TranslationBlock *tb = db->tb;

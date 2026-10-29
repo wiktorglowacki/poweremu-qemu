@@ -3390,6 +3390,16 @@ void tcg_gen_lookup_and_goto_ptr(void)
     tcg_temp_free_ptr(ptr);
 }
 
+void tcg_gen_link_tb(int n)
+{
+    TCGv_ptr ptr = tcg_temp_ebb_new_ptr();
+
+    plugin_gen_disable_mem_helpers();
+    gen_helper_link_tb(ptr, tcg_env, tcg_constant_ptr(tcg_ctx->gen_tb), tcg_constant_i32(n));
+    tcg_gen_op1i(INDEX_op_goto_ptr, TCG_TYPE_PTR, tcgv_ptr_arg(ptr));
+    tcg_temp_free_ptr(ptr);
+}
+
 /* Jump to the code of a TB the caller looked up itself. */
 void tcg_gen_goto_ptr(TCGv_ptr ptr)
 {

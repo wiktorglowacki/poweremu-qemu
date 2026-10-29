@@ -38,6 +38,7 @@ typedef struct CPUJumpCache {
      * hash MMU guest flushes constantly.
      */
     uint32_t gen;
+    uint64_t link_gen;
     struct {
         TranslationBlock *tb;
         vaddr pc;

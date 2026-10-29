@@ -708,6 +708,7 @@ void tcg_flush_jmp_cache(CPUState *cpu)
     if (unlikely(jc == NULL)) {
         return;
     }
+    jc->link_gen++;
 
     /*
      * Retire every entry at once.  Only on the (4-billionth) wrap does the

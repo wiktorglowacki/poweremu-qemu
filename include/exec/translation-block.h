@@ -143,6 +143,7 @@ struct TranslationBlock {
     uintptr_t jmp_list_head;
     uintptr_t jmp_list_next[2];
     uintptr_t jmp_dest[2];
+    uint64_t link_gen[2];
 };
 
 /* The alignment given to TranslationBlock during allocation. */
