@@ -3142,6 +3142,9 @@ static void vk_gpu_wrote(uint64_t lo, uint64_t hi)
 {
     uint32_t s = vk_batch()->seq;
 
+    if (lo >= hi) {
+        return;
+    }
     V.gen++;
     for (uint64_t p = vk_pg(lo); p <= vk_pg(hi - 1) && p < V.npages; p++) {
         V.page_gen[p] = V.gen;
@@ -4068,6 +4071,9 @@ static VkFormat vk_rt_format(uint32_t view)
 
 static bool vk_range_pending(uint64_t lo, uint64_t hi)
 {
+    if (lo >= hi) {
+        return false;
+    }
     if (vk_z_pending(lo, hi)) {
         return true;
     }
