@@ -255,6 +255,7 @@ static struct {
     uint64_t npages;
     uint64_t *page_gen;         /* write generation of each page */
     uint64_t *blk_gen;          /* ... newest of each 64 pages */
+    uint32_t *blk_wseq;         /* newest page_wseq of each 64 pages */
     /* The page's last draw: its generation, the drawn image's VRAM bytes,
      * and the page's generation before that image's run of draws. */
     uint64_t *page_wgen, *page_gprev, (*page_wr)[2];
@@ -983,6 +984,7 @@ void *ppc_mac_gpu_vulkan_alloc_vram(uint64_t vram_size, void **opaque_out)
     V.npages = DIV_ROUND_UP(vram_size, VK_PAGE);
     V.page_gen = g_new0(uint64_t, V.npages);
     V.blk_gen = g_new0(uint64_t, V.npages / 64 + 1);
+    V.blk_wseq = g_new0(uint32_t, V.npages / 64 + 1);
     V.page_wgen = g_new0(uint64_t, V.npages);
     V.page_gprev = g_new0(uint64_t, V.npages);
     V.page_wr = g_malloc0(sizeof(*V.page_wr) * V.npages);
@@ -1231,11 +1233,16 @@ static inline uint64_t vk_pg(uint64_t addr)
     return addr / VK_PAGE;
 }
 
+/* Is the batch of this write sequence still open or unfinished? */
+static inline bool vk_seq_pending(uint32_t s)
+{
+    return s && (V.cur && s == V.cur->seq ? true : !vk_seq_done(s));
+}
+
 /* Is a GPU write of the page still pending (open or unfinished batch)? */
 static inline bool vk_page_pending_write(uint64_t p)
 {
-    uint32_t s = V.page_wseq[p];
-    return s && (V.cur && s == V.cur->seq ? true : !vk_seq_done(s));
+    return vk_seq_pending(V.page_wseq[p]);
 }
 
 /*
@@ -2877,7 +2884,7 @@ static void vk_img_written(VkImg *im, uint32_t x0, uint32_t y0,
     uint64_t wlo = im->addr, whi = vk_img_hi(im);
     uint64_t *gen = V.page_gen, *wgen = V.page_wgen, *gprev = V.page_gprev, (*wr)[2] = V.page_wr;
     uint64_t *blk = V.blk_gen;
-    uint32_t *wseq = V.page_wseq;
+    uint32_t *wseq = V.page_wseq, *bwseq = V.blk_wseq;
     uint8_t *src = V.page_src;
     V.gen++;
     for (uint64_t p = vk_pg(lo), e = MIN(vk_pg(hi - 1) + 1, V.npages); p < e; p++) {
@@ -2890,6 +2897,7 @@ static void vk_img_written(VkImg *im, uint32_t x0, uint32_t y0,
         gen[p] = V.gen;
         blk[p / 64] = V.gen;
         wseq[p] = s;
+        bwseq[p / 64] = s;
         src[p] = 2;
     }
     im->gen = V.gen;
@@ -3198,6 +3206,7 @@ static void vk_gpu_wrote(uint64_t lo, uint64_t hi)
         V.page_gen[p] = V.gen;
         V.blk_gen[p / 64] = V.gen;
         V.page_wseq[p] = s;
+        V.blk_wseq[p / 64] = s;
         V.page_src[p] = 3;
     }
 }
@@ -4129,14 +4138,21 @@ static VkFormat vk_rt_format(uint32_t view)
 
 static bool vk_range_pending(uint64_t lo, uint64_t hi)
 {
+    static int blk = -1;
+
+    if (blk < 0) {
+        blk = g_strcmp0(getenv("PPCGPU_VK_BLKPEND"), "0") != 0;
+    }
     if (lo >= hi) {
         return false;
     }
     if (vk_z_pending(lo, hi)) {
         return true;
     }
-    for (uint64_t p = vk_pg(lo); p <= vk_pg(hi - 1) && p < V.npages; p++) {
-        if (vk_page_pending_write(p)) {
+    for (uint64_t p = vk_pg(lo), e = MIN(vk_pg(hi - 1) + 1, V.npages); p < e; p++) {
+        if (blk && p % 64 == 0 && !vk_seq_pending(V.blk_wseq[p / 64])) {
+            p += 63;
+        } else if (vk_page_pending_write(p)) {
             return true;
         }
     }
