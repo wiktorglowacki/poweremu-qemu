@@ -1492,6 +1492,9 @@ static const GpuVs *gpu_vs_get(const R300State *st, const R300PVSProgram *prog,
  * Returns false (pkt untouched) when the draw needs the CPU path;
  * *failed when fetching the vertices failed (the draw is dropped).
  */
+enum { SCR_XV, SCR_OUTS, SCR_HKEY, SCR_HSLOT, SCR_DUP, SCR_LIST, SCR_PROV, SCR_N };
+static void *scratch(unsigned k, size_t size);
+
 static bool gpu_vs_build(const R300State *st, Fetch *f, const R300PVSProgram *prog,
                          const Layout *lay, const Route *route, uint32_t prim,
                          const uint32_t *order, uint32_t n, R300DrawPacket *pkt,
@@ -1535,8 +1538,9 @@ static bool gpu_vs_build(const R300State *st, Fetch *f, const R300PVSProgram *pr
     while (hn < 2 * n) {
         hn <<= 1;
     }
-    uint32_t *hkey = malloc(hn * sizeof(*hkey)), *hval = malloc(hn * sizeof(*hval));
-    uint32_t *pos = malloc(n * sizeof(*pos));
+    uint32_t *hkey = scratch(SCR_HKEY, hn * sizeof(*hkey));
+    uint32_t *hval = scratch(SCR_HSLOT, hn * sizeof(*hval));
+    uint32_t *pos = scratch(SCR_DUP, n * sizeof(*pos));
     float (*in)[4] = malloc((size_t)n * stride * sizeof(*in));
     uint32_t nu = 0;
     memset(hval, 0xFF, hn * sizeof(*hval));
@@ -1550,7 +1554,7 @@ static bool gpu_vs_build(const R300State *st, Fetch *f, const R300PVSProgram *pr
             if (!fetch_vertex(f, order[i], v)) {
                 *err = f->why ? f->why : "vertex data out of range";
                 *failed = true;
-                free(hkey); free(hval); free(pos); free(in); free(list);
+                free(in); free(list);
                 return false;
             }
             for (unsigned k = 0; k < nin; k++) {
@@ -1567,9 +1571,6 @@ static bool gpu_vs_build(const R300State *st, Fetch *f, const R300PVSProgram *pr
     for (uint32_t k = 0; k < nidx; k++) {
         list[k] = pos[list[k]];
     }
-    free(hkey);
-    free(hval);
-    free(pos);
 
     R300VSUniforms *u = calloc(1, sizeof(*u));
     memcpy(u->c, prog->consts, sizeof(u->c));
@@ -1747,7 +1748,6 @@ static void copy_detect(const R300FSDesc *desc, const Route *route,
  * ponytail: holds the largest draw's arrays (~0.75 KB a vertex) for the
  * thread's lifetime; trim after huge draws if that memory ever matters.
  */
-enum { SCR_XV, SCR_OUTS, SCR_HKEY, SCR_HSLOT, SCR_DUP, SCR_LIST, SCR_PROV, SCR_N };
 static __thread struct { void *p; size_t cap; } scr[SCR_N];
 
 static void *scratch(unsigned k, size_t size)
