@@ -4108,7 +4108,11 @@ static bool vk_set_cache(void)
     static int on = -1;
 
     if (on < 0) {
+#if defined(__APPLE__) && defined(__aarch64__)
+        on = g_strcmp0(getenv("PPCGPU_VK_SET_CACHE"), "0") != 0;
+#else
         on = g_strcmp0(getenv("PPCGPU_VK_SET_CACHE"), "1") == 0;
+#endif
     }
     return on;
 }
