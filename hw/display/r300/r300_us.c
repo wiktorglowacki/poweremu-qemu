@@ -143,17 +143,17 @@ static bool tex_is_float(uint32_t fmt)
 
 float r300_float24(uint32_t v)
 {
-    uint32_t mant = v & 0xFFFF;
-    uint32_t exp = (v >> 16) & 0x7F;
-    uint32_t sign = (v >> 23) & 1;
+    uint32_t bits = (v & 0x800000) << 8;
     float f;
 
-    if (!exp && !mant) {
-        return sign ? -0.0f : 0.0f;
+    /* Bias 63 -> 127: every exponent is a float32 normal, the top one a
+     * large finite value, not inf; the same bits as the ldexpf form for
+     * all 2^24 inputs (tests/r300/test_float24.c). */
+    if (v & 0x7FFFFF) {
+        bits |= ((((v >> 16) & 0x7F) + 64) << 23) | ((v & 0xFFFF) << 7);
     }
-    /* Bias 63; treat the top exponent as a large finite value, not inf. */
-    f = ldexpf(1.0f + mant / 65536.0f, (int)exp - 63);
-    return sign ? -f : f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
 }
 
 typedef struct USNode {
