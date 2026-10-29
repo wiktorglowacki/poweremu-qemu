@@ -13780,6 +13780,10 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         if (val != s->regs.crtc_pitch) {
             blit_path_log("CRTC", "PITCH changed 0x%x -> 0x%x",
                           s->regs.crtc_pitch, val);
+            if (!getenv("PPCGPU_STRIDE_OVERRIDE_STICKY")) {
+                s->disp_stride_override_active = false;
+                s->disp_stride_override_value = 0;
+            }
         }
         s->regs.crtc_pitch = val;
         s->display_invalid = true;
