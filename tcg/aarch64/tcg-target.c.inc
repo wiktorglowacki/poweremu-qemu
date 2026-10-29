@@ -12,6 +12,8 @@
 
 #include "qemu/bitops.h"
 
+static bool use_concat_vec;
+
 /* Used for function call generation. */
 #define TCG_REG_CALL_STACK              TCG_REG_SP
 #define TCG_TARGET_STACK_ALIGN          16
@@ -24,6 +26,16 @@
 # define TCG_TARGET_CALL_ARG_I128       TCG_CALL_ARG_EVEN
 #endif
 #define TCG_TARGET_CALL_RET_I128        TCG_CALL_RET_NORMAL
+
+/* Fast memory paths use only the reserved temporary registers. */
+#ifndef CONFIG_USER_ONLY
+# define TCG_TARGET_LDST_CLOBBER  0
+# define LDST_SAVE_SIZE  (TCG_TARGET_NB_REGS * 16)
+#else
+# define LDST_SAVE_SIZE  0
+#endif
+#define LDST_SAVE_OFS \
+    (TCG_STATIC_CALL_ARGS_SIZE + CPU_TEMP_BUF_NLONGS * sizeof(long))
 
 /* We're going to re-use TCGType in setting of the SF bit, which controls
    the size of the operation performed.  If we know the values match, it
@@ -1715,6 +1727,28 @@ static const TCGLdstHelperParam ldst_helper_param = {
     .ntmp = 1, .tmp = { TCG_REG_TMP0 }
 };
 
+static void tcg_out_ldst_save(TCGContext *s, const TCGLabelQemuLdst *l,
+                              bool restore)
+{
+#ifdef TCG_TARGET_LDST_CLOBBER
+    for (int r = 0; r < TCG_TARGET_NB_REGS; r++) {
+        TCGType type = r < TCG_REG_V0 ? TCG_TYPE_I64 : TCG_TYPE_V128;
+        intptr_t ofs = LDST_SAVE_OFS + r * 16;
+
+        if (!tcg_regset_test_reg(l->live_regs, r) ||
+            (l->is_ld && (r == l->datalo_reg ||
+                          (l->type == TCG_TYPE_I128 && r == l->datahi_reg)))) {
+            continue;
+        }
+        if (restore) {
+            tcg_out_ld(s, type, r, TCG_REG_SP, ofs);
+        } else {
+            tcg_out_st(s, type, r, TCG_REG_SP, ofs);
+        }
+    }
+#endif
+}
+
 static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
 {
     MemOp opc = get_memop(lb->oi);
@@ -1723,9 +1757,11 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
         return false;
     }
 
+    tcg_out_ldst_save(s, lb, false);
     tcg_out_ld_helper_args(s, lb, &ldst_helper_param);
     tcg_out_call_int(s, qemu_ld_helpers[opc & MO_SIZE]);
     tcg_out_ld_helper_ret(s, lb, false, &ldst_helper_param);
+    tcg_out_ldst_save(s, lb, true);
     tcg_out_goto(s, lb->raddr);
     return true;
 }
@@ -1738,8 +1774,10 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
         return false;
     }
 
+    tcg_out_ldst_save(s, lb, false);
     tcg_out_st_helper_args(s, lb, &ldst_helper_param);
     tcg_out_call_int(s, qemu_st_helpers[opc & MO_SIZE]);
+    tcg_out_ldst_save(s, lb, true);
     tcg_out_goto(s, lb->raddr);
     return true;
 }
@@ -1780,6 +1818,9 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
         ldst->is_ld = is_ld;
         ldst->oi = oi;
         ldst->addr_reg = addr_reg;
+#ifdef TCG_TARGET_LDST_CLOBBER
+        ldst_record_live(s, ldst);
+#endif
 
         mask_type = (s->page_bits + s->tlb_dyn_max_bits > 32
                      ? TCG_TYPE_I64 : TCG_TYPE_I32);
@@ -2569,6 +2610,11 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_dupm_vec:
         tcg_out_dupm_vec(s, type, vece, a0, a1, a2);
         break;
+    case INDEX_op_concat_i64_vec:
+        tcg_debug_assert(type == TCG_TYPE_V128 && vece == MO_64);
+        tcg_out_dup_vec(s, type, MO_64, a0, a1);
+        tcg_out_insn(s, 3605, INS, 0, a0, a2, 24, 0);
+        break;
     case INDEX_op_add_vec:
         if (is_scalar) {
             tcg_out_insn(s, 3611, ADD, vece, a0, a1, a2);
@@ -2939,6 +2985,8 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
         return vece < MO_64;
     case INDEX_op_tbl_vec:
         return type == TCG_TYPE_V128 && vece == MO_8;
+    case INDEX_op_concat_i64_vec:
+        return use_concat_vec && type == TCG_TYPE_V128 && vece == MO_64;
     case INDEX_op_fop_vec:
     case INDEX_op_ffma_vec:
     case INDEX_op_fcvt_vec:
@@ -3166,6 +3214,9 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_sub2_i64:
         return C_O2_I4(r, r, rz, rz, rA, rMZ);
 
+    case INDEX_op_concat_i64_vec:
+        return C_O1_I2(w, r, r);
+
     case INDEX_op_add_vec:
     case INDEX_op_sub_vec:
     case INDEX_op_mul_vec:
@@ -3223,6 +3274,9 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
 
 static void tcg_target_init(TCGContext *s)
 {
+    /* PPC_CONCAT_VEC=0 retains the mask/dup/bitsel lowering for A/B tests. */
+    use_concat_vec = g_strcmp0(getenv("PPC_CONCAT_VEC"), "0") != 0;
+
     tcg_target_available_regs[TCG_TYPE_I32] = 0xffffffffu;
     tcg_target_available_regs[TCG_TYPE_I64] = 0xffffffffu;
     tcg_target_available_regs[TCG_TYPE_V64] = 0xffffffff00000000ull;
@@ -3266,6 +3320,7 @@ static void tcg_target_init(TCGContext *s)
     ((PUSH_SIZE \
       + TCG_STATIC_CALL_ARGS_SIZE \
       + CPU_TEMP_BUF_NLONGS * sizeof(long) \
+      + LDST_SAVE_SIZE \
       + TCG_TARGET_STACK_ALIGN - 1) \
      & ~(TCG_TARGET_STACK_ALIGN - 1))
 

@@ -30,6 +30,8 @@ vupkhsb vupkhsh vupklsb vupklsh
 vmuleub vmuloub vmulesb vmulosb vmuleuh vmulouh vmulesh vmulosh
 vmsumubm vmsummbm vmsumuhm vmsumshm
 lvsl lvsr lvx ldu16 ldu15 vmhraddshs vmhaddshs vperm(d=b) deadst-ld deadst-call
+mmio-vec mmio-lvx
+lvebx lvehx lvewx stvebx stvehx stvewx mmio-veb mmio-veh mmio-vew
 isync-smc
 vaddfp vsubfp vmaxfp vminfp vmaddfp vnmsubfp vrefp vcfsx vcfux vctsxs vctuxs
 """.split()
@@ -176,7 +178,7 @@ def main():
             if n:
                 print(f'FAIL {name}: {n} mismatches')
         for k in range(min(fails, 8)):
-            p = mon.words(RESULTS + 0x100 + k * 96, 24)
+            p = mon.words(RESULTS + 0x200 + k * 96, 24)
             it, gs, es = p[1] & 0xffff, (p[1] >> 16) & 0xff, p[1] >> 24
             vec = lambda i: ' '.join(f'{w:08x}' for w in p[i:i + 4])
             print(f'  {OPS[p[0]]} #{it}: a={vec(4)} b={vec(8)} c={vec(12)}')

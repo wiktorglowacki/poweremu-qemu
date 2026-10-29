@@ -192,7 +192,7 @@ static bool trans_STVXL(DisasContext *ctx, arg_STVXL *a)
     return trans_STVX(ctx, a);
 }
 
-static bool do_ldst_ve_X(DisasContext *ctx, arg_X *a, int size,
+static bool do_ldst_ve_X(DisasContext *ctx, arg_X *a, int size, bool store,
                    void (*helper)(TCGv_env, TCGv_ptr, TCGv))
 {
     TCGv EA;
@@ -205,17 +205,49 @@ static bool do_ldst_ve_X(DisasContext *ctx, arg_X *a, int size,
         tcg_gen_andi_tl(EA, EA, ~(size - 1));
     }
     vrt = gen_avr_ptr(a->rt);
-    helper(tcg_env, vrt, EA);
+    /* shortcut: other host/guest modes retain helpers until tested. */
+    if (ppc_inline_ve && !ctx->le_mode) {
+        TCGv_i32 value = tcg_temp_new_i32();
+        TCGv_i32 index = tcg_temp_new_i32();
+        TCGv_ptr offset = tcg_temp_new_ptr();
+        MemOp mop = DEF_MEMOP(ctz32(size));
+
+        tcg_gen_trunc_tl_i32(index, EA);
+        tcg_gen_andi_i32(index, index, 16 - size);
+        tcg_gen_xori_i32(index, index, 16 - size);
+        tcg_gen_ext_i32_ptr(offset, index);
+        tcg_gen_add_ptr(vrt, vrt, offset);
+        if (store) {
+            switch (size) {
+            case 1: tcg_gen_ld8u_i32(value, vrt, 0); break;
+            case 2: tcg_gen_ld16u_i32(value, vrt, 0); break;
+            case 4: tcg_gen_ld_i32(value, vrt, 0); break;
+            default: g_assert_not_reached();
+            }
+            tcg_gen_qemu_st_i32(value, EA, ctx->mem_idx, mop);
+        } else {
+            /* Commit the selected lane only after a successful guest load. */
+            tcg_gen_qemu_ld_i32(value, EA, ctx->mem_idx, mop);
+            switch (size) {
+            case 1: tcg_gen_st8_i32(value, vrt, 0); break;
+            case 2: tcg_gen_st16_i32(value, vrt, 0); break;
+            case 4: tcg_gen_st_i32(value, vrt, 0); break;
+            default: g_assert_not_reached();
+            }
+        }
+    } else {
+        helper(tcg_env, vrt, EA);
+    }
     return true;
 }
 
-TRANS(LVEBX, do_ldst_ve_X, 1, gen_helper_LVEBX);
-TRANS(LVEHX, do_ldst_ve_X, 2, gen_helper_LVEHX);
-TRANS(LVEWX, do_ldst_ve_X, 4, gen_helper_LVEWX);
+TRANS(LVEBX, do_ldst_ve_X, 1, false, gen_helper_LVEBX);
+TRANS(LVEHX, do_ldst_ve_X, 2, false, gen_helper_LVEHX);
+TRANS(LVEWX, do_ldst_ve_X, 4, false, gen_helper_LVEWX);
 
-TRANS(STVEBX, do_ldst_ve_X, 1, gen_helper_STVEBX);
-TRANS(STVEHX, do_ldst_ve_X, 2, gen_helper_STVEHX);
-TRANS(STVEWX, do_ldst_ve_X, 4, gen_helper_STVEWX);
+TRANS(STVEBX, do_ldst_ve_X, 1, true, gen_helper_STVEBX);
+TRANS(STVEHX, do_ldst_ve_X, 2, true, gen_helper_STVEHX);
+TRANS(STVEWX, do_ldst_ve_X, 4, true, gen_helper_STVEWX);
 
 static void gen_mfvscr(DisasContext *ctx)
 {

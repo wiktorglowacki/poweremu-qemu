@@ -19,6 +19,7 @@
 
 #include "qemu/osdep.h"
 #include "vmx-x86.h"
+#include "vmx-neon.h"
 #include "cpu.h"
 #include "internal.h"
 #include "qemu/host-utils.h"
@@ -1263,6 +1264,14 @@ void helper_VMHADDSHS(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *a,
     int sat = 0;
     int i;
 
+#if defined(__aarch64__)
+    if (vmx_neon_on()) {
+        if (vmhaddshs_neon(r->s16, a->s16, b->s16, c->s16, false)) {
+            set_vscr_sat(env);
+        }
+        return;
+    }
+#endif
     for (i = 0; i < ARRAY_SIZE(r->s16); i++) {
         int32_t prod = a->s16[i] * b->s16[i];
         int32_t t = (int32_t)c->s16[i] + (prod >> 15);
@@ -1284,6 +1293,13 @@ void helper_VMHRADDSHS(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *a,
 #if defined(__x86_64__)
     if (vmx_x86_on()) {             /* PPC_NATIVE_VINT=0 keeps the loop */
         if (vmhraddshs_x86(r, a, b, c)) {
+            set_vscr_sat(env);
+        }
+        return;
+    }
+#elif defined(__aarch64__)
+    if (vmx_neon_on()) {
+        if (vmhaddshs_neon(r->s16, a->s16, b->s16, c->s16, true)) {
             set_vscr_sat(env);
         }
         return;

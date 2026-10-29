@@ -157,10 +157,12 @@ char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
  * r300_us_to_glsl(), remembered: returns the same text for the same
  * inputs without regenerating it.  *id names the text (equal ids, equal
  * text), so a renderer can cache per id without hashing the string; 0
- * means none (not cacheable).  Not thread-safe.
+ * means none (not cacheable). Optional sampler_mask receives the exact
+ * declared sampler units, or UINT32_MAX when unknown. Not thread-safe.
  */
 char *r300_us_glsl_cached(const R300State *st, const R300FSDesc *desc,
-                          uint32_t flags, uint32_t *id, const char **err);
+                          uint32_t flags, uint32_t *id, uint32_t *sampler_mask,
+                          const char **err);
 char *r300_us_glsl_by_id(uint32_t id);              /* malloc'd copy, or NULL */
 bool r300_us_glsl_writes_w(uint32_t id, const char *glsl);
 

@@ -528,7 +528,9 @@ typedef struct PPCMacGPURenderer {
      * into it as it does into malloc'd memory; NULL means use malloc);
      * compose_overlay converts, filters, scales and keys the OV0 overlay
      * from VRAM into that buffer's window rectangle and returns false when
-     * it cannot, in which case the caller composes on the CPU.
+     * it cannot, in which case the caller composes on the CPU. GPU work must
+     * not retain access to VRAM or this buffer after returning, including
+     * on timeout; private snapshots may remain pending.
      */
     void *(*scanout_alloc)(void *opaque, size_t size);
     void (*scanout_free)(void *opaque, void *p);

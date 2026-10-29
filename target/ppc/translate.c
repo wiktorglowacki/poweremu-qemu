@@ -88,6 +88,7 @@ static bool ppc_sync_exit;
 static bool ppc_isync_exit;
 /* PPC_MTMSR_EE=0: mtmsr always ends the TB (old behaviour) */
 static bool ppc_mtmsr_ee;
+static bool ppc_inline_ve;
 
 void ppc_translate_init(void)
 {
@@ -116,6 +117,10 @@ void ppc_translate_init(void)
         const char *e = getenv("PPC_MTMSR_EE");
         ppc_mtmsr_ee = !(e && e[0] == '0');
     }
+#endif
+#if defined(__aarch64__) && !HOST_BIG_ENDIAN && \
+    !defined(TARGET_PPC64) && !defined(CONFIG_USER_ONLY)
+    ppc_inline_ve = g_strcmp0(getenv("PPC_INLINE_VE"), "0") != 0;
 #endif
     p = cpu_reg_names;
     cpu_reg_names_size = sizeof(cpu_reg_names);

@@ -3063,6 +3063,28 @@ static void ppc_mac_gpu_display_update_inner(void *opaque)
      */
     uint64_t ov_generation = ov_on && use_generation ?
         s->renderer->vram_generation(s->renderer_opaque, 0, s->vram_size) : 0;
+    if (ov_on && s->renderer && s->renderer->range_busy_r200 &&
+        s->renderer->wait_busy_r200) {
+        uint32_t pbase[3];
+        uint64_t plen[3];
+        unsigned n = ppc_mac_gpu_overlay_planes(s, pbase, plen);
+        bool busy = s->renderer->range_busy_r200(s->renderer_opaque,
+                         s->disp.offset, s->disp.offset + frame_size, false);
+
+        for (unsigned p = 0; p < n && !busy; p++) {
+            /* The shader's word loads include alignment and packed-pixel padding. */
+            uint64_t end = MIN((uint64_t)pbase[p] + plen[p] + 8, s->vram_size);
+            busy = s->renderer->range_busy_r200(s->renderer_opaque,
+                                                pbase[p] & ~3u, end, false);
+        }
+        if (busy) {
+            /* Neither CPU fallback nor its private GPU snapshot may read a
+             * pending writer. Retry without consuming dirty rows/generations. */
+            /* A zero-time poll also submits lazy depth writebacks. */
+            s->renderer->wait_busy_r200(s->renderer_opaque, 0);
+            return;
+        }
+    }
     if (ov_on && s->renderer && s->renderer->vram_changed_since &&
         s->scanout_generation_valid) {
         uint32_t pbase[3];

@@ -170,6 +170,8 @@ typedef struct R300DrawPacket {
     /* Fragment stage */
     char *glsl;                 /* r300_us_to_glsl() source; owned by the packet */
     uint32_t glsl_id;           /* r300_us_glsl_cached() id of glsl, 0 if none */
+    uint32_t sampler_mask;      /* statically declared combined-image samplers */
+    bool sampler_mask_valid;
 
     /*
      * Vertex shading on the host GPU (R300_GLSL_GPU_VS).  When vs_glsl is

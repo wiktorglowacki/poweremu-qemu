@@ -110,6 +110,7 @@
 #define TCG_TARGET_HAS_cmpsel_vec       0
 #define TCG_TARGET_HAS_tst_vec          1
 #define TCG_TARGET_HAS_tbl_vec          1
+#define TCG_TARGET_HAS_concat_i64_vec   1
 #define TCG_TARGET_HAS_fp_vec           1
 
 #define TCG_TARGET_extract_valid(type, ofs, len)   1

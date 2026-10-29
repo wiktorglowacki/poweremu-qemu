@@ -1906,7 +1906,8 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
             pkt->warn |= f.warn;
             free(order);
             pkt->glsl = r300_us_glsl_cached(st, &desc, st->glsl_flags,
-                                            &pkt->glsl_id, err);
+                                            &pkt->glsl_id, &pkt->sampler_mask, err);
+            pkt->sampler_mask_valid = pkt->glsl != NULL;
             if (!pkt->glsl) {
                 r300_draw_free(pkt);
                 return false;
@@ -2115,7 +2116,9 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         copy_detect(&desc, &route, copy_coord, pkt);
     }
 
-    pkt->glsl = r300_us_glsl_cached(st, &desc, st->glsl_flags, &pkt->glsl_id, err);
+    pkt->glsl = r300_us_glsl_cached(st, &desc, st->glsl_flags, &pkt->glsl_id,
+                                    &pkt->sampler_mask, err);
+    pkt->sampler_mask_valid = pkt->glsl != NULL;
     if (!pkt->glsl) {
         r300_draw_free(pkt);
         return false;

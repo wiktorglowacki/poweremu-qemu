@@ -316,13 +316,18 @@ static struct {
     GQueue *waitq;              /* VkWaitItem */
     bool thread_started;
     /* scanout composition (the OV0 overlay) */
+    VkQueue comp_queue;
+    uint32_t comp_qfam;
+    VkCommandPool comp_cmdpool;
     VkBuffer comp_buf, par_buf;
     VkDeviceMemory comp_mem, par_mem;
     void *comp_map, *par_map;
-    VkBuffer comp_old_buf;
-    VkDeviceMemory comp_old_mem;
-    void *comp_old_map;
-    size_t comp_size;
+    VkBuffer comp_src_buf;
+    VkDeviceMemory comp_src_mem;
+    void *comp_src_map;
+    void *comp_scanout;
+    size_t comp_size, comp_src_size, comp_scanout_size;
+    bool comp_pending;
     VkDescriptorSetLayout comp_dsl;
     VkPipelineLayout comp_pl;
     VkPipeline comp_pipe;
@@ -630,18 +635,40 @@ static bool vk_ctx_init(void)
             break;
         }
     }
-    g_free(qf);
     if (V.qfam == UINT32_MAX) {
+        g_free(qf);
         vk_fail("no graphics queue");
         goto fail;
     }
-    float prio = 1.0f;
-    VkDeviceQueueCreateInfo qci = {
+    V.comp_qfam = UINT32_MAX;
+    if ((qf[V.qfam].queueFlags & VK_QUEUE_COMPUTE_BIT) && qf[V.qfam].queueCount > 1) {
+        V.comp_qfam = V.qfam;
+    } else {
+        for (uint32_t i = 0; i < n; i++) {
+            if (i != V.qfam && qf[i].queueCount &&
+                (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
+                V.comp_qfam = i;
+                break;
+            }
+        }
+    }
+    g_free(qf);
+    float prio[2] = { 1.0f, 1.0f };
+    VkDeviceQueueCreateInfo qci[2] = {{
         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex = V.qfam,
-        .queueCount = 1,
-        .pQueuePriorities = &prio,
-    };
+        .queueCount = V.comp_qfam == V.qfam ? 2 : 1,
+        .pQueuePriorities = prio,
+    }};
+    unsigned nqci = 1;
+    if (V.comp_qfam != UINT32_MAX && V.comp_qfam != V.qfam) {
+        qci[nqci++] = (VkDeviceQueueCreateInfo) {
+            .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+            .queueFamilyIndex = V.comp_qfam,
+            .queueCount = 1,
+            .pQueuePriorities = prio,
+        };
+    }
     VkPhysicalDeviceExtendedDynamicStateFeaturesEXT weds = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT,
         .pNext = V.props.apiVersion >= VK_API_VERSION_1_2 ? &w12 : NULL,
@@ -658,14 +685,18 @@ static bool vk_ctx_init(void)
     VkDeviceCreateInfo dci = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = V.rov ? (void *)&wil : eds ? (void *)&weds : weds.pNext,
-        .queueCreateInfoCount = 1,
-        .pQueueCreateInfos = &qci,
+        .queueCreateInfoCount = nqci,
+        .pQueueCreateInfos = qci,
         .enabledExtensionCount = ndext,
         .ppEnabledExtensionNames = dext,
         .pEnabledFeatures = &want,
     };
     VKCHECK(vkCreateDevice(V.pdev, &dci, NULL, &V.dev), "vkCreateDevice");
     vkGetDeviceQueue(V.dev, V.qfam, 0, &V.queue);
+    if (V.comp_qfam != UINT32_MAX) {
+        vkGetDeviceQueue(V.dev, V.comp_qfam, V.comp_qfam == V.qfam ? 1 : 0,
+                         &V.comp_queue);
+    }
 #define VK_LOAD(f) (V.f = (PFN_##f)vkGetDeviceProcAddr(V.dev, #f))
     V.eds = eds && VK_LOAD(vkCmdSetDepthTestEnableEXT) && VK_LOAD(vkCmdSetDepthWriteEnableEXT) &&
             VK_LOAD(vkCmdSetDepthCompareOpEXT) && VK_LOAD(vkCmdSetStencilTestEnableEXT) &&
@@ -3030,6 +3061,16 @@ static bool vk_wait_busy_r200(void *opaque, uint32_t us)
 {
     VkBatch *newest;
 
+    if (!us && !V.cur) {
+        bool available = false;
+        vk_reap();
+        for (int i = 0; i < VK_NBATCH; i++) {
+            available |= V.batch[i].state == 0;
+        }
+        if (!available) {
+            return true;  /* A lazy-Z writeback must not wait for a free batch. */
+        }
+    }
     vk_commit_ex(NULL, NULL, true);
     newest = vk_newest_pending();
     if (!newest) {
@@ -4505,7 +4546,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         { auxb, auxo, MAX(aux_bytes, 16u) },
     };
     VkDescriptorImageInfo ai[VK_MAX_ATT];
-    VkWriteDescriptorSet wr[6 + 3];
+    VkWriteDescriptorSet wr[6 + 2 + R300_NUM_TEX_UNITS];
     VkDescriptorBufferInfo vbi = { vub, vuo, sizeof(R300VSUniforms) };
     uint32_t nwr = 0;
     static const VkDescriptorType bt[6] = {
@@ -4535,10 +4576,32 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         .descriptorCount = nin,
         .descriptorType = rov ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
                               : VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, .pImageInfo = ai };
-    wr[nwr++] = (VkWriteDescriptorSet){
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = set, .dstBinding = R300_BIND_TEX0, .descriptorCount = R300_NUM_TEX_UNITS,
-        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = tii };
+    static int descriptor_mask = -1;
+    if (descriptor_mask < 0) {
+#if defined(__APPLE__) && defined(__aarch64__)
+        descriptor_mask = g_strcmp0(getenv("PPCGPU_DESCRIPTOR_MASK"), "0") != 0;
+#else
+        descriptor_mask = g_strcmp0(getenv("PPCGPU_DESCRIPTOR_MASK"), "1") == 0;
+#endif
+    }
+    uint32_t mask = descriptor_mask && pkt->sampler_mask_valid
+                  ? pkt->sampler_mask : (1u << R300_NUM_TEX_UNITS) - 1;
+    for (uint32_t k = 0; k < R300_NUM_TEX_UNITS; ) {
+        if (!(mask & (1u << k))) {
+            k++;
+            continue;
+        }
+        uint32_t first = k++;
+        while (k < R300_NUM_TEX_UNITS && (mask & (1u << k))) {
+            k++;
+        }
+        wr[nwr++] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = set, .dstBinding = R300_BIND_TEX0 + first,
+            .descriptorCount = k - first,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &tii[first] };
+    }
     vkUpdateDescriptorSets(V.dev, nwr, wr, 0, NULL);
 
     /* The render pass: reuse the open one if it has these attachments. */
@@ -4812,68 +4875,112 @@ static void vk_compose_drop_set(void)
     }
 }
 
+/* A timed-out job owns only these private resources, never VRAM or scanout. */
+static bool vk_compose_reap(void)
+{
+    if (V.comp_pending) {
+        VkResult r = vkGetFenceStatus(V.dev, V.comp_fence);
+        if (r != VK_SUCCESS && r != VK_ERROR_DEVICE_LOST) {
+            return false;
+        }
+        V.comp_pending = false;
+        V.comp_failed |= r == VK_ERROR_DEVICE_LOST;
+    }
+    if (V.comp_failed || !V.comp_scanout) {
+        vk_compose_drop_set();
+        if (V.comp_cmdpool) vkDestroyCommandPool(V.dev, V.comp_cmdpool, NULL);
+        if (V.comp_fence) vkDestroyFence(V.dev, V.comp_fence, NULL);
+        if (V.comp_pipe) vkDestroyPipeline(V.dev, V.comp_pipe, NULL);
+        if (V.comp_pl) vkDestroyPipelineLayout(V.dev, V.comp_pl, NULL);
+        if (V.comp_dsl) vkDestroyDescriptorSetLayout(V.dev, V.comp_dsl, NULL);
+        if (V.comp_buf) vkDestroyBuffer(V.dev, V.comp_buf, NULL);
+        if (V.comp_mem) vkFreeMemory(V.dev, V.comp_mem, NULL);
+        if (V.comp_src_buf) vkDestroyBuffer(V.dev, V.comp_src_buf, NULL);
+        if (V.comp_src_mem) vkFreeMemory(V.dev, V.comp_src_mem, NULL);
+        if (V.par_buf) vkDestroyBuffer(V.dev, V.par_buf, NULL);
+        if (V.par_mem) vkFreeMemory(V.dev, V.par_mem, NULL);
+        V.comp_cb = VK_NULL_HANDLE;
+        V.comp_cmdpool = VK_NULL_HANDLE;
+        V.comp_fence = VK_NULL_HANDLE;
+        V.comp_pipe = VK_NULL_HANDLE;
+        V.comp_pl = VK_NULL_HANDLE;
+        V.comp_dsl = VK_NULL_HANDLE;
+        V.comp_buf = V.comp_src_buf = V.par_buf = VK_NULL_HANDLE;
+        V.comp_mem = V.comp_src_mem = V.par_mem = VK_NULL_HANDLE;
+        V.comp_map = V.comp_src_map = V.par_map = NULL;
+        V.comp_size = V.comp_src_size = 0;
+    }
+    return true;
+}
+
 static void vk_scanout_free(void *opaque, void *ptr)
 {
-    if (ptr && ptr == V.comp_old_map) {
-        vkDestroyBuffer(V.dev, V.comp_old_buf, NULL);
-        vkFreeMemory(V.dev, V.comp_old_mem, NULL);
-        V.comp_old_map = NULL;
-        return;
+    if (ptr == V.comp_scanout) {
+        V.comp_scanout = NULL;
+        V.comp_scanout_size = 0;
     }
-    if (!ptr || ptr != V.comp_map) {
-        return;
-    }
-    if (V.comp_fence) {
-        vkWaitForFences(V.dev, 1, &V.comp_fence, VK_TRUE, UINT64_MAX);
-    }
-    vk_compose_drop_set();
-    vkDestroyBuffer(V.dev, V.comp_buf, NULL);
-    vkFreeMemory(V.dev, V.comp_mem, NULL);
-    V.comp_buf = VK_NULL_HANDLE;
-    V.comp_mem = VK_NULL_HANDLE;
-    V.comp_map = NULL;
-    V.comp_size = 0;
+    g_free(ptr);
+    /* Never wait under the BQL, including for a reset but unsubmitted fence. */
+    vk_compose_reap();
 }
 
 static void *vk_scanout_alloc(void *opaque, size_t size)
 {
-    void *map = NULL;
+    if (!V.dev) {
+        return NULL;
+    }
+    /* UI readers and CPU fallback must never see a pending GPU destination. */
+    V.comp_scanout = g_malloc0(size);
+    V.comp_scanout_size = size;
+    vk_compose_reap();
+    return V.comp_scanout;
+}
 
-    if (!V.dev || V.comp_failed) {
-        return NULL;
+static bool vk_compose_buffers(size_t source_size)
+{
+    if (V.comp_size < V.comp_scanout_size || V.comp_src_size < source_size) {
+        vk_compose_drop_set();
     }
-    if (V.comp_map) {
-        if (V.comp_fence) {
-            vkWaitForFences(V.dev, 1, &V.comp_fence, VK_TRUE, UINT64_MAX);
-        }
-        vk_scanout_free(opaque, V.comp_old_map);
-        V.comp_old_buf = V.comp_buf;
-        V.comp_old_mem = V.comp_mem;
-        V.comp_old_map = V.comp_map;
+    if (V.comp_size < V.comp_scanout_size) {
+        if (V.comp_buf) vkDestroyBuffer(V.dev, V.comp_buf, NULL);
+        if (V.comp_mem) vkFreeMemory(V.dev, V.comp_mem, NULL);
         V.comp_map = NULL;
+        V.comp_size = 0;
+        if (!vk_buffer(V.comp_scanout_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                       VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                       &V.comp_buf, &V.comp_mem, &V.comp_map)) {
+            return false;
+        }
+        V.comp_size = V.comp_scanout_size;
     }
-    /* Host-cached: the CPU copies rows into it and GL uploads from it. */
-    if (!vk_buffer(size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                   VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
-                   &V.comp_buf, &V.comp_mem, &map)) {
-        V.comp_buf = VK_NULL_HANDLE;
-        V.comp_mem = VK_NULL_HANDLE;
-        return NULL;
+    if (V.comp_src_size < source_size) {
+        if (V.comp_src_buf) vkDestroyBuffer(V.dev, V.comp_src_buf, NULL);
+        if (V.comp_src_mem) vkFreeMemory(V.dev, V.comp_src_mem, NULL);
+        V.comp_src_map = NULL;
+        V.comp_src_size = 0;
+        if (!vk_buffer(source_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                       VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                       &V.comp_src_buf, &V.comp_src_mem, &V.comp_src_map)) {
+            return false;
+        }
+        V.comp_src_size = source_size;
     }
-    memset(map, 0, size);
-    V.comp_map = map;
-    V.comp_size = size;
-    vk_compose_drop_set();
-    return map;
+    return true;
 }
 
 static bool vk_compose_init(void)
 {
+    if (V.comp_failed) {
+        return false;
+    }
     if (V.comp_pipe) {
         return true;
     }
-    if (V.comp_failed) {
+    if (!V.comp_queue) {
+        qemu_log("ppc-mac-gpu vulkan: no independent compute queue; CPU overlay fallback\n");
+        V.comp_failed = true;
         return false;
     }
     size_t nw;
@@ -4919,9 +5026,13 @@ static bool vk_compose_init(void)
     };
     VkCommandBufferAllocateInfo cai = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool = V.cmdpool,
         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
         .commandBufferCount = 1,
+    };
+    VkCommandPoolCreateInfo pool_ci = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+        .queueFamilyIndex = V.comp_qfam,
     };
     VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
                               .flags = VK_FENCE_CREATE_SIGNALED_BIT };
@@ -4939,6 +5050,10 @@ static bool vk_compose_init(void)
         vkDestroyShaderModule(V.dev, mod, NULL);
     }
     if (r == VK_SUCCESS) {
+        r = vkCreateCommandPool(V.dev, &pool_ci, NULL, &V.comp_cmdpool);
+    }
+    if (r == VK_SUCCESS) {
+        cai.commandPool = V.comp_cmdpool;
         r = vkAllocateCommandBuffers(V.dev, &cai, &V.comp_cb);
     }
     if (r == VK_SUCCESS) {
@@ -4953,7 +5068,7 @@ static bool vk_compose_init(void)
     if (r != VK_SUCCESS) {
         qemu_log("ppc-mac-gpu vulkan: overlay compose setup failed (VkResult %d)\n", (int)r);
         V.comp_failed = true;
-        V.comp_pipe = VK_NULL_HANDLE;
+        vk_compose_reap();
         return false;
     }
     return true;
@@ -4988,7 +5103,7 @@ static bool vk_compose_set(void)
         return false;
     }
     VkDescriptorBufferInfo bi[3] = {
-        { V.vram_buf, 0, VK_WHOLE_SIZE },
+        { V.comp_src_buf, 0, VK_WHOLE_SIZE },
         { V.comp_buf, 0, VK_WHOLE_SIZE },
         { V.par_buf, 0, 256 },
     };
@@ -5022,30 +5137,56 @@ static bool vk_compose_overlay(void *opaque, const PPCMacGPUOverlayParams *p)
                      p->fb_offset, p->fb_stride, p->out_stride);
         }
     }
-    if (!V.comp_map || !vk_compose_init() || !vk_compose_set()) {
+    if (!vk_compose_reap() || !V.comp_scanout || !vk_compose_init()) {
         return false;
     }
     if (p->x1 <= p->x0 || p->y1 <= p->y0 || p->win_x1 <= p->win_x0 ||
         p->bottom <= p->top || p->sx1 < p->sx0 || !p->src_h ||
-        (uint64_t)(p->y1 - 1) * p->out_stride + (uint64_t)p->x1 * 4 > V.comp_size ||
+        (uint64_t)(p->y1 - 1) * p->out_stride + (uint64_t)p->x1 * 4 > V.comp_scanout_size ||
         (uint64_t)p->fb_offset + (uint64_t)(p->y1 - 1) * p->fb_stride +
             (uint64_t)p->x1 * 4 > V.vram_size) {
         return false;
     }
-    for (int i = 0; i < (p->fmt == 10 ? 3 : 1); i++) {
+    /* Preserve byte alignment while packing only the ranges this shader reads. */
+    uint64_t src[4], len[4], dst[4], source_size;
+    unsigned planes = p->fmt == 10 ? 3 : 1;
+    src[0] = p->fb_offset & ~3u;
+    len[0] = ROUND_UP((uint64_t)p->fb_offset +
+                     (uint64_t)(p->y1 - 1) * p->fb_stride + p->x1 * 4, 4) - src[0];
+    dst[0] = 0;
+    source_size = len[0];
+    for (unsigned i = 0; i < planes; i++) {
         uint64_t rows = i ? (p->src_h + 1) / 2 : p->src_h;
         uint64_t cols = (i ? p->sx1 / 2 + 1 : p->sx1 + 1) * (p->fmt == 10 ? 1 : 2);
-        if ((uint64_t)p->plane[i] + (rows - 1) * p->pitch[i] + cols + 4 > V.vram_size) {
+        uint64_t end = (uint64_t)p->plane[i] + (rows - 1) * p->pitch[i] + cols + 4;
+        if (end > V.vram_size) {
             return false;
         }
+        src[i + 1] = p->plane[i] & ~3u;
+        len[i + 1] = ROUND_UP(end, 4) - src[i + 1];
+        dst[i + 1] = source_size;
+        source_size += len[i + 1];
     }
-    /* the previous pass has long completed (it was waited for) */
-    vkWaitForFences(V.dev, 1, &V.comp_fence, VK_TRUE, UINT64_MAX);
-    vkResetFences(V.dev, 1, &V.comp_fence);
+    /* Bound the quarantined allocation even for overlapping, oversized planes. */
+    if (source_size > V.vram_size ||
+        source_size > V.props.limits.maxStorageBufferRange ||
+        V.comp_scanout_size > V.props.limits.maxStorageBufferRange ||
+        !vk_compose_buffers(source_size) || !vk_compose_set()) {
+        return false;
+    }
+    for (unsigned y = p->y0; y < p->y1; y++) {
+        uint64_t off = ((uint64_t)p->fb_offset + y * (uint64_t)p->fb_stride +
+                        p->x0 * 4) & ~3ull;
+        memcpy((uint8_t *)V.comp_src_map + off - src[0], V.vram + off,
+               (p->x1 - p->x0) * 4);
+    }
+    for (unsigned i = 1; i <= planes; i++) {
+        memcpy((uint8_t *)V.comp_src_map + dst[i], V.vram + src[i], len[i]);
+    }
 
     uint32_t *u = V.par_map;
     uint32_t words[32] = {
-        p->fb_offset, p->fb_stride, p->out_stride, p->fb_swap,
+        p->fb_offset - src[0], p->fb_stride, p->out_stride, p->fb_swap,
         p->x0, p->y0, p->x1, p->y1,
         p->win_x0, p->win_x1, p->top, p->bottom,
         p->fmt, p->sx0, p->sx1, p->src_h,
@@ -5054,6 +5195,9 @@ static bool vk_compose_overlay(void *opaque, const PPCMacGPUOverlayParams *p)
         p->vkey_lo, p->vkey_hi, p->gkey_lo, p->gkey_hi,
         p->vfn, p->gfn, p->both, 0,
     };
+    for (unsigned i = 0; i < planes; i++) {
+        words[16 + i] = dst[i + 1] + p->plane[i] - src[i + 1];
+    }
     memcpy(u, words, sizeof(words));
     float *f = (float *)(u + 32);
     /* cy, ccb, ccr, coff as vec4 (r, g, b, 0): coef[c*4 + k] */
@@ -5068,7 +5212,10 @@ static bool vk_compose_overlay(void *opaque, const PPCMacGPUOverlayParams *p)
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
-    vkBeginCommandBuffer(V.comp_cb, &bi);
+    VkResult r = vkBeginCommandBuffer(V.comp_cb, &bi);
+    if (r != VK_SUCCESS) {
+        goto fail;
+    }
     VkMemoryBarrier in = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
@@ -5088,21 +5235,38 @@ static bool vk_compose_overlay(void *opaque, const PPCMacGPUOverlayParams *p)
     };
     vkCmdPipelineBarrier(V.comp_cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &out, 0, NULL, 0, NULL);
-    vkEndCommandBuffer(V.comp_cb);
+    r = vkEndCommandBuffer(V.comp_cb);
+    if (r != VK_SUCCESS) {
+        goto fail;
+    }
+    r = vkResetFences(V.dev, 1, &V.comp_fence);
+    if (r != VK_SUCCESS) {
+        goto fail;
+    }
     VkSubmitInfo si = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1,
         .pCommandBuffers = &V.comp_cb,
     };
-    if (vkQueueSubmit(V.queue, 1, &si, V.comp_fence) != VK_SUCCESS) {
-        vk_fail("overlay compose: vkQueueSubmit failed");
-        V.comp_failed = true;
-        return false;
+    /* Private buffers and a separate queue keep a stalled overlay out of 3D. */
+    r = vkQueueSubmit(V.comp_queue, 1, &si, V.comp_fence);
+    if (r != VK_SUCCESS) {
+        /* OOM leaves submission state unchanged; unknown errors are quarantined. */
+        V.comp_pending = r != VK_ERROR_OUT_OF_HOST_MEMORY &&
+                         r != VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        goto fail;
     }
-    if (vkWaitForFences(V.dev, 1, &V.comp_fence, VK_TRUE, 500 * 1000 * 1000) != VK_SUCCESS) {
-        qemu_log("ppc-mac-gpu vulkan: overlay compose did not finish in 500 ms\n");
-        V.comp_failed = true;
-        return false;
+    V.comp_pending = true;
+    r = vkWaitForFences(V.dev, 1, &V.comp_fence, VK_TRUE, 500 * 1000 * 1000);
+    if (r != VK_SUCCESS) {
+        V.comp_pending = r != VK_ERROR_DEVICE_LOST;
+        goto fail;
+    }
+    V.comp_pending = false;
+    for (unsigned y = p->y0; y < p->y1; y++) {
+        size_t off = (size_t)y * p->out_stride + p->x0 * 4;
+        memcpy((uint8_t *)V.comp_scanout + off, (uint8_t *)V.comp_map + off,
+               (p->x1 - p->x0) * 4);
     }
     if (!V.comp_logged) {
         V.comp_logged = true;
@@ -5110,6 +5274,13 @@ static bool vk_compose_overlay(void *opaque, const PPCMacGPUOverlayParams *p)
                  p->x1 - p->x0, p->y1 - p->y0, p->fmt);
     }
     return true;
+
+fail:
+    qemu_log("ppc-mac-gpu vulkan: overlay disabled after VkResult %d; private job %s\n",
+             (int)r, V.comp_pending ? "quarantined" : "not pending");
+    V.comp_failed = true;
+    vk_compose_reap();
+    return false;
 }
 
 static PPCMacGPURenderer vulkan_renderer = {

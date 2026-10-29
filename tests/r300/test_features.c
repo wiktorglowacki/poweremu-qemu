@@ -493,14 +493,14 @@ static void morphos_color_profile(void)
         uint32_t original_id, legacy_id, compat_id, restored_id;
         st.card_bytes = true;
         st.morphos_color_compat = false;
-        char *original = r300_us_glsl_cached(&st, &desc, flags, &original_id, &err);
+        char *original = r300_us_glsl_cached(&st, &desc, flags, &original_id, NULL, &err);
         CHECK(original && original_id, "default MRT shader: %s", err ? err : "");
         st.morphos_color_compat = true;
         st.card_bytes = false;
-        char *legacy = r300_us_glsl_cached(&st, &desc, flags, &legacy_id, &err);
+        char *legacy = r300_us_glsl_cached(&st, &desc, flags, &legacy_id, NULL, &err);
         CHECK(legacy && legacy_id == original_id, "legacy handoff changed default cache");
         st.card_bytes = true;
-        char *compat = r300_us_glsl_cached(&st, &desc, flags, &compat_id, &err);
+        char *compat = r300_us_glsl_cached(&st, &desc, flags, &compat_id, NULL, &err);
         CHECK(compat && compat_id && compat_id != original_id,
               "native compatibility reused the default MRT shader id");
         if (original && legacy && compat) {
@@ -514,10 +514,109 @@ static void morphos_color_profile(void)
                   "MRT framebuffer store did not use the effective endian");
         }
         st.morphos_color_compat = false;
-        char *restored = r300_us_glsl_cached(&st, &desc, flags, &restored_id, &err);
+        char *restored = r300_us_glsl_cached(&st, &desc, flags, &restored_id, NULL, &err);
         CHECK(restored && restored_id == original_id && original &&
               !strcmp(restored, original), "return to default missed its original shader cache");
         free(original); free(legacy); free(compat); free(restored);
+    }
+}
+
+/* Sampler metadata follows declarations, including cached text-by-id hits. */
+static void sampler_masks(void)
+{
+    R300FSDesc desc = { 0 };
+    const char *err;
+    uint32_t id, mask, first_id;
+    char *text;
+
+    for (unsigned ssbo = 0; ssbo < 2; ssbo++) {
+        uint32_t flags = R300_GLSL_TEXT_BY_ID | (ssbo ? R300_GLSL_VRAM_SSBO : 0);
+        load_state();
+        for (unsigned unit = 0; unit < 16; unit++) {
+            r300_state_write(&st, 0x4104, 1u << unit);
+            r300_state_write(&st, 0x44C0 + 4 * unit, 0x0000a60c);
+            r300_state_write(&st, 0x4620, 0x8040 | unit << 11);
+            text = r300_us_glsl_cached(&st, &desc, flags, &id, &mask, &err);
+            CHECK(text && mask == (1u << unit), "unit %u mask %x", unit, mask);
+            free(text);
+            first_id = id;
+            text = r300_us_glsl_cached(&st, &desc, flags, &id, &mask, &err);
+            CHECK(text && !*text && id == first_id && mask == (1u << unit),
+                  "cached unit %u lost sampler metadata", unit);
+            free(text);
+            r300_state_write(&st, 0x4104, 0); /* Used but unbound still needs a dummy. */
+            text = r300_us_glsl_cached(&st, &desc, flags, &id, &mask, &err);
+            CHECK(text && mask == (1u << unit), "unbound unit %u mask %x", unit, mask);
+            free(text);
+            r300_state_write(&st, 0x4104, 1u << unit);
+            r300_state_write(&st, 0x44C0 + 4 * unit, 0x0000a61b); /* RAW 32F */
+            text = r300_us_glsl_cached(&st, &desc, flags, &id, &mask, &err);
+            CHECK(text && mask == (ssbo ? 0 : 1u << unit),
+                  "RAW unit %u SSBO=%u mask %x", unit, ssbo, mask);
+            free(text);
+        }
+    }
+
+    load_state();
+    uint32_t flags = R300_GLSL_VRAM_SSBO | R300_GLSL_TEXT_BY_ID;
+    r300_state_write(&st, 0x4104, 0x8008);
+    r300_state_write(&st, 0x461C, 0x00420000); /* Two texture instructions. */
+    r300_state_write(&st, 0x4620, 0x8040 | 3u << 11);
+    r300_state_write(&st, 0x4624, 0x8041 | 15u << 11);
+    r300_state_write(&st, 0x44C0 + 4 * 3, 0x0000a60c);
+    r300_state_write(&st, 0x44C0 + 4 * 15, 0x0000a60c);
+    text = r300_us_glsl_cached(&st, &desc, flags, &id, &mask, &err);
+    CHECK(text && mask == 0x8008, "sparse sampler mask %x", mask);
+    free(text);
+    first_id = id;
+    r300_state_write(&st, 0x44C0 + 4 * 15, 0x0000a61b);
+    text = r300_us_glsl_cached(&st, &desc, flags, &id, &mask, &err);
+    CHECK(text && mask == 8 && id != first_id, "RAW format reused sampled metadata");
+    free(text);
+    r300_state_write(&st, 0x44C0 + 4 * 15, 0x0000a60c);
+    text = r300_us_glsl_cached(&st, &desc, flags, &id, &mask, &err);
+    CHECK(text && id == first_id && mask == 0x8008, "shader switch missed prior mask");
+    free(text);
+    for (unsigned i = 0; i < 70; i++) {
+        desc.route[0] = i % 10;
+        desc.route[1] = i / 10;
+        text = r300_us_glsl_cached(&st, &desc, flags, &id, &mask, &err);
+        CHECK(text && mask == 0x8008, "memo eviction changed sampler mask");
+        free(text);
+    }
+    text = r300_us_glsl_by_id(first_id);
+    CHECK(!text, "old shader survived more than 64 distinct memo entries");
+    free(text);
+    memset(&desc, 0, sizeof(desc));
+    text = r300_us_glsl_cached(&st, &desc, flags, &id, &mask, &err);
+    CHECK(text && id != first_id && mask == 0x8008, "evicted mask did not regenerate");
+    free(text);
+    r300_state_write(&st, 0x4620, 0); /* NOP */
+    r300_state_write(&st, 0x4624, 2u << 15); /* KIL */
+    text = r300_us_glsl_cached(&st, &desc, flags, &id, &mask, &err);
+    CHECK(text && mask == 0, "NOP/KIL incorrectly declare samplers");
+    free(text);
+    r300_state_write(&st, 0x4620, 7u << 15); /* Unsupported program. */
+    text = r300_us_glsl_cached(&st, &desc, flags, &id, &mask, &err);
+    CHECK(!text && err && mask == UINT32_MAX, "unknown shader did not keep conservative mask");
+    free(text);
+
+    for (unsigned gpu_vs = 0; gpu_vs < 2; gpu_vs++) {
+        load_state();
+        st.glsl_flags = flags | (gpu_vs ? R300_GLSL_GPU_VS : 0);
+        r300_state_write(&st, 0x4104, 8); /* Disable the plain-copy shortcut. */
+        r300_state_write(&st, 0x4620, 0x8040 | 3u << 11);
+        r300_state_write(&st, 0x4278, 0xaaaa); /* Interpolated colours. */
+        r300_state_write(&st, 0x4288, 0);
+        r300_state_write(&st, 0x2090, r300_reg(&st, 0x2090) & ~(3u << 3));
+        R300Arrays none = { 0 };
+        R300DrawPacket pkt;
+        CHECK(r300_draw_build(&st, &none, 0x35, immd, 49, rd, NULL, &pkt, &err),
+              "sampler packet build: %s", err ? err : "");
+        CHECK(pkt.sampler_mask_valid && pkt.sampler_mask == 8,
+              "packet lost sampler mask (GPU VS flag=%u)", gpu_vs);
+        CHECK((pkt.vs_glsl != NULL) == (gpu_vs != 0), "wrong vertex stage path");
+        r300_draw_free(&pkt);
     }
 }
 
@@ -656,6 +755,7 @@ int main(void)
     CHECK(r300_msaa_offset(592, 496, 2, 704, 4, 0) == 0x2b3400, "msaa sample 0 %x",
           r300_msaa_offset(592, 496, 2, 704, 4, 0));
     rendering_completeness();
+    sampler_masks();
     bypass_semantics();
     viewport_ports();
     draw_bounds();

@@ -10,7 +10,7 @@
  *   +0  magic 'VMXT' once finished
  *   +4  checks run            +8  failures
  *   +12 failures per op (NOPS words)
- *   +0x100 first MAXLOG failures: op, iteration, a, b, c, got, expected
+ *   +0x200 first MAXLOG failures: op, iteration, a, b, c, got, expected
  *   +0x800 benchmark: timebase ticks per op for BENCH_ITERS iterations
  *
  * Built by run.py with clang --target=powerpc-unknown-none -maltivec.
@@ -51,6 +51,9 @@ enum {
     OP_VMSUMUBM, OP_VMSUMMBM, OP_VMSUMUHM, OP_VMSUMSHM,
     OP_LVSL, OP_LVSR, OP_LVX, OP_LDU16, OP_LDU15,
     OP_VMHRADDSHS, OP_VMHADDSHS, OP_VPERM_DB, OP_DEADST_LD, OP_DEADST_CALL,
+    OP_MMIO_VEC, OP_MMIO_LVX,
+    OP_LVEBX, OP_LVEHX, OP_LVEWX, OP_STVEBX, OP_STVEHX, OP_STVEWX,
+    OP_MMIO_VEB, OP_MMIO_VEH, OP_MMIO_VEW,
     OP_ISYNC_SMC,
     OP_VADDFP, OP_VSUBFP, OP_VMAXFP, OP_VMINFP, OP_VMADDFP, OP_VNMSUBFP,
     OP_VREFP, OP_VCFSX, OP_VCFUX, OP_VCTSXS, OP_VCTUXS,
@@ -648,6 +651,110 @@ static void run_op(int op, V a, V b, V c, int sh, V *got, V *exp,
                 r.w[0] = ~e.w[0];   /* final value or interrupt count wrong */
             }
         }
+        break;
+    }
+    case OP_MMIO_VEC:
+    case OP_MMIO_LVX: {
+        /* UniNorth reads and ignored writes force the QEMU MMIO slow path. */
+        volatile uint32_t *mmio = (void *)0xf8000000u;
+        uint32_t x, y = 0;
+
+        if (op == OP_MMIO_VEC) {
+            asm volatile("vaddubm 19,%3,%4\n\tadd 20,%5,%6\n\t"
+                         "lwz %1,0(%7)\n\tstw %1,0(%7)\n\t"
+                         "add %2,20,%5\n\tvaddubm %0,19,%4"
+                         : "=v"(r.v), "=&r"(x), "=&r"(y)
+                         : "v"(a.v), "v"(b.v), "r"(a.w[0]),
+                           "r"(b.w[0]), "b"(mmio)
+                         : "v19", "r20", "memory");
+        } else {
+            asm volatile("vaddubm 19,%1,%2\n\tlvx 20,0,%3\n\t"
+                         "stvx 20,0,%3\n\tvaddubm %0,19,%2"
+                         : "=v"(r.v) : "v"(a.v), "v"(b.v), "b"(mmio)
+                         : "v19", "v20", "memory");
+        }
+        for (i = 0; i < 16; i++) {
+            e.b[i] = a.b[i] + 2 * b.b[i];
+        }
+        if (op == OP_MMIO_VEC && y != 2 * a.w[0] + b.w[0]) {
+            r.w[0] = ~e.w[0];
+        }
+        break;
+    }
+    case OP_LVEBX:
+    case OP_LVEHX:
+    case OP_LVEWX:
+    case OP_STVEBX:
+    case OP_STVEHX:
+    case OP_STVEWX:
+    case OP_MMIO_VEB:
+    case OP_MMIO_VEH:
+    case OP_MMIO_VEW: {
+        int mmio = op >= OP_MMIO_VEB;
+        int store = op >= OP_STVEBX && !mmio;
+        int size = 1 << ((op - (mmio ? OP_MMIO_VEB : OP_LVEBX)) % 3);
+        int lane = sh & ~(size - 1);
+        V mem = b, source;
+        uint8_t *p = mmio ? (void *)(0xf8000000u + sh) : mem.b + sh;
+
+        for (i = 0; i < 16; i++) {
+            e.b[i] = a.b[i] + c.b[i];
+        }
+#define ELEMENT_LOAD(insn) \
+        asm volatile("vaddubm %0,%1,%2\n\t" insn " %0,0,%3\n\t" \
+                     "vaddubm %0,%0,%1" \
+                     : "=&v"(r.v) : "v"(a.v), "v"(c.v), "b"(p), \
+                       "m"(mem) : "memory")
+#define ELEMENT_STORE(insn) \
+        asm volatile("vaddubm %0,%2,%3\n\t" insn " %0,0,%4" \
+                     : "=&v"(source.v), "+m"(mem) \
+                     : "v"(a.v), "v"(c.v), "b"(p) : "memory")
+        if (store) {
+            /* A computed vector must reach the dynamic lane read. */
+            switch (size) {
+            case 1: ELEMENT_STORE("stvebx"); break;
+            case 2: ELEMENT_STORE("stvehx"); break;
+            case 4: ELEMENT_STORE("stvewx"); break;
+            }
+            r = mem;
+            for (i = 0; i < 16; i++) {
+                if (source.b[i] != e.b[i]) {
+                    r.b[i] ^= 1;
+                }
+                if (i < lane || i >= lane + size) {
+                    e.b[i] = b.b[i];
+                }
+            }
+        } else {
+            switch (size) {
+            case 1: ELEMENT_LOAD("lvebx"); break;
+            case 2: ELEMENT_LOAD("lvehx"); break;
+            case 4: ELEMENT_LOAD("lvewx"); break;
+            }
+            if (mmio) {
+                /* Scalar accesses independently check MMIO width/address. */
+                uintptr_t aligned = (uintptr_t)p & ~(uintptr_t)(size - 1);
+                switch (size) {
+                case 1: e.b[lane] = *(volatile uint8_t *)aligned; break;
+                case 2: e.h[lane / 2] = *(volatile uint16_t *)aligned; break;
+                case 4: e.w[lane / 4] = *(volatile uint32_t *)aligned; break;
+                }
+                switch (size) {
+                case 1: ELEMENT_STORE("stvebx"); break;
+                case 2: ELEMENT_STORE("stvehx"); break;
+                case 4: ELEMENT_STORE("stvewx"); break;
+                }
+            } else {
+                for (i = lane; i < lane + size; i++) {
+                    e.b[i] = b.b[i];
+                }
+            }
+            for (i = 0; i < 16; i++) {
+                e.b[i] += a.b[i];
+            }
+        }
+#undef ELEMENT_LOAD
+#undef ELEMENT_STORE
         break;
     }
     case OP_ISYNC_SMC: {
@@ -1430,6 +1537,12 @@ static void scalar_sraw(uint32_t *seed)
 
 int main(void)
 {
+    static const V concat_edges[] = {
+        { .w = { 0, 0, 0, 0 } },
+        { .w = { ~0u, ~0u, ~0u, ~0u } },
+        { .w = { 0x01234567, 0x89abcdef, 0xfedcba98, 0x76543210 } },
+        { .w = { 0x01234567, 0x89abcdef, 0x01234567, 0x89abcdef } },
+    };
     uint32_t seed = 0x2545f491;
     uint32_t checks = 0, fails = 0, logged = 0;
     int op, it, i;
@@ -1450,6 +1563,9 @@ int main(void)
             V got, exp;
             int gs, es, bad = 0;
 
+            if (op == OP_LVX && it < 4) {
+                a = b = concat_edges[it];
+            }
             if (op == OP_VMHRADDSHS || op == OP_VMHADDSHS) {
                 a = rand_hvec(&seed, (it & 7) == 0);
                 b = rand_hvec(&seed, (it & 7) == 0);
@@ -1475,7 +1591,7 @@ int main(void)
                 fails++;
                 res[3 + op]++;
                 if (logged < MAXLOG) {
-                    volatile uint32_t *p = res + 0x40 + logged * 24;
+                    volatile uint32_t *p = res + 0x80 + logged * 24;
                     p[0] = op;
                     p[1] = it | gs << 16 | es << 24;
                     log_vec(p + 4, a);

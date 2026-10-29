@@ -1516,12 +1516,12 @@ static void us_emit_target(R300Sb *sb, unsigned k, int src)
         k, src, k, k, k, k, k, k, k, k, k, k);
 }
 
-char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
-                      uint32_t flags, const char **err)
+static char *us_to_glsl(const R300State *st, const R300FSDesc *desc,
+                        uint32_t flags, uint32_t *sampler_mask, const char **err)
 {
     USNode nodes[4];
     unsigned n = us_nodes(st, nodes);
-    uint32_t units = 0;
+    uint32_t units = 0, samplers = 0;
     R300Sb body, sb;
     bool writes_w;
     uint32_t written = us_targets_written(st, &writes_w);
@@ -1614,6 +1614,9 @@ char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
     /* Texture units: unit k at binding R300_BIND_TEX0 + k. */
     for (unsigned k = 0; k < R300_NUM_TEX_UNITS; k++) {
         if (units & (1u << k)) {
+            if (!unit_is_raw(st, k) || !(flags & R300_GLSL_VRAM_SSBO)) {
+                samplers |= 1u << k;
+            }
             static const char *dims[3] = { "sampler2D", "sampler3D", "samplerCube" };
             if (unit_is_raw(st, k)) {
                 if (flags & R300_GLSL_VRAM_SSBO) {
@@ -1783,7 +1786,16 @@ char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
     r300_sb_free(&cbout);
     r300_sb_free(&skip);
     r300_sb_free(&body);
+    if (sampler_mask) {
+        *sampler_mask = samplers;
+    }
     return r300_sb_steal(&sb);
+}
+
+char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
+                      uint32_t flags, const char **err)
+{
+    return us_to_glsl(st, desc, flags, NULL, err);
 }
 
 char *r300_us_disasm(const R300State *st)
@@ -1824,7 +1836,7 @@ char *r300_us_disasm(const R300State *st)
  * CPU's time in Chess.
  */
 typedef struct USMemo {
-    uint32_t flags, id;
+    uint32_t flags, id, sampler_mask;
     bool color_compat;
     R300FSDesc desc;
     unsigned n;
@@ -1855,7 +1867,8 @@ static bool us_memo_match(const USMemo *m, const R300State *st,
 }
 
 char *r300_us_glsl_cached(const R300State *st, const R300FSDesc *desc,
-                          uint32_t flags, uint32_t *id, const char **err)
+                          uint32_t flags, uint32_t *id, uint32_t *sampler_mask,
+                          const char **err)
 {
     for (unsigned k = 0; k < US_MEMO_SLOTS; k++) {
         if (us_memo_match(&us_memo[k], st, desc, flags)) {
@@ -1863,6 +1876,9 @@ char *r300_us_glsl_cached(const R300State *st, const R300FSDesc *desc,
             memmove(&us_memo[1], &us_memo[0], k * sizeof(USMemo));
             us_memo[0] = hit;
             *id = hit.id;
+            if (sampler_mask) {
+                *sampler_mask = hit.sampler_mask;
+            }
             *err = NULL;
             return strdup(flags & R300_GLSL_TEXT_BY_ID ? "" : hit.glsl);
         }
@@ -1872,7 +1888,11 @@ char *r300_us_glsl_cached(const R300State *st, const R300FSDesc *desc,
     us_rec.n = 0;
     us_rec.overflow = false;
     us_rec.on = true;
-    char *glsl = r300_us_to_glsl(st, desc, flags, err);
+    uint32_t mask = UINT32_MAX;
+    char *glsl = us_to_glsl(st, desc, flags, &mask, err);
+    if (sampler_mask) {
+        *sampler_mask = mask;
+    }
     us_rec.on = false;
     *id = 0;
     if (!glsl || us_rec.overflow) {
@@ -1886,6 +1906,7 @@ char *r300_us_glsl_cached(const R300State *st, const R300FSDesc *desc,
     memmove(&us_memo[1], &us_memo[0], (US_MEMO_SLOTS - 1) * sizeof(USMemo));
     USMemo *m = &us_memo[0];
     m->flags = flags;
+    m->sampler_mask = mask;
     m->color_compat = st->morphos_color_compat && st->card_bytes;
     m->desc = *desc;
     m->n = us_rec.n;
