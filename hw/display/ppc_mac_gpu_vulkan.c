@@ -57,6 +57,7 @@
 #include "system/system.h"
 #include "system/runstate.h"
 #include "qemu/main-loop.h"
+#include "system/cpus.h"
 
 #include <vulkan/vulkan.h>
 
@@ -3034,7 +3035,7 @@ static bool vk_wait_busy_r200(void *opaque, uint32_t us)
     if (!newest) {
         return false;
     }
-    if (us && bql_locked()) {
+    if (us && bql_locked() && qemu_in_vcpu_thread()) {
         uint32_t seq = newest->seq;
         int64_t end = g_get_monotonic_time() + us;
 
