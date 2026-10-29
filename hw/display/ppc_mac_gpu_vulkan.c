@@ -4255,6 +4255,8 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         if (td->bound && td->kind == R300_TEXK_RAW && td->host_data) {
             uint32_t *dw = (uint32_t *)(auxp + u.tex_addr[t][0]);
             memcpy(dw, td->host_data, td->size_bytes);
+            memset((uint8_t *)dw + td->size_bytes, 0,
+                   ROUND_UP(td->size_bytes, 4) - td->size_bytes);
             /* GART dwords reversed to VRAM's side (r300_tex_raw_bpp) */
             if (!td->card_bytes) {
                 for (uint32_t i = 0; i < ROUND_UP(td->size_bytes, 4) / 4; i++) {
