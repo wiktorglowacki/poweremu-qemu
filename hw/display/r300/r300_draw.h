@@ -186,6 +186,7 @@ typedef struct R300DrawPacket {
     uint32_t vs_in_vecs;
     uint32_t *vs_idx;
     struct R300VSUniforms *vs_u;
+    uint32_t vs_nconst;
     R300FSUniforms uniforms;
     R300TexDesc tex[R300_NUM_TEX_UNITS];
 
@@ -311,6 +312,7 @@ uint32_t r300_assemble_prov(unsigned prim, uint32_t n, uint32_t *list,
                             uint32_t *cls, R300Prov *prov);
 
 void r300_draw_free(R300DrawPacket *pkt);
+char *r300_vs_glsl_by_id(uint32_t id);
 
 /* Conservative pixel bounds, intersected with the hardware scissor. */
 void r300_draw_bounds(const R300DrawPacket *pkt, uint32_t bounds[4]);

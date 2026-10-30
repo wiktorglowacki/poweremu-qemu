@@ -3586,9 +3586,17 @@ static VkShaderModule vk_module(VkProg *pg, const char *glsl, R300Stage stage, b
 static VkShaderModule vk_vs_module(const char *vs_glsl, uint32_t vs_id)
 {
     gpointer m;
+    g_autofree char *fetched = NULL;
     if (vs_id && g_hash_table_lookup_extended(V.vs_mods_by_id,
                                               GUINT_TO_POINTER(vs_id), NULL, &m)) {
         return (VkShaderModule)m;
+    }
+    if (!*vs_glsl) {
+        fetched = r300_vs_glsl_by_id(vs_id);
+        if (!fetched) {
+            return VK_NULL_HANDLE;
+        }
+        vs_glsl = fetched;
     }
     if (g_hash_table_lookup_extended(V.vs_mods, vs_glsl, NULL, &m)) {
         if (vs_id) {
@@ -4550,7 +4558,10 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         }
         memcpy(vp, pkt->vs_in, (size_t)pkt->vs_in_vecs * 16);
         memcpy(ip, pkt->vs_idx, (size_t)pkt->num_verts * 4);
-        memcpy(vup, pkt->vs_u, sizeof(R300VSUniforms));
+        uint32_t nc = pkt->vs_nconst ? MIN(pkt->vs_nconst, 256u) : 256u;
+        size_t tail = offsetof(R300VSUniforms, ucp);
+        memcpy(vup, pkt->vs_u->c, nc * sizeof(pkt->vs_u->c[0]));
+        memcpy((uint8_t *)vup + tail, (uint8_t *)pkt->vs_u + tail, sizeof(R300VSUniforms) - tail);
     } else {
         memcpy(vp, pkt->verts, (size_t)nv * sizeof(R300Vertex));
     }

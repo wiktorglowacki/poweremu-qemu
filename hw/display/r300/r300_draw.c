@@ -7,6 +7,7 @@
 #include "r300_draw.h"
 
 #include <math.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -1290,6 +1291,27 @@ typedef struct GpuVs {
 
 #define GPU_VS_SLOTS 256
 static GpuVs gpu_vs_memo[GPU_VS_SLOTS];     /* most recently used first */
+
+char *r300_vs_glsl_by_id(uint32_t id)
+{
+    for (unsigned k = 0; k < GPU_VS_SLOTS; k++) {
+        if (gpu_vs_memo[k].glsl && gpu_vs_memo[k].id == id) {
+            return strdup(gpu_vs_memo[k].glsl);
+        }
+    }
+    return NULL;
+}
+
+static bool gpu_vs_lean(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_VS_LEAN");
+        on = !(e && !strcmp(e, "0"));
+    }
+    return on;
+}
 static uint32_t gpu_vs_next_id = 1;
 
 static void key_push(uint32_t **k, unsigned *n, unsigned *cap, uint32_t v)
@@ -1572,8 +1594,13 @@ static bool gpu_vs_build(const R300State *st, Fetch *f, const R300PVSProgram *pr
         list[k] = pos[list[k]];
     }
 
-    R300VSUniforms *u = calloc(1, sizeof(*u));
-    memcpy(u->c, prog->consts, sizeof(u->c));
+    bool lean = gpu_vs_lean();
+    uint32_t nc = lean && prog->max_const >= 0 && prog->max_const < 256 ? prog->max_const + 1 : 256;
+    R300VSUniforms *u = lean ? malloc(sizeof(*u)) : calloc(1, sizeof(*u));
+    memcpy(u->c, prog->consts, nc * sizeof(u->c[0]));
+    if (lean) {
+        memset(u->ucp, 0, sizeof(*u) - offsetof(R300VSUniforms, ucp));
+    }
     for (int k = 0; k < 6; k++) {
         memcpy(u->ucp[k], &st->pvs_mem[(R300_PVS_UCP_START + k) * 4], sizeof(u->ucp[k]));
     }
@@ -1592,7 +1619,8 @@ static bool gpu_vs_build(const R300State *st, Fetch *f, const R300PVSProgram *pr
     u->fogp[1] = bits_to_float(r300_reg(st, GA_FOG_OFFSET));
     u->info[0] = stride;
 
-    pkt->vs_glsl = strdup(vs->glsl);
+    pkt->vs_glsl = strdup(lean && (st->glsl_flags & R300_GLSL_TEXT_BY_ID) ? "" : vs->glsl);
+    pkt->vs_nconst = nc;
     pkt->vs_id = vs->id;
     pkt->vs_in = in;
     pkt->vs_in_vecs = nu * stride;
