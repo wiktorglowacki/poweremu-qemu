@@ -38,6 +38,8 @@ void tlb_unprotect_code(ram_addr_t ram_addr);
  * DMA writes still invalidate through the DIRTY_MEMORY_CODE bitmap.
  */
 extern bool tcg_smc_by_icbi;
+extern void (*tlb_flush_notify)(CPUState *cpu, uint16_t idxmap, vaddr addr,
+                                vaddr len, unsigned bits);
 
 #ifndef CONFIG_USER_ONLY
 void tlb_reset_dirty(CPUState *cpu, ram_addr_t start1, ram_addr_t length);

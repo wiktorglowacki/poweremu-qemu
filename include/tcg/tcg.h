@@ -453,6 +453,7 @@ extern bool tcg_use_softmmu;
 #else
 #define tcg_use_softmmu  true
 #endif
+extern uintptr_t tcg_fastmem_base[16];
 
 extern __thread TCGContext *tcg_ctx;
 extern const void *tcg_code_gen_epilogue;

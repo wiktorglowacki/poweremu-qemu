@@ -243,6 +243,7 @@ static TCGAtomAlign atom_and_align_for_opc(TCGContext *s, MemOp opc,
 #ifdef CONFIG_USER_ONLY
 bool tcg_use_softmmu;
 #endif
+uintptr_t tcg_fastmem_base[16];
 
 TCGContext tcg_init_ctx;
 __thread TCGContext *tcg_ctx;

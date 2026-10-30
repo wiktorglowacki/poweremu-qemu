@@ -113,6 +113,8 @@ typedef enum MemOp {
     MO_ATOM_NONE          = 5 << MO_ATOM_SHIFT,
     MO_ATOM_MASK          = 7 << MO_ATOM_SHIFT,
 
+    MO_NOFASTMEM          = 1 << 11,
+
     /* Combinations of the above, for ease of use.  */
     MO_UB    = MO_8,
     MO_UW    = MO_16,

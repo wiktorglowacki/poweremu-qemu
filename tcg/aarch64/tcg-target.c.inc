@@ -1807,6 +1807,28 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
                                    s_bits == MO_128);
     a_mask = (1 << h->aa.align) - 1;
 
+    if (tcg_use_softmmu && tcg_fastmem_base[get_mmuidx(oi)] &&
+        !(opc & MO_NOFASTMEM)) {
+        if (a_mask) {
+            ldst = new_ldst_label(s);
+            ldst->is_ld = is_ld;
+            ldst->oi = oi;
+            ldst->addr_reg = addr_reg;
+#ifdef TCG_TARGET_LDST_CLOBBER
+            ldst_record_live(s, ldst);
+#endif
+            tcg_out_logicali(s, I3404_ANDSI, 0, TCG_REG_XZR, addr_reg, a_mask);
+            ldst->label_ptr[0] = s->code_ptr;
+            tcg_out_insn(s, 3202, B_C, TCG_COND_NE, 0);
+        }
+        tcg_out_movi(s, TCG_TYPE_PTR, TCG_REG_TMP1,
+                     tcg_fastmem_base[get_mmuidx(oi)]);
+        h->base = TCG_REG_TMP1;
+        h->index = addr_reg;
+        h->index_ext = addr_type;
+        return ldst;
+    }
+
     if (tcg_use_softmmu) {
         unsigned s_mask = (1u << s_bits) - 1;
         unsigned mem_index = get_mmuidx(oi);

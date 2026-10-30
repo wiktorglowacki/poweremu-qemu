@@ -2236,6 +2236,37 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
     h->aa = atom_and_align_for_opc(s, opc, MO_ATOM_IFALIGN, s_bits == MO_128);
     a_mask = (1 << h->aa.align) - 1;
 
+    if (tcg_use_softmmu && tcg_fastmem_base[get_mmuidx(oi)] &&
+        !(opc & MO_NOFASTMEM)) {
+        if (a_mask) {
+            int jcc;
+
+            ldst = new_ldst_label(s);
+            ldst->is_ld = is_ld;
+            ldst->oi = oi;
+            ldst->addr_reg = addr;
+#ifdef TCG_TARGET_LDST_CLOBBER
+            ldst_record_live(s, ldst);
+#endif
+            jcc = tcg_out_cmp(s, TCG_COND_TSTNE, addr, a_mask, true, false);
+            tcg_out_opc(s, OPC_JCC_long + jcc, 0, 0, 0);
+            ldst->label_ptr[0] = s->code_ptr;
+            s->code_ptr += 4;
+        }
+        if (s->addr_type == TCG_TYPE_I32) {
+            tcg_out_ext32u(s, TCG_REG_L0, addr);
+        } else {
+            tcg_out_mov(s, TCG_TYPE_I64, TCG_REG_L0, addr);
+        }
+        tcg_out_movi(s, TCG_TYPE_PTR, TCG_REG_L1,
+                     tcg_fastmem_base[get_mmuidx(oi)]);
+        h->base = TCG_REG_L1;
+        h->index = TCG_REG_L0;
+        h->ofs = 0;
+        h->seg = 0;
+        return ldst;
+    }
+
     if (tcg_use_softmmu) {
         int cmp_ofs = is_ld ? offsetof(CPUTLBEntry, addr_read)
                             : offsetof(CPUTLBEntry, addr_write);

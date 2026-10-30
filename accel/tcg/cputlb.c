@@ -380,6 +380,9 @@ static void flush_all_helper(CPUState *src, run_on_cpu_func fn,
     }
 }
 
+void (*tlb_flush_notify)(CPUState *cpu, uint16_t idxmap, vaddr addr,
+                         vaddr len, unsigned bits);
+
 static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
 {
     uint16_t asked = data.host_int;
@@ -387,6 +390,9 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
     int64_t now = get_clock_realtime();
 
     assert_cpu_is_self(cpu);
+    if (tlb_flush_notify) {
+        tlb_flush_notify(cpu, asked, 0, 0, 0);
+    }
 
     tlb_debug("mmu_idx:0x%04" PRIx16 "\n", asked);
 
@@ -561,6 +567,9 @@ static void tlb_flush_page_by_mmuidx_async_0(CPUState *cpu,
     int mmu_idx;
 
     assert_cpu_is_self(cpu);
+    if (tlb_flush_notify) {
+        tlb_flush_notify(cpu, idxmap, addr, TARGET_PAGE_SIZE, 64);
+    }
 
     tlb_debug("page addr: %016" VADDR_PRIx " mmu_map:0x%x\n", addr, idxmap);
 
@@ -641,6 +650,9 @@ void tlb_flush_data_pages_by_mmuidx(CPUState *cpu, vaddr addr, vaddr npages,
 {
     assert_cpu_is_self(cpu);
     addr &= TARGET_PAGE_MASK;
+    if (tlb_flush_notify) {
+        tlb_flush_notify(cpu, idxmap, addr, npages * TARGET_PAGE_SIZE, 64);
+    }
 
     qemu_spin_lock(&cpu->neg.tlb.c.lock);
     for (vaddr i = 0; i < npages; i++) {
@@ -774,6 +786,9 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
 
     tlb_debug("range: %016" VADDR_PRIx "/%u+%016" VADDR_PRIx " mmu_map:0x%x\n",
               d.addr, d.bits, d.len, d.idxmap);
+    if (tlb_flush_notify) {
+        tlb_flush_notify(cpu, d.idxmap, d.addr, d.len, d.bits);
+    }
 
     qemu_spin_lock(&cpu->neg.tlb.c.lock);
     for (mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {

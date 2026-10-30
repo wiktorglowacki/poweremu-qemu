@@ -224,6 +224,7 @@ struct DisasContext {
     int access_type;
     TCGv_ptr ldst_host;
     int ldst_off;
+    bool fastmem;
     /* Translation flags */
     MemOp default_tcg_memop_mask;
 #if defined(TARGET_PPC64)
@@ -2793,6 +2794,179 @@ static void gen_host_ldst_i64(DisasContext *ctx, TCGv_i64 v, MemOp mop,
 #define gen_host_ldst_tl gen_host_ldst_i32
 #else
 #define gen_host_ldst_tl gen_host_ldst_i64
+#endif
+
+#if !defined(CONFIG_USER_ONLY)
+#include <sys/mman.h>
+#include "hw/boards.h"
+#if defined(__linux__)
+#include <ucontext.h>
+#endif
+
+static int fastmem_fd;
+static uint64_t fastmem_ram_size;
+static long fastmem_pg;
+#define FASTMEM_SLOW_BITS 13
+static target_ulong fastmem_slow[1 << FASTMEM_SLOW_BITS];
+
+static target_ulong *fastmem_slow_slot(target_ulong pc)
+{
+    return &fastmem_slow[(pc >> 2 ^ pc >> (2 + FASTMEM_SLOW_BITS)) &
+                         ((1 << FASTMEM_SLOW_BITS) - 1)];
+}
+
+static void fastmem_wipe(uint16_t idxmap, vaddr addr, vaddr len)
+{
+    for (int i = 0; i < NB_MMU_MODES; i++) {
+        uintptr_t a = tcg_fastmem_base[i];
+        size_t l = 1ull << 32;
+
+        if (!((idxmap >> i) & 1) || !a) {
+            continue;
+        }
+        if (len) {
+            a += addr & ~(vaddr)(fastmem_pg - 1);
+            l = ROUND_UP(len + (addr & (fastmem_pg - 1)), fastmem_pg);
+        }
+        mmap((void *)a, l, PROT_NONE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+    }
+}
+
+static void fastmem_flush_notify(CPUState *cs, uint16_t idxmap, vaddr addr,
+                                 vaddr len, unsigned bits)
+{
+    if (!len || bits >= 32) {
+        fastmem_wipe(idxmap, addr, len);
+        return;
+    }
+    for (vaddr a = addr & MAKE_64BIT_MASK(0, bits); a < (1ull << 32);
+         a += 1ull << bits) {
+        fastmem_wipe(idxmap, a, len);
+    }
+}
+
+static bool fastmem_map(CPUState *cs, int idx, vaddr ea, bool write)
+{
+    PowerPCCPU *cpu = POWERPC_CPU(cs);
+    vaddr g = ea & ~(vaddr)(fastmem_pg - 1);
+    hwaddr raddr = 0;
+    int prot = 0;
+
+    for (vaddr p = g; p < g + fastmem_pg; p += TARGET_PAGE_SIZE) {
+        hwaddr r;
+        int ps, pr;
+
+        if (!ppc_xlate(cpu, p, write ? MMU_DATA_STORE : MMU_DATA_LOAD,
+                       &r, &ps, &pr, idx, false) ||
+            r >= fastmem_ram_size) {
+            return false;
+        }
+        if (p == g) {
+            raddr = r;
+            prot = pr;
+            if ((raddr & (fastmem_pg - 1)) || !(prot & PAGE_READ) ||
+                (write && !(prot & PAGE_WRITE))) {
+                return false;
+            }
+        } else if (r != raddr + (p - g) || pr != prot) {
+            return false;
+        }
+    }
+    return mmap((void *)(tcg_fastmem_base[idx] + g), fastmem_pg,
+                PROT_READ | (prot & PAGE_WRITE ? PROT_WRITE : 0),
+                MAP_SHARED | MAP_FIXED, fastmem_fd, raddr) != MAP_FAILED;
+}
+
+static struct sigaction fastmem_old[2];
+
+static void fastmem_fault(int sig, siginfo_t *si, void *puc)
+{
+    ucontext_t *uc = puc;
+    CPUState *cs = current_cpu;
+    TranslationBlock *tb = NULL;
+    uintptr_t addr = (uintptr_t)si->si_addr;
+    target_ulong nip;
+    int idx;
+#if defined(__linux__) && defined(__x86_64__)
+    uintptr_t pc = uc->uc_mcontext.gregs[REG_RIP];
+    bool write = uc->uc_mcontext.gregs[REG_ERR] & 2;
+#elif defined(__APPLE__) && defined(__aarch64__)
+    uintptr_t pc = uc->uc_mcontext->__ss.__pc;
+    bool write = (uc->uc_mcontext->__es.__esr >> 6) & 1;
+#else
+    uintptr_t pc = 0;
+    bool write = false;
+#endif
+
+    for (idx = 0; idx < NB_MMU_MODES; idx++) {
+        if (tcg_fastmem_base[idx] &&
+            addr - tcg_fastmem_base[idx] < (1ull << 32)) {
+            break;
+        }
+    }
+    if (pc && cs && idx < NB_MMU_MODES) {
+        tb = tcg_tb_lookup(pc);
+    }
+    if (!tb) {
+        struct sigaction *old = &fastmem_old[sig == SIGBUS];
+
+        if (old->sa_flags & SA_SIGINFO) {
+            old->sa_sigaction(sig, si, puc);
+        } else if (old->sa_handler != SIG_IGN && old->sa_handler != SIG_DFL) {
+            old->sa_handler(sig);
+        } else {
+            sigaction(sig, old, NULL);
+        }
+        return;
+    }
+    cpu_restore_state(cs, pc + 2);
+    if (!fastmem_map(cs, idx, addr - tcg_fastmem_base[idx], write)) {
+        nip = cpu_env(cs)->nip;
+        qatomic_set(fastmem_slow_slot(nip), ~nip);
+        tb_phys_invalidate(tb, -1);
+    }
+    sigprocmask(SIG_SETMASK, &uc->uc_sigmask, NULL);
+    cpu_loop_exit_noexc(cs);
+}
+
+static bool ppc_fastmem_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("PPC_FASTMEM");
+        MachineState *ms = MACHINE(qdev_get_machine());
+        int fd = ms->ram ? memory_region_get_fd(ms->ram) : -1;
+
+        on = 0;
+#if defined(__APPLE__)
+        fd = -1;
+#endif
+        if (e && e[0] == '1' && tcg_smc_by_icbi && fd >= 0) {
+            struct sigaction sa = { .sa_sigaction = fastmem_fault,
+                                    .sa_flags = SA_SIGINFO };
+
+            for (int i = 0; i < NB_MMU_MODES; i += 4) {
+                void *w = mmap(NULL, 1ull << 32, PROT_NONE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                               -1, 0);
+                tcg_fastmem_base[i] = w == MAP_FAILED ? 0 : (uintptr_t)w;
+            }
+            fastmem_fd = fd;
+            fastmem_ram_size = ms->ram_size;
+            fastmem_pg = qemu_real_host_page_size();
+            tlb_flush_notify = fastmem_flush_notify;
+            sigaction(SIGSEGV, &sa, &fastmem_old[0]);
+            sigaction(SIGBUS, &sa, &fastmem_old[1]);
+            on = 1;
+        }
+    }
+    return on;
+}
+
+#else
+static bool ppc_fastmem_on(void) { return false; }
 #endif
 
 /***                             Integer load                              ***/
@@ -6814,6 +6988,8 @@ static void ppc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
         /* As ppc_env_mmu_index(): cs_base is the TLB slot. */
         ctx->mem_idx |= ctx->base.tb->cs_base << 2;
     }
+    ctx->fastmem = !ctx->base.plugin_enabled && ppc_fastmem_on() &&
+                   tcg_fastmem_base[ctx->mem_idx];
     ctx->dr = (hflags >> HFLAGS_DR) & 1;
     ctx->hv = (hflags >> HFLAGS_HV) & 1;
     ctx->insns_flags = env->insns_flags;
@@ -6885,6 +7061,12 @@ static void ppc_decode_insn(DisasContextBase *dcbase, CPUState *cs)
               ctx->base.pc_next, ctx->mem_idx, (int)msr_ir);
 
     ctx->cia = pc = ctx->base.pc_next;
+#if !defined(CONFIG_USER_ONLY)
+    ctx->default_tcg_memop_mask &= ~MO_NOFASTMEM;
+    if (ctx->fastmem && qatomic_read(fastmem_slow_slot(pc)) == ~pc) {
+        ctx->default_tcg_memop_mask |= MO_NOFASTMEM;
+    }
+#endif
     insn = translator_ldl_swap(env, dcbase, pc, need_byteswap(ctx));
     ctx->base.pc_next = pc += 4;
 
@@ -7098,7 +7280,7 @@ static bool ppc_ldst_group(DisasContext *ctx, CPUState *cs)
     TCGLabel *slow, *done;
     LdstGroup g = { 0 };
 
-    if (!ldst_group_on() || ctx->base.plugin_enabled ||
+    if (!ldst_group_on() || ctx->base.plugin_enabled || ctx->fastmem ||
         !ldst_group_scan(ctx, cpu_env(cs), &g)) {
         return false;
     }
