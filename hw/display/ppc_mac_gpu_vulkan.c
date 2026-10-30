@@ -1289,7 +1289,7 @@ static void vk_page_cpu(uint64_t p)
     }
 }
 
-static void vk_harvest(void)
+static void vk_harvest_ex(bool draw)
 {
     static int scan = -1;
 
@@ -1302,7 +1302,7 @@ static void vk_harvest(void)
     if (scan) {
         bitmap_zero(V.dirty_bm, V.npages);
     }
-    if (!V.dirty_fn(V.dirty_arg, V.dirty_bm, V.npages) && !scan) {
+    if (!V.dirty_fn(V.dirty_arg, V.dirty_bm, V.npages, draw && !scan) && !scan) {
         return;
     }
     uint64_t p = find_first_bit(V.dirty_bm, V.npages);
@@ -1314,6 +1314,11 @@ static void vk_harvest(void)
         vk_page_cpu(p);
     }
     bitmap_zero(V.dirty_bm, V.npages);
+}
+
+static void vk_harvest(void)
+{
+    vk_harvest_ex(false);
 }
 
 /* PPCGPU_VK_CPU_OWNER=0: an exact device write makes its whole pages newer. */
@@ -4274,7 +4279,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         want_z = false;
     }
 
-    vk_harvest();
+    vk_harvest_ex(true);
 
     /*
      * Textures whose bytes the CPU reads (rebuilt ones, and anything in

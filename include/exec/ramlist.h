@@ -52,6 +52,7 @@ typedef struct RAMList {
     DirtyMemoryBlocks *dirty_memory[DIRTY_MEMORY_NUM];
     unsigned int num_dirty_blocks;
     uint32_t version;
+    unsigned int vga_dirty_gen;
     QLIST_HEAD(, RAMBlockNotifier) ramblock_notifiers;
 } RAMList;
 extern RAMList ram_list;

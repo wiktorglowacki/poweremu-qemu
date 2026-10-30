@@ -340,6 +340,7 @@ static inline void cpu_physical_memory_set_dirty_range(ram_addr_t start,
             if (unlikely(mask & (1 << DIRTY_MEMORY_VGA))) {
                 bitmap_set_atomic(blocks[DIRTY_MEMORY_VGA]->blocks[idx],
                                   offset, next - page);
+                qatomic_inc(&ram_list.vga_dirty_gen);
             }
             if (unlikely(mask & (1 << DIRTY_MEMORY_CODE))) {
                 bitmap_set_atomic(blocks[DIRTY_MEMORY_CODE]->blocks[idx],

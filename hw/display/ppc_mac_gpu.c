@@ -40,6 +40,7 @@
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "exec/address-spaces.h"
+#include "exec/ramlist.h"
 #include "hw/display/ppc_mac_gpu.h"
 #include "ppc_mac_gpu_3d_regs.h"
 #include "ppc_mac_gpu_renderer.h"
@@ -15157,10 +15158,21 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
  * marks with memory_region_set_dirty).
  */
 static bool ppc_mac_gpu_vram_dirty(void *arg, unsigned long *bitmap,
-                                   uint64_t npages)
+                                   uint64_t npages, bool draw)
 {
     PPCMacGPUState *s = arg;
     const uint64_t pg = PPC_MAC_GPU_DIRTY_PAGE, chunk = 256 * pg;
+    static int always = -1;
+    static unsigned seen;
+    unsigned gen = qatomic_load_acquire(&ram_list.vga_dirty_gen);
+
+    if (always < 0) {
+        always = g_strcmp0(getenv("PPCGPU_VK_HARVEST_ALWAYS"), "1") == 0;
+    }
+    if (draw && !always && gen == seen) {
+        return false;
+    }
+    seen = gen;
 
     /*
      * The renderer asks before every draw.  Snapshotting and clearing the

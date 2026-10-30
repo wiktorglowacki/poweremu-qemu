@@ -32,7 +32,7 @@ struct R300DrawPacket;     /* hw/display/r300/r300_draw.h */
  */
 #define PPC_MAC_GPU_DIRTY_PAGE 4096
 typedef bool (*PPCMacGPUDirtyFn)(void *arg, unsigned long *bitmap,
-                                 uint64_t npages);
+                                 uint64_t npages, bool draw);
 
 /*
  * Blit operation descriptor.
