@@ -1809,7 +1809,7 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
 
     if (tcg_use_softmmu && tcg_fastmem_base[get_mmuidx(oi)] &&
         !(opc & MO_NOFASTMEM)) {
-        if (a_mask) {
+        if (a_mask || (!is_ld && s_bits)) {
             ldst = new_ldst_label(s);
             ldst->is_ld = is_ld;
             ldst->oi = oi;
@@ -1817,7 +1817,17 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
 #ifdef TCG_TARGET_LDST_CLOBBER
             ldst_record_live(s, ldst);
 #endif
-            tcg_out_logicali(s, I3404_ANDSI, 0, TCG_REG_XZR, addr_reg, a_mask);
+            if (a_mask) {
+                tcg_out_logicali(s, I3404_ANDSI, 0, TCG_REG_XZR, addr_reg,
+                                 a_mask);
+            } else {
+                tcg_out_insn(s, 3401, ADDI, TCG_TYPE_I32, TCG_REG_TMP0,
+                             addr_reg, (1 << s_bits) - 1);
+                tcg_out_insn(s, 3510, EOR, TCG_TYPE_I32, TCG_REG_TMP0,
+                             TCG_REG_TMP0, addr_reg);
+                tcg_out_logicali(s, I3404_ANDSI, 0, TCG_REG_XZR, TCG_REG_TMP0,
+                                 1 << s->page_bits);
+            }
             ldst->label_ptr[0] = s->code_ptr;
             tcg_out_insn(s, 3202, B_C, TCG_COND_NE, 0);
         }
