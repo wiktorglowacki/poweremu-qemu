@@ -297,6 +297,15 @@ static struct {
     VkImg *pass_img[VK_MAX_ATT];
     bool pass_z;                /* last attachment is the depth buffer */
     bool pass_z16;
+    struct {
+        VkPipeline pipe;
+        VkBuffer ib;
+        bool vp_ok, z_ok, bc_ok;
+        VkViewport vp;
+        VkRect2D sc;
+        uint32_t z[3];
+        float bc[4];
+    } dyn;
 
     VkImg img[VK_MAX_IMG];
     uint16_t img_head[1024];
@@ -4725,6 +4734,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             .renderArea = { { 0, 0 }, { fbw, fbh } },
         };
         vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+        memset(&V.dyn, 0, sizeof(V.dyn));
         for (uint32_t k = 0; k < natt; k++) {
             att[k]->sp_ok = false;
         }
@@ -4768,8 +4778,14 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     }
     V.stat_rov += rov;
 
-    if (hz) {
+    static int dyn_skip = -1;
+    if (dyn_skip < 0) {
+        dyn_skip = g_strcmp0(getenv("PPCGPU_VK_DYN_SKIP"), "0") != 0;
+    }
+    if (hz && !(dyn_skip && V.dyn.z_ok && !memcmp(V.dyn.z, u.zinfo, sizeof(V.dyn.z)))) {
         VkPipelineDepthStencilStateCreateInfo zs = vk_zstate(u.zinfo[0], u.zinfo[1], u.zinfo[2]);
+        memcpy(V.dyn.z, u.zinfo, sizeof(V.dyn.z));
+        V.dyn.z_ok = true;
         if (V.eds) {
             V.vkCmdSetDepthTestEnableEXT(cb, zs.depthTestEnable);
             V.vkCmdSetDepthWriteEnableEXT(cb, zs.depthWriteEnable);
@@ -4783,10 +4799,12 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, zs.front.compareMask);
         vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, zs.front.writeMask);
         vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, zs.front.reference);
-        V.stat_hwz++;
     }
-    if (pk.cba.blendEnable) {
+    V.stat_hwz += hz;
+    if (pk.cba.blendEnable && !(dyn_skip && V.dyn.bc_ok && !memcmp(V.dyn.bc, bc, sizeof(bc)))) {
         vkCmdSetBlendConstants(cb, bc);
+        memcpy(V.dyn.bc, bc, sizeof(bc));
+        V.dyn.bc_ok = true;
     }
     for (uint32_t k = 0; k < ns; k++) {
         uint32_t cx = k * pkt->rt_pitch * (ns > 1);
@@ -4795,13 +4813,30 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         /* Clip space has y up (as Metal's): flip the viewport. */
         VkViewport vpt = { cx, pkt->rt_height, pkt->rt_width, -(float)pkt->rt_height, 0, 1 };
         VkRect2D sc = { { cx + sx0, sy0 }, { sx1 - sx0, sy1 - sy0 } };
-        vkCmdSetViewport(cb, 0, 1, &vpt);
-        vkCmdSetScissor(cb, 0, 1, &sc);
+        if (!(dyn_skip && V.dyn.vp_ok && !memcmp(&V.dyn.vp, &vpt, sizeof(vpt)))) {
+            vkCmdSetViewport(cb, 0, 1, &vpt);
+            V.dyn.vp = vpt;
+        }
+        if (!(dyn_skip && V.dyn.vp_ok && !memcmp(&V.dyn.sc, &sc, sizeof(sc)))) {
+            vkCmdSetScissor(cb, 0, 1, &sc);
+            V.dyn.sc = sc;
+        }
+        V.dyn.vp_ok = true;
         if (pkt->num_verts) {
-            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+            if (!dyn_skip || V.dyn.pipe != pipe) {
+                vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+                V.dyn.pipe = pipe;
+                V.dyn.z_ok &= pk.hz;
+            }
             vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.layout, 0, 1,
                                     &set, 5, dyn);
-            if (gpu_vs) {
+            if (gpu_vs && dyn_skip) {
+                if (V.dyn.ib != ib) {
+                    vkCmdBindIndexBuffer(cb, ib, 0, VK_INDEX_TYPE_UINT32);
+                    V.dyn.ib = ib;
+                }
+                vkCmdDrawIndexed(cb, pkt->num_verts, 1, io / 4, 0, 0);
+            } else if (gpu_vs) {
                 vkCmdBindIndexBuffer(cb, ib, io, VK_INDEX_TYPE_UINT32);
                 vkCmdDrawIndexed(cb, pkt->num_verts, 1, 0, 0, 0);
             } else {
@@ -4810,6 +4845,8 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         }
         if (pkt->num_line_verts) {
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, lpipe);
+            V.dyn.pipe = lpipe;
+            V.dyn.z_ok &= pk.hz;
             vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.layout, 0, 1,
                                     &set, 5, dyn);
             vkCmdDraw(cb, pkt->num_line_verts, 1, pkt->num_verts, 0);
