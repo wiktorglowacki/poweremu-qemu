@@ -2799,6 +2799,7 @@ static void gen_host_ldst_i64(DisasContext *ctx, TCGv_i64 v, MemOp mop,
 #if !defined(CONFIG_USER_ONLY)
 #include <sys/mman.h>
 #include "hw/boards.h"
+#include "accel/tcg/cpu-ops.h"
 #if defined(__linux__)
 #include <ucontext.h>
 #endif
@@ -2872,6 +2873,9 @@ static bool fastmem_map(CPUState *cs, int idx, vaddr ea, bool write)
         } else if (r != raddr + (p - g) || pr != prot) {
             return false;
         }
+    }
+    if (cpu_watchpoint_address_matches(cs, g, fastmem_pg)) {
+        return false;
     }
     return mmap((void *)(tcg_fastmem_base[idx] + g), fastmem_pg,
                 PROT_READ | (prot & PAGE_WRITE ? PROT_WRITE : 0),
