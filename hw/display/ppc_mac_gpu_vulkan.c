@@ -157,6 +157,9 @@ typedef struct VkImg {
     uint64_t used;
     uint64_t hash;              /* PPCGPU_VK_CHECK: VRAM bytes when loaded, or 0 */
     bool z;                     /* last bound as a depth buffer */
+    bool sp_ok;
+    uint32_t sp_seq;
+    uint64_t sp_p0, sp_e;
 } VkImg;
 
 /* Textures rebuilt on the CPU (mips, 3D, cube, 16bpp, DXT, GART copies). */
@@ -1251,8 +1254,19 @@ static inline bool vk_page_pending_write(uint64_t p)
  * not yet in VRAM over a page the CPU wrote gets that rendering written
  * back before it is reloaded (vk_img_get), so both survive.
  */
+static void vk_stamp_drop(uint64_t lo, uint64_t hi)
+{
+    for (uint32_t k = 0; k < V.pass_n; k++) {
+        VkImg *im = V.pass_img[k];
+        if (im->sp_ok && lo < hi && vk_pg(lo) < im->sp_e && vk_pg(hi - 1) >= im->sp_p0) {
+            im->sp_ok = false;
+        }
+    }
+}
+
 static void vk_page_cpu(uint64_t p)
 {
+    vk_stamp_drop(p * VK_PAGE, (p + 1) * VK_PAGE);
     V.page_gen[p] = V.gen;
     V.blk_gen[p / 64] = V.gen;
     V.page_src[p] = 1;
@@ -1382,6 +1396,7 @@ static uint64_t vk_vram_generation(void *opaque, uint64_t lo, uint64_t hi)
 {
     vk_harvest();
     hi = MIN(hi, V.vram_size);
+    vk_stamp_drop(lo, hi);
     return lo < hi ? vk_range_gen(lo, hi) : 0;
 }
 
@@ -2509,6 +2524,7 @@ static void vk_st_rows(VkImg *im, uint64_t gen)
         run = newer;
     }
     V.stat_up_src[src & 3]++;
+    vk_stamp_drop(im->addr, hi);
     im->gen = gen;
 }
 
@@ -2809,6 +2825,7 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
         vk_full_barrier(cb);
         vk_note_read(rlo, rhi);
         im->valid = true;
+        vk_stamp_drop(addr, hi);
         im->gen = gen;
         im->hash = vk_check() && cls == IMG_TEX && !vk_range_pending(addr, hi) ?
                    vk_img_hash(addr, w, h, pitch, bpp) : 0;
@@ -2882,12 +2899,21 @@ static void vk_img_written(VkImg *im, uint32_t x0, uint32_t y0,
         hi = im->addr + (uint64_t)QEMU_ALIGN_UP(y1, band) * im->pitch;
     }
     uint64_t wlo = im->addr, whi = vk_img_hi(im);
+    uint64_t p0 = vk_pg(lo), pe = MIN(vk_pg(hi - 1) + 1, V.npages);
+    static int skip = -1;
+    if (skip < 0) {
+        skip = g_strcmp0(getenv("PPCGPU_VK_STAMP_SKIP"), "0") != 0;
+    }
+    if (skip && im->sp_ok && im->sp_seq == s && p0 >= im->sp_p0 && pe <= im->sp_e) {
+        return;
+    }
+    vk_stamp_drop(wlo, whi);
     uint64_t *gen = V.page_gen, *wgen = V.page_wgen, *gprev = V.page_gprev, (*wr)[2] = V.page_wr;
     uint64_t *blk = V.blk_gen;
     uint32_t *wseq = V.page_wseq, *bwseq = V.blk_wseq;
     uint8_t *src = V.page_src;
     V.gen++;
-    for (uint64_t p = vk_pg(lo), e = MIN(vk_pg(hi - 1) + 1, V.npages); p < e; p++) {
+    for (uint64_t p = p0; p < pe; p++) {
         if (wgen[p] != gen[p] || wr[p][0] != wlo || wr[p][1] != whi) {
             gprev[p] = gen[p];      /* another writer came before */
             wr[p][0] = wlo;
@@ -2901,6 +2927,10 @@ static void vk_img_written(VkImg *im, uint32_t x0, uint32_t y0,
         src[p] = 2;
     }
     im->gen = V.gen;
+    im->sp_ok = true;
+    im->sp_seq = s;
+    im->sp_p0 = p0;
+    im->sp_e = pe;
 }
 
 /* ---- commit / flush --------------------------------------------------- */
@@ -3201,6 +3231,7 @@ static void vk_gpu_wrote(uint64_t lo, uint64_t hi)
     if (lo >= hi) {
         return;
     }
+    vk_stamp_drop(lo, hi);
     V.gen++;
     for (uint64_t p = vk_pg(lo); p <= vk_pg(hi - 1) && p < V.npages; p++) {
         V.page_gen[p] = V.gen;
@@ -3925,6 +3956,7 @@ static VkImageView vk_texture_full(const R300TexDesc *td)
         VkTexFull *t = &V.texfull[i];
         if (t->live && !memcmp(&t->key, &key, sizeof(key))) {
             t->used = ++V.clock;
+            vk_stamp_drop(td->gpu_addr, (uint64_t)td->gpu_addr + td->size_bytes);
             t->gen = gen;
             t->size = td->size_bytes;
             return t->view;
@@ -4020,6 +4052,7 @@ static VkImageView vk_texture_full(const R300TexDesc *td)
     t->live = true;
     t->key = key;
     t->used = ++V.clock;
+    vk_stamp_drop(td->gpu_addr, (uint64_t)td->gpu_addr + td->size_bytes);
     t->gen = gen;
     t->size = td->size_bytes;
     return t->view;
@@ -4681,6 +4714,9 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             .renderArea = { { 0, 0 }, { fbw, fbh } },
         };
         vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+        for (uint32_t k = 0; k < natt; k++) {
+            att[k]->sp_ok = false;
+        }
         V.in_pass = true;
         V.pass_rp = rp;
         V.pass_fb = fb;

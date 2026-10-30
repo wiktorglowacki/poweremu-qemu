@@ -35,8 +35,10 @@ prefix = r'''
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 enum { IMG_RT, IMG_TEX };
+static int g_strcmp0(const char *a, const char *b) { return !a || !b ? (a != b) : strcmp(a, b); }
 #define QEMU_ALIGN_UP(n, a) (((n) + (a) - 1) / (a) * (a))
 #define QEMU_ALIGN_DOWN(n, a) ((n) / (a) * (a))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -49,6 +51,9 @@ typedef struct {
     uint32_t dr[1][4], ndr;
     bool dirty, valid;
     uint64_t gen;
+    bool sp_ok;
+    uint32_t sp_seq;
+    uint64_t sp_p0, sp_e;
 } VkImg;
 static struct {
     uint64_t gen, npages, page_wgen[4], page_gen[4], page_gprev[4], page_wr[4][2], blk_gen[1];
@@ -59,6 +64,7 @@ static struct Batch { uint32_t seq; } batch = { 7 };
 static struct Batch *vk_batch(void) { return &batch; }
 static uint64_t vk_pg(uint64_t addr) { return addr / 4096; }
 static void vk_img_dirty(VkImg *im, bool d) { im->dirty = d; }
+static void vk_stamp_drop(uint64_t lo, uint64_t hi) { (void)lo; (void)hi; }
 /* Isolate the production page-stamping loop for a nonempty first draw. */
 static int vk_dr_slot(VkImg *im, uint32_t *in, uint32_t *out)
 { (void)im; (void)in; (void)out; return 0; }
@@ -97,6 +103,16 @@ int main(void)
         vk_img_written(&im, 0, 3, 1024, 4);
         assert(V.page_gen[2] == (micro ? 2 : 0) && V.page_gen[3] == 2);
         assert(im.gen == 2);
+        /* The same pages again in the same batch: nothing to stamp. */
+        vk_img_written(&im, 0, 3, 1024, 4);
+        assert(V.gen == 2 && im.gen == 2 && V.page_gen[3] == 2);
+        batch.seq = 8;
+        vk_img_written(&im, 0, 3, 1024, 4);
+        assert(V.gen == 3 && im.gen == 3 && V.page_gen[3] == 3 && V.page_wseq[3] == 8);
+        im.sp_ok = false;
+        vk_img_written(&im, 0, 3, 1024, 4);
+        assert(V.gen == 4 && V.page_gen[3] == 4);
+        batch.seq = 7;
     }
     unsigned pixels = 0;
     for (unsigned w = 1; w <= 17; w++) {
