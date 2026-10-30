@@ -8,6 +8,7 @@ Needs clang with the PowerPC target and gdb; no linker or objcopy.
 """
 import os
 import re
+import shutil
 import socket
 import struct
 import subprocess
@@ -97,6 +98,8 @@ with tempfile.TemporaryDirectory(prefix='ppc-fastmem-') as tmp:
         assert words == want, (f, [hex(w) for w in words])
     print('page-crossing lwz/stw into an unmapped page: DSI, memory untouched, '
           'identical with PPC_FASTMEM=0 and 1 PASS')
+    if not shutil.which('gdb'):
+        sys.exit('gdb not found: watchpoint case skipped')
     out = watch_case(tmp, rom(tmp, 1))
     hits = len(re.findall(r'^Old value = ', out, re.M))
     assert hits == 1 and f'Breakpoint 3, {DONE:#010x}' in out, out
