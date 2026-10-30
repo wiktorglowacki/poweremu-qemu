@@ -2940,12 +2940,14 @@ static bool ppc_fastmem_on(void)
         int fd = ms->ram ? memory_region_get_fd(ms->ram) : -1;
 
         on = 0;
-#if defined(__APPLE__)
-        fd = -1;
-#endif
         if (e && e[0] == '1' && tcg_smc_by_icbi && fd >= 0) {
             struct sigaction sa = { .sa_sigaction = fastmem_fault,
                                     .sa_flags = SA_SIGINFO };
+            sigset_t bus;
+
+            sigemptyset(&bus);
+            sigaddset(&bus, SIGBUS);
+            pthread_sigmask(SIG_UNBLOCK, &bus, NULL);
 
             for (int i = 0; i < NB_MMU_MODES; i += 4) {
                 void *w = mmap(NULL, 1ull << 32, PROT_NONE,
