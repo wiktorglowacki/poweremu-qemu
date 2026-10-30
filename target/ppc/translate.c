@@ -2847,7 +2847,7 @@ static void fastmem_flush_notify(CPUState *cs, uint16_t idxmap, vaddr addr,
     }
 }
 
-static bool fastmem_map(CPUState *cs, int idx, vaddr ea, bool write)
+static int fastmem_map(CPUState *cs, int idx, vaddr ea, bool write)
 {
     PowerPCCPU *cpu = POWERPC_CPU(cs);
     vaddr g = ea & ~(vaddr)(fastmem_pg - 1);
@@ -2859,23 +2859,27 @@ static bool fastmem_map(CPUState *cs, int idx, vaddr ea, bool write)
         int ps, pr;
 
         if (!ppc_xlate(cpu, p, write ? MMU_DATA_STORE : MMU_DATA_LOAD,
-                       &r, &ps, &pr, idx, false) ||
-            r >= fastmem_ram_size) {
-            return false;
+                       &r, &ps, &pr, idx, false)) {
+            return 0;
+        }
+        if (r >= fastmem_ram_size) {
+            return -1;
         }
         if (p == g) {
             raddr = r;
             prot = pr;
-            if ((raddr & (fastmem_pg - 1)) || !(prot & PAGE_READ) ||
-                (write && !(prot & PAGE_WRITE))) {
-                return false;
+            if (!(prot & PAGE_READ) || (write && !(prot & PAGE_WRITE))) {
+                return 0;
+            }
+            if (raddr & (fastmem_pg - 1)) {
+                return -1;
             }
         } else if (r != raddr + (p - g) || pr != prot) {
-            return false;
+            return -1;
         }
     }
     if (cpu_watchpoint_address_matches(cs, g, fastmem_pg)) {
-        return false;
+        return 0;
     }
     return mmap((void *)(tcg_fastmem_base[idx] + g), fastmem_pg,
                 PROT_READ | (prot & PAGE_WRITE ? PROT_WRITE : 0),
@@ -2891,7 +2895,7 @@ static void fastmem_fault(int sig, siginfo_t *si, void *puc)
     TranslationBlock *tb = NULL;
     uintptr_t addr = (uintptr_t)si->si_addr;
     target_ulong nip;
-    int idx;
+    int idx, r;
 #if defined(__linux__) && defined(__x86_64__)
     uintptr_t pc = uc->uc_mcontext.gregs[REG_RIP];
     bool write = uc->uc_mcontext.gregs[REG_ERR] & 2;
@@ -2925,10 +2929,14 @@ static void fastmem_fault(int sig, siginfo_t *si, void *puc)
         return;
     }
     cpu_restore_state(cs, pc + 2);
-    if (!fastmem_map(cs, idx, addr - tcg_fastmem_base[idx], write)) {
+    r = fastmem_map(cs, idx, addr - tcg_fastmem_base[idx], write);
+    if (r < 0) {
         nip = cpu_env(cs)->nip;
         qatomic_set(fastmem_slow_slot(nip), ~nip);
         tb_phys_invalidate(tb, -1);
+    } else if (!r) {
+        cs->cflags_next_tb = (tb->cflags & ~(CF_COUNT_MASK | CF_INVALID)) |
+                             CF_NOFASTMEM | CF_NOIRQ | 1;
     }
     sigprocmask(SIG_SETMASK, &uc->uc_sigmask, NULL);
     cpu_loop_exit_noexc(cs);
@@ -7069,7 +7077,9 @@ static void ppc_decode_insn(DisasContextBase *dcbase, CPUState *cs)
     ctx->cia = pc = ctx->base.pc_next;
 #if !defined(CONFIG_USER_ONLY)
     ctx->default_tcg_memop_mask &= ~MO_NOFASTMEM;
-    if (ctx->fastmem && qatomic_read(fastmem_slow_slot(pc)) == ~pc) {
+    if (ctx->fastmem &&
+        ((tb_cflags(ctx->base.tb) & CF_NOFASTMEM) ||
+         qatomic_read(fastmem_slow_slot(pc)) == ~pc)) {
         ctx->default_tcg_memop_mask |= MO_NOFASTMEM;
     }
 #endif
