@@ -309,6 +309,8 @@ static struct {
     uint64_t update_us;      /* time inside the display update (BQL held) */
     uint64_t gpu_vs;         /* R300 draws whose vertex program ran on the GPU */
     uint64_t co_copies, co_partials, co_skips, co_defers;  /* scanout path */
+    uint64_t co_ov_defers;   /* refreshes withheld: OV0 burst in the ring */
+    uint64_t co_ov_moved;    /* ... dropped: OV0 moved under the update */
     uint64_t co_rows;        /* scanout rows copied */
     uint64_t read_checks;    /* VRAM reads of the draw builder */
     uint64_t read_skips;     /* ... that the memo answered without the renderer */
@@ -1491,6 +1493,8 @@ static void ppc_mac_gpu_update_irq(PPCMacGPUState *s)
 }
 
 static void ppc_mac_gpu_csq_ring_drain(PPCMacGPUState *s);
+static bool ppc_mac_gpu_cp_pending(PPCMacGPUState *s);
+static void ppc_mac_gpu_cp_run(PPCMacGPUState *s);
 
 /* The next word of a packet body, or 0 past its end: a truncated packet
  * must not read the words of whatever follows it in the buffer. */
@@ -2178,7 +2182,8 @@ static bool ppc_mac_gpu_overlay_params(PPCMacGPUState *s, uint32_t fb_stride,
     }
     for (unsigned p = 0; p < (planar ? 3u : 1u); p++) {
         uint32_t value = r[OV0(0x440) + buffer * 3 + p];
-        uint64_t address = (uint64_t)r[OV0(0x43c)] + (value & 0x03fffff0);
+        uint64_t address = (uint64_t)r[OV0(0x43c)] +
+                           (value & s->ov0_base_mask);
         unsigned cpp = planar ? 1 : 2;
         unsigned rows = p ? (sh + 1) / 2 : sh;
         unsigned cols = p ? (sx1 / 2 + 1) : (sx1 + 1);
@@ -2213,6 +2218,7 @@ static bool ppc_mac_gpu_overlay_params(PPCMacGPUState *s, uint32_t fb_stride,
     op->sx0 = sx0;
     op->sx1 = sx1;
     op->src_h = sh;
+    op->buffer = buffer;
     op->vkey_lo = r[OV0(0x4e4)];
     op->vkey_hi = r[OV0(0x4e8)];
     op->gkey_lo = r[OV0(0x4ec)];
@@ -2294,7 +2300,8 @@ static void ppc_mac_gpu_overlay(PPCMacGPUState *s, uint8_t *vram,
     };
     for (unsigned p = 0; p < (planar ? 3 : 1); p++) {
         uint32_t value = r[OV0(0x440) + buffer * 3 + p];
-        uint64_t address = (uint64_t)r[OV0(0x43c)] + (value & 0x03fffff0);
+        uint64_t address = (uint64_t)r[OV0(0x43c)] +
+                           (value & s->ov0_base_mask);
         unsigned cpp = planar ? 1 : 2;
         unsigned rows = p ? (sh + 1) / 2 : sh;
         unsigned cols = p ? (sx1 / 2 + 1) : (sx1 + 1);
@@ -2442,6 +2449,7 @@ static bool ppc_gpu_flip_kick = true;
 static bool ppc_gpu_async_present = true;
 static bool ppc_gpu_po_alias = true;
 static bool ppc_gpu_hd_mono = true;
+static bool ppc_gpu_ov0_atomic = true;
 
 static void ppc_mac_gpu_scanout_cursor(PPCMacGPUState *s, uint32_t stride,
                                       int y0, int y1)
@@ -2527,6 +2535,10 @@ static inline void ppc_mac_gpu_line16(uint32_t *dp, const uint8_t *sp,
 
 static void ppc_mac_gpu_display_update_inner(void *opaque);
 
+/* Refreshes withheld waiting for an OV0 burst to leave the ring before the
+ * burst is finished in the display update instead (PPCGPU_OV0_ATOMIC). */
+#define OV0_DEFERS_MAX 2
+
 /* The refresh timer calls this with the BQL held: time it (rate line). */
 static void ppc_mac_gpu_display_update(void *opaque)
 {
@@ -2548,6 +2560,7 @@ static void *scanout_row(void *dst, const uint8_t *fb, uint32_t stride, uint32_t
 static void ppc_mac_gpu_display_update_inner(void *opaque)
 {
     PPCMacGPUState *s = opaque;
+    uint32_t ov0_seq;
 
     ppc_mac_gpu_csq_ring_drain(s);
     /* A machine that has just been woken: give the window the pointer the
@@ -2564,6 +2577,45 @@ static void ppc_mac_gpu_display_update_inner(void *opaque)
         }
         dpy_mouse_set(s->con, s->hwc_x, s->hwc_y, s->hwc_visible);
     }
+
+    /*
+     * The overlay's registers are written one dword at a time, and for
+     * frames above 720p the driver spreads one frame over several ring
+     * packets (three plane bases, their pitches, the source rect), with the
+     * per-frame blit that fills those planes chunked too.  The CP thread
+     * yields the BQL between those packets (ppc_mac_gpu_cp_yield), so a
+     * refresh landing in the gap composes the new Y with the previous
+     * frame's Cb and Cr: green stripes, once per refresh for as long as the
+     * burst lasts.  Measured on a 4K clip, four consecutive composes:
+     *
+     *   planes 2d9f000/3193800/3290a00   whole
+     *   planes 2d9f000/397c800/3290a00   Y old, Cb new, Cr old
+     *   planes 2d9f000/397c800/3a79a00   still mixed
+     *   planes 3588000/397c800/3a79a00   whole again
+     *
+     * While the ring has packets left, the burst is not over: withhold the
+     * refresh, consuming nothing, so the next one composes the whole state.
+     * A ring that is never empty (a game drawing every refresh) must not
+     * starve the overlay, so after OV0_DEFERS_MAX refreshes the burst is
+     * finished here instead -- the CP thread gives up its copy of the
+     * segment to this thread, as it does for the guest's own catch-ups.
+     */
+    if (ppc_gpu_ov0_atomic &&
+        (s->regs.ov0_active[OV0(R200_OV0_SCALE_CNTL)] & BIT(30))) {
+        if (ppc_mac_gpu_cp_pending(s)) {
+            if (s->ov0_defers < OV0_DEFERS_MAX) {
+                s->ov0_defers++;
+                r200_rate.co_ov_defers++;
+                return;
+            }
+            ppc_mac_gpu_cp_run(s);
+        }
+        s->ov0_defers = 0;
+    }
+    /* The state this refresh may compose; the update yields the BQL to
+     * harvest dirty RAM, and a CP thread that carried on writing OV0 in
+     * that gap leaves nothing whole to commit (see below). */
+    ov0_seq = s->ov0_seq;
 
     {
         int64_t now = g_get_monotonic_time();
@@ -2587,11 +2639,14 @@ static void ppc_mac_gpu_display_update_inner(void *opaque)
                          r200_rate.read_checks ?
                          100.0 * r200_rate.read_skips / r200_rate.read_checks : 0.0);
                 if (r200_rate.co_copies || r200_rate.co_skips ||
-                    r200_rate.co_defers) {
+                    r200_rate.co_defers || r200_rate.co_ov_defers ||
+                    r200_rate.co_ov_moved) {
                     qemu_log("ppc-mac-gpu scanout: %.0f full + %.0f partial "
                              "copies/s (%.0f rows/copy), "
                              "%.0f unchanged/s skipped, "
-                             "%.0f presents deferred/s\n",
+                             "%.0f presents deferred/s, "
+                             "%.0f overlay withheld/s, "
+                             "%.0f overlay dropped/s\n",
                              (r200_rate.co_copies - r200_rate.co_partials) /
                              sec,
                              r200_rate.co_partials / sec,
@@ -2599,7 +2654,9 @@ static void ppc_mac_gpu_display_update_inner(void *opaque)
                              (double)r200_rate.co_rows / r200_rate.co_copies :
                              0.0,
                              r200_rate.co_skips / sec,
-                             r200_rate.co_defers / sec);
+                             r200_rate.co_defers / sec,
+                             r200_rate.co_ov_defers / sec,
+                             r200_rate.co_ov_moved / sec);
                 }
             }
             ppc_mac_gpu_cp_rate_log((now - r200_rate.since) / 1e6);
@@ -2768,6 +2825,11 @@ static void ppc_mac_gpu_display_update_inner(void *opaque)
                     ppc_mac_gpu_line16(dp, sp, width, false, false);
                 }
             }
+        }
+        if (ppc_gpu_ov0_atomic && s->ov0_seq != ov0_seq &&
+            (s->regs.ov0_active[OV0(R200_OV0_SCALE_CNTL)] & BIT(30))) {
+            r200_rate.co_ov_moved++;
+            return;                 /* see the 32bpp path below */
         }
         ppc_mac_gpu_overlay(s, vram_ptr, width * 4);
         ppc_mac_gpu_scanout_cursor(s, width * 4, 0, height);
@@ -3113,6 +3175,21 @@ static void ppc_mac_gpu_display_update_inner(void *opaque)
         }
     }
 
+    /*
+     * Compose only a state that did not move since the snapshot at the top:
+     * harvesting dirty RAM and waiting on the render queue both let the CP
+     * thread in, and an OV0 burst that resumed there leaves the register
+     * file with one frame's plane bases in some planes and the previous
+     * frame's in the others.  Drop the refresh; nothing is consumed here,
+     * so the next one still finds its rows and generations.
+     */
+    if (ppc_gpu_ov0_atomic && s->ov0_seq != ov0_seq &&
+        (ov_on ||
+         (s->regs.ov0_active[OV0(R200_OV0_SCALE_CNTL)] & BIT(30)))) {
+        r200_rate.co_ov_moved++;
+        return;
+    }
+
     int y0 = 0, y1 = (int)height;
     if (cursor_only) {
         y0 = CLAMP(s->r300_cursor_y0, 0, (int)height);
@@ -3274,6 +3351,7 @@ static void ppc_mac_gpu_display_update_inner(void *opaque)
     s->scanout_generation_valid = use_generation;
     s->scanout_dirty_valid = s->scanout_log_owner;
     s->scanout_defers = 0;
+    s->ov0_defers = 0;
 
     if (y0 == 0 && y1 == (int)height) {
         dpy_gfx_update_full(s->con);
@@ -13535,7 +13613,15 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     }
 
     if (s->r300 && s->edid_read_done && addr >= 0x400 && addr + size <= 0x500) {
-        ppc_mac_gpu_reg_write_offs(&s->regs.ov0[OV0(addr & ~3u)], addr & 3, val, size);
+        uint32_t *slot = &s->regs.ov0[OV0(addr & ~3u)];
+        uint32_t old = *slot;
+
+        ppc_mac_gpu_reg_write_offs(slot, addr & 3, val, size);
+        if (*slot != old) {
+            /* A composed OV0 dword moved: the display refresh must not
+             * commit a state that ring packets are still writing. */
+            s->ov0_seq++;
+        }
         if (!(s->regs.ov0[OV0(0x410)] & 1)) {
             memcpy(s->regs.ov0_active, s->regs.ov0, sizeof(s->regs.ov0));
             s->scanout_dirty_valid = false;
@@ -13545,8 +13631,13 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         return;
     }
     if (s->r300 && addr >= 0xd20 && addr + size <= 0xd38) {
-        ppc_mac_gpu_reg_write_offs(&s->regs.ov0_transform[(addr - 0xd20) / 4],
-                                  addr & 3, val, size);
+        uint32_t *slot = &s->regs.ov0_transform[(addr - 0xd20) / 4];
+        uint32_t old = *slot;
+
+        ppc_mac_gpu_reg_write_offs(slot, addr & 3, val, size);
+        if (*slot != old) {
+            s->ov0_seq++;
+        }
         s->scanout_dirty_valid = false;
         s->scanout_generation_valid = false;
         return;
@@ -15235,6 +15326,20 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
         return;
     }
 
+    /*
+     * How much of an OV0 plane base register carries VRAM.  The bases are
+     * addresses in 4 KB units, and the card uses as many bits as its
+     * framebuffer has: the launcher's vgamem_mb=256 puts a 4K frame's Cb and
+     * Cr planes above 64 MB, where a 26-bit decode folded them down into low
+     * VRAM (0x4165800 read as 0x165800: correct luma, chroma from whatever
+     * lives there, the green flash).  Round the size up to a power of two;
+     * a bit past the VRAM is harmless because r300_to_vram rejects any base
+     * that does not land inside it.
+     * PPCGPU_OV0_ADDR_BITS=0 restores the 26-bit decode.
+     */
+    s->ov0_base_mask = ppc_gpu_env_on("PPCGPU_OV0_ADDR_BITS") ?
+        (uint32_t)((pow2ceil(s->vram_size) - 1) & ~0xFull) : 0x03fffff0u;
+
     /* Create graphics console */
     s->con = graphic_console_init(DEVICE(dev), 0,
                                   &ppc_mac_gpu_gfx_ops, s);
@@ -15696,6 +15801,7 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
     ppc_gpu_async_present = ppc_gpu_env_on("PPCGPU_ASYNC_PRESENT");
     ppc_gpu_po_alias = ppc_gpu_env_on("PPCGPU_PO_ALIAS");
     ppc_gpu_hd_mono = ppc_gpu_env_on("PPCGPU_HD_MONO");
+    ppc_gpu_ov0_atomic = ppc_gpu_env_on("PPCGPU_OV0_ATOMIC");
     s->scanout_log_owner = !s->renderer || !s->renderer->set_dirty_source;
 
     /* Set PCI config space fields */

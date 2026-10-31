@@ -738,6 +738,10 @@ struct PPCMacGPUState {
     uint32_t r300_aic_pt_base;  /* PCI GART table base (0x0AB0) */
     uint32_t vram_size_mb;      /* VRAM size in megabytes */
     uint64_t vram_size;         /* VRAM size in bytes (computed) */
+    /* Bits of an OV0 plane base that carry VRAM (4 KB unit): as many as the
+     * framebuffer needs, see ppc_mac_gpu_realize and
+     * ppc_mac_gpu_overlay_params. */
+    uint32_t ov0_base_mask;
 
     /* Device state */
     uint8_t mode;               /* VGA or extended mode */
@@ -815,6 +819,14 @@ struct PPCMacGPUState {
     bool scanout_generation_valid;
     bool scanout_log_owner;       /* this device consumes the VGA dirty log */
     int scanout_defers;           /* deferrals of the frame we are after */
+
+    /* PPCGPU_OV0_ATOMIC: an OV0 state that ring packets are still writing
+     * must not be composed (a refresh between two of them mixes one frame's
+     * plane bases with another's).  ov0_seq counts changes to a composed OV0
+     * dword; the display update snapshots it before it can yield the BQL and
+     * drops the refresh if it moved. */
+    uint32_t ov0_seq;
+    int ov0_defers;               /* refreshes withheld waiting for the ring */
 
     /* Deferred present (PPCGPU_ASYNC_PRESENT): display updates skipped while
      * in-flight GPU work still owned the scanout range. */

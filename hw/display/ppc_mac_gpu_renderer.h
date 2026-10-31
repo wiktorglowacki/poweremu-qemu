@@ -258,6 +258,7 @@ typedef struct PPCMacGPUOverlayParams {
     uint32_t fmt;                   /* OV0 format: 3 1555, 4 565, 10 planar 4:2:0, 11 YUYV, 12 UYVY */
     uint32_t plane[3], pitch[3];
     uint32_t sx0, sx1, src_h;       /* source columns (inclusive) and rows */
+    uint32_t buffer;                /* OV0 0x470 buffer index (double buffered) */
     uint32_t vkey_lo, vkey_hi, gkey_lo, gkey_hi;
     uint32_t vfn, gfn;
     bool both;

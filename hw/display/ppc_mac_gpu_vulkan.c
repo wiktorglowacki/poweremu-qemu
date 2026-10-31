@@ -5277,9 +5277,11 @@ static bool vk_compose_overlay(void *opaque, const PPCMacGPUOverlayParams *p)
         static PPCMacGPUOverlayParams last;
         if (memcmp(&last, p, offsetof(PPCMacGPUOverlayParams, vkey_lo))) {
             last = *p;
-            qemu_log("ppc-mac-gpu overlay: fmt %u src cols %u-%u rows %u pitch %u/%u/%u "
+            qemu_log("ppc-mac-gpu overlay: t=%.3f fmt %u buf %u src cols %u-%u rows %u pitch %u/%u/%u "
                      "planes %x/%x/%x -> window x %u-%u top %u bottom %u, clipped (%u,%u)-(%u,%u), "
-                     "fb off %x stride %u out %u\n", p->fmt, p->sx0, p->sx1, p->src_h,
+                     "fb off %x stride %u out %u\n",
+                     qemu_clock_get_ms(QEMU_CLOCK_REALTIME) / 1000.0,
+                     p->fmt, p->buffer, p->sx0, p->sx1, p->src_h,
                      p->pitch[0], p->pitch[1], p->pitch[2], p->plane[0], p->plane[1], p->plane[2],
                      p->win_x0, p->win_x1, p->top, p->bottom, p->x0, p->y0, p->x1, p->y1,
                      p->fb_offset, p->fb_stride, p->out_stride);
