@@ -15332,13 +15332,15 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
      * framebuffer has: the launcher's vgamem_mb=256 puts a 4K frame's Cb and
      * Cr planes above 64 MB, where a 26-bit decode folded them down into low
      * VRAM (0x4165800 read as 0x165800: correct luma, chroma from whatever
-     * lives there, the green flash).  Round the size up to a power of two;
+     * lives there, the green flash).  Round the size up to a power of two,
+     * never below the 26 bits, so a smaller card does not wrap a base past
+     * its end back into VRAM;
      * a bit past the VRAM is harmless because r300_to_vram rejects any base
      * that does not land inside it.
      * PPCGPU_OV0_ADDR_BITS=0 restores the 26-bit decode.
      */
     s->ov0_base_mask = ppc_gpu_env_on("PPCGPU_OV0_ADDR_BITS") ?
-        (uint32_t)((pow2ceil(s->vram_size) - 1) & ~0xFull) : 0x03fffff0u;
+        (uint32_t)((pow2ceil(MAX(s->vram_size, 64 * MiB)) - 1) & ~0xFull) : 0x03fffff0u;
 
     /* Create graphics console */
     s->con = graphic_console_init(DEVICE(dev), 0,
