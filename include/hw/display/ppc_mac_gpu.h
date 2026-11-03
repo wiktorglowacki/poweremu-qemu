@@ -777,6 +777,7 @@ struct PPCMacGPUState {
     uint32_t host_data_h;         /* dest rect height */
     uint32_t host_data_cur_x;     /* current X position */
     uint32_t host_data_bpp;       /* bytes per pixel of the destination */
+    uint32_t host_data_clip[4];   /* scissor x0, y0, x1, y1 (exclusive) */
     uint8_t host_data_mono;       /* 1 mono fg/bg, 2 mono fg (bg left alone); +4 LSB first */
     uint32_t host_data_cur_y;     /* current Y position */
     uint32_t host_data_offset;    /* dest surface offset */

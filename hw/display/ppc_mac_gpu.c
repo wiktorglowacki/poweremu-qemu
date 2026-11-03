@@ -5906,6 +5906,57 @@ static inline uint32_t gmc_dst_bpp(uint32_t gmc)
 }
 
 /*
+ * The 2D engine's destination scissor, [x0, x1) x [y0, y1) in destination
+ * pixels: SC_TOP_LEFT to SC_BOTTOM_RIGHT with GMC_DST_CLIPPING set, else
+ * SC_TOP_LEFT to DEFAULT_SC_BOTTOM_RIGHT.  MorphOS's driver relies on the
+ * second: it pads every mono host-data blit (area-pattern RectFill, text) to
+ * a multiple of 32 pixels and puts the real right edge in
+ * DEFAULT_SC_BOTTOM_RIGHT, so unclipped a one-pixel dotted Listtree
+ * connector came out as a 32-pixel checkerboard.
+ */
+static void r200_dst_scissor(PPCMacGPUState *s, uint32_t gmc, uint32_t sc[4])
+{
+    uint32_t br = gmc & R200_GMC_DST_CLIPPING ? s->regs.sc_bottom_right
+                                              : s->regs.default_sc_bottom_right;
+
+    sc[0] = s->regs.sc_top_left & 0x3FFF;
+    sc[1] = s->regs.sc_top_left >> 16 & 0x3FFF;
+    sc[2] = br & 0x3FFF;
+    sc[3] = br >> 16 & 0x3FFF;
+}
+
+/* Clip a register-triggered 2D rectangle to the scissor; the source origin
+ * moves with the destination.  False when nothing is left. */
+static bool r200_scissor_rect(PPCMacGPUState *s, uint32_t gmc,
+                              uint32_t *sx, uint32_t *sy, uint32_t *dx, uint32_t *dy,
+                              uint32_t *w, uint32_t *h)
+{
+    uint32_t sc[4];
+
+    r200_dst_scissor(s, gmc, sc);
+    uint32_t x0 = MAX(*dx, sc[0]), y0 = MAX(*dy, sc[1]);
+    uint32_t x1 = MIN(*dx + *w, sc[2]), y1 = MIN(*dy + *h, sc[3]);
+    if (x0 >= x1 || y0 >= y1) {
+        return false;
+    }
+    *sx += x0 - *dx;
+    *sy += y0 - *dy;
+    *dx = x0;
+    *dy = y0;
+    *w = x1 - x0;
+    *h = y1 - y0;
+    return true;
+}
+
+/* Host data runs over the whole (padded) rectangle; only the pixels inside
+ * the scissor latched when the blit started are stored. */
+static inline bool host_data_clipped(PPCMacGPUState *s, uint32_t x, uint32_t y)
+{
+    return x < s->host_data_clip[0] || y < s->host_data_clip[1] ||
+           x >= s->host_data_clip[2] || y >= s->host_data_clip[3];
+}
+
+/*
  * Host data at fewer than 32 bpp: each dword carries 4/bpp pixels in memory
  * byte order (the same bytes the 32bpp path stores whole), and every row
  * starts on a fresh dword.  Returns false once the rectangle is complete.
@@ -5921,7 +5972,7 @@ static bool host_data_put_narrow(PPCMacGPUState *s, uint8_t *vram, uint32_t val,
         }
         uint64_t a = base + (uint64_t)(y0 + *cy) * pitch +
                      (uint64_t)(x0 + *cx) * bpp;
-        if (a + bpp <= s->vram_size) {
+        if (a + bpp <= s->vram_size && !host_data_clipped(s, x0 + *cx, y0 + *cy)) {
             for (uint32_t b = 0; b < bpp; b++) {
                 vram[a + b] = val >> (8 * (i + b));
             }
@@ -5978,7 +6029,9 @@ static bool host_data_put_mono(PPCMacGPUState *s, uint8_t *vram, uint32_t val, u
     for (int i = 0; i < 32 && s->host_data_cur_x < s->host_data_w; i++) {
         uint32_t byte = (m >> (i & ~7)) & 0xFF;
         bool on = (byte >> ((s->host_data_mono & 4) ? (i & 7) : 7 - (i & 7))) & 1;
-        if (on || (s->host_data_mono & 3) == 1) {
+        if ((on || (s->host_data_mono & 3) == 1) &&
+            !host_data_clipped(s, s->host_data_dst_x + s->host_data_cur_x,
+                               s->host_data_dst_y + s->host_data_cur_y)) {
             uint64_t a = (uint64_t)s->host_data_offset +
                          (uint64_t)(s->host_data_dst_y + s->host_data_cur_y) * s->host_data_pitch +
                          (uint64_t)(s->host_data_dst_x + s->host_data_cur_x) * bpp;
@@ -6048,7 +6101,9 @@ static void ppc_mac_gpu_host_data_write(PPCMacGPUState *s, uint32_t val)
     }
 
     /* Register pixels use the same VRAM representation as solid fills. */
-    mc_vram_write32(s, vram, linear_addr, s->r300 && !s->r300_card_bytes ? bswap32(val) : val);
+    if (!host_data_clipped(s, x, y)) {
+        mc_vram_write32(s, vram, linear_addr, s->r300 && !s->r300_card_bytes ? bswap32(val) : val);
+    }
 
     /* Advance cursor: left-to-right, then next row */
     s->host_data_cur_x++;
@@ -6753,6 +6808,69 @@ static bool r200_gpu_fill(PPCMacGPUState *s, uint32_t dst_offset, uint32_t dst_p
     return true;
 }
 
+/* ROP3 over pattern, source and destination, bit index P * 4 + S * 2 + D. */
+static uint32_t rop3_eval(uint32_t rop, uint32_t p, uint32_t src, uint32_t d)
+{
+    uint32_t r = 0;
+
+    for (int i = 0; i < 8; i++) {
+        if (rop & (1 << i)) {
+            r |= (i & 4 ? p : ~p) & (i & 2 ? src : ~src) & (i & 1 ? d : ~d);
+        }
+    }
+    return r;
+}
+
+/* Does the ROP3 read the source (it differs between S = 0 and S = 1)? */
+static inline bool rop3_uses_src(uint32_t rop)
+{
+    return ((rop >> 2) ^ rop) & 0x33;
+}
+
+/*
+ * A register-triggered 2D operation with a ROP3 other than SRCCOPY and
+ * PATCOPY, on the CPU: pattern = DP_BRUSH_FRGD_CLR, source = VRAM.  MorphOS
+ * sends DSTINVERT (0x55) for a COMPLEMENT RectFill and ClipBlit's ~D minterm.
+ */
+static void r200_rop3_rect(PPCMacGPUState *s, uint8_t *vram, uint32_t rop3, uint32_t gmc,
+                           uint32_t so, uint32_t sp, bool smt, uint32_t sx, uint32_t sy,
+                           uint32_t dof, uint32_t dp, bool dmt, uint32_t dx, uint32_t dy,
+                           uint32_t w, uint32_t h, uint32_t bpp)
+{
+    uint32_t c = s->regs.dp_brush_frgd_clr;
+    /* the pattern in the bytes fill_vram_px stores */
+    uint32_t p = bpp == 4 ? (s->r300_card_bytes ? cpu_to_le32(c) : be32_to_cpu(c)) :
+                 bpp == 2 ? (s->r300_card_bytes ? cpu_to_le16(c) : be16_to_cpu(c)) : c;
+    bool use_src = rop3_uses_src(rop3);
+    bool xrev = !(s->regs.dp_cntl & 1), yrev = !(s->regs.dp_cntl & 2);
+
+    /* ponytail: solid brush only; the driver sends no mono/colour brush with
+     * these ROPs.  Add BRUSH_DATA patterns when a guest does. */
+    if (((rop3 >> 4) ^ rop3) & 0xF && ((gmc >> 4) & 0xF) < 0xD) {
+        qemu_log_mask(LOG_UNIMP, "ppc-mac-gpu 2d: rop %02x with brush type %u "
+                      "drawn with a solid brush\n", rop3, (gmc >> 4) & 0xF);
+    }
+    for (uint32_t r = 0; r < h; r++) {
+        uint32_t y = yrev ? h - 1 - r : r;
+        for (uint32_t i = 0; i < w; i++) {
+            uint32_t x = xrev ? w - 1 - i : i;
+            uint64_t da = blit_px(dof, dp, dmt, dx + x, dy + y, bpp);
+            uint64_t sa = use_src ? blit_px(so, sp, smt, sx + x, sy + y, bpp) : 0;
+            if (da + bpp > s->vram_size) {
+                continue;
+            }
+            if (bpp == 4) {
+                uint32_t sv = use_src ? mc_vram_read32(s, vram, sa) : 0;
+                mc_vram_write32(s, vram, da,
+                                rop3_eval(rop3, p, sv, mc_vram_read32(s, vram, da)));
+            } else {
+                uint32_t sv = use_src && sa + bpp <= s->vram_size ? ldn_he_p(vram + sa, bpp) : 0;
+                stn_he_p(vram + da, bpp, rop3_eval(rop3, p, sv, ldn_he_p(vram + da, bpp)));
+            }
+        }
+    }
+}
+
 static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
 {
     /*
@@ -6856,6 +6974,10 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
             (rop3 == 0xCC && (src_x > 0x3FFF || src_y > 0x3FFF))) {
             return;
         }
+    }
+    if (src_type != 3 &&
+        !r200_scissor_rect(s, gmc, &src_x, &src_y, &dst_x, &dst_y, &blit_w, &blit_h)) {
+        return;
     }
     bool src_mt = r300_macro_layout && s->r300 && src_po >> 30 == 1 && !(src_pitch % 256);
     bool dst_mt = r300_macro_layout && s->r300 && dst_po >> 30 == 1 && !(dst_pitch % 256);
@@ -6965,7 +7087,7 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
     }
     if (!gpu_done) {
         r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dy0, dh), true, 1);
-        if (rop3 == 0xCC && src_type != 3 && src_offset < s->vram_size) {
+        if (rop3_uses_src(rop3) && src_type != 3 && src_offset < s->vram_size) {
             r200_vram_access(s, R200_ROWS(src_offset, src_pitch ? src_pitch : dst_pitch,
                                           sy0, sh), false, 1);
         }
@@ -6998,6 +7120,7 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
         s->host_data_cur_y = 0;
         s->host_data_bpp = gmc_dst_bpp(s->regs.dp_gui_master_cntl);
         s->host_data_mono = host_data_mono_mode(s->regs.dp_gui_master_cntl);
+        r200_dst_scissor(s, gmc, s->host_data_clip);
         /* written on the CPU: rendering pending there goes first */
         if (ppc_gpu_hd_mono) {
             r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y, blit_h), true, 1);
@@ -7436,8 +7559,12 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
         }
         r200_fill_notify(s, dst_offset, dst_pitch, dst_x, dst_y,
                          blit_w, blit_h, bpp, color);
+    } else {
+        r200_rop3_rect(s, vram, rop3, gmc, src_offset, src_pitch, src_mt, src_x, src_y,
+                       dst_offset, dst_pitch, dst_mt, dst_x, dst_y, blit_w, blit_h, bpp);
+        vram_rect_dirty(s, dst_offset, dst_pitch, dst_mt ? 0 : dst_x, dy0,
+                        dst_mt ? dst_pitch / bpp : blit_w, dh, bpp);
     }
-    /* Other ROP3 values: silently ignore for now */
 }
 
 /*
@@ -7493,6 +7620,10 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
     if (blit_w == 0 || blit_h == 0 || dst_pitch == 0) {
         return;
     }
+    if (src_type != 3 &&
+        !r200_scissor_rect(s, gmc, &src_x, &src_y, &dst_x, &dst_y, &blit_w, &blit_h)) {
+        return;
+    }
 
     bool gpu_done = false;
     {
@@ -7510,7 +7641,7 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
     }
     if (!gpu_done) {
         r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y, blit_h), true, 2);
-        if (rop3 == 0xCC && src_type != 3 && src_offset < s->vram_size) {
+        if (rop3_uses_src(rop3) && src_type != 3 && src_offset < s->vram_size) {
             r200_vram_access(s, R200_ROWS(src_offset, src_pitch ? src_pitch : dst_pitch,
                                           src_y, blit_h), false, 2);
         }
@@ -7533,6 +7664,7 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
         s->host_data_cur_y = 0;
         s->host_data_bpp = gmc_dst_bpp(gmc);
         s->host_data_mono = host_data_mono_mode(gmc);
+        r200_dst_scissor(s, gmc, s->host_data_clip);
         if (ppc_gpu_hd_mono) {
             r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y, blit_h), true, 1);
         }
@@ -7838,6 +7970,11 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
         }
         r200_fill_notify(s, dst_offset, dst_pitch, dst_x, dst_y,
                          blit_w, blit_h, bpp, color);
+        s->display_invalid = true;
+    } else {
+        r200_rop3_rect(s, vram, rop3, gmc, src_offset, src_pitch, false, src_x, src_y,
+                       dst_offset, dst_pitch, false, dst_x, dst_y, blit_w, blit_h, bpp);
+        vram_rect_dirty(s, dst_offset, dst_pitch, dst_x, dst_y, blit_w, blit_h, bpp);
         s->display_invalid = true;
     }
 }
@@ -11040,6 +11177,8 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                  */
                 uint32_t gmc = d[0];
                 uint32_t po = d[1];
+                s->host_data_clip[0] = s->host_data_clip[1] = 0;
+                s->host_data_clip[2] = s->host_data_clip[3] = UINT32_MAX;
                 uint32_t dst_offset = (po & 0x3FFFFF) << 10;
                 uint32_t dst_pitch  = (po & 0x3FC00000) >> 16;
                 if (s->r300) {
