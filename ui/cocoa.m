@@ -334,6 +334,10 @@ static void qemu_toggle_full_panel(void);
     int mouseX;
     int mouseY;
     bool mouseOn;
+    /* game mouse: switched in by a hidden guest pointer, or held by Ctrl+Alt+M */
+    BOOL guestCursorBlank;
+    BOOL gameMouseAuto;
+    BOOL gameMouseHeld;
     /* full-panel fullscreen: borderless window over the whole screen */
     BOOL fullPanel;
     NSRect savedFrame;
@@ -530,6 +534,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     [cursorLayer setPosition:position];
     [cursorLayer setHidden:!mouseOn];
     [CATransaction commit];
+    [self updateGameMouse];
 }
 
 - (void)setCursor:(QEMUCursor *)given_cursor
@@ -546,6 +551,14 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     }
 
     cursor_ref(cursor);
+
+    guestCursorBlank = YES;
+    for (int i = 0; i < cursor->width * cursor->height; i++) {
+        if (cursor->data[i] >> 24) {
+            guestCursorBlank = NO;
+            break;
+        }
+    }
 
     bounds.size.width = cursor->width;
     bounds.size.height = cursor->height;
@@ -1265,6 +1278,8 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
                         // desktop tablet <-> relative game mouse
                         case 'm':
+                            gameMouseHeld = YES;
+                            gameMouseAuto = NO;
                             [self toggleGameMouse];
                             return true;
 
@@ -1468,8 +1483,43 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     if (isMouseGrabbed) {
         CGAssociateMouseAndMouseCursorPosition(isAbsoluteEnabled);
         [self setGrabTitle];
-    } else {
+    } else if (!isAbsoluteEnabled ||
+               NSPointInRect([self convertPoint:[[self window] mouseLocationOutsideOfEventStream]
+                                       fromView:nil], [self bounds])) {
         [self grabMouse];
+    }
+}
+
+/*
+ * A guest that hides its pointer (a game going into mouse look: the cursor
+ * off, or an all-transparent one) gets the game mouse while the window has
+ * the mouse, and the tablet back once the pointer shows.  Ctrl+Alt+M holds
+ * the choice until the pointer next shows.  QEMU_COCOA_AUTO_GAME_MOUSE=0:
+ * only Ctrl+Alt+M switches.
+ */
+- (void) updateGameMouse
+{
+    static int enabled = -1;
+    BOOL hidden = !mouseOn || guestCursorBlank;
+
+    if (enabled < 0) {
+        const char *e = getenv("QEMU_COCOA_AUTO_GAME_MOUSE");
+        enabled = !(e && e[0] == '0');
+    }
+    if (!hidden) {
+        gameMouseHeld = NO;
+    }
+    if (!enabled || gameMouseHeld) {
+        return;
+    }
+    if (hidden && !gameMouseAuto && isAbsoluteEnabled && isMouseGrabbed) {
+        gameMouseAuto = YES;
+        [self toggleGameMouse];
+    } else if (!hidden && gameMouseAuto) {
+        gameMouseAuto = NO;
+        if (!isAbsoluteEnabled) {
+            [self toggleGameMouse];
+        }
     }
 }
 
@@ -1488,6 +1538,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     [self hideCursor];
     CGAssociateMouseAndMouseCursorPosition(isAbsoluteEnabled);
     isMouseGrabbed = TRUE; // while isMouseGrabbed = TRUE, QemuCocoaApp sends all events to [cocoaView handleEvent:]
+    [self updateGameMouse];
 }
 
 - (void) ungrabMouse
