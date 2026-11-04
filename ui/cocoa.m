@@ -1263,6 +1263,11 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
                             [self ungrabMouse];
                             return true;
 
+                        // desktop tablet <-> relative game mouse
+                        case 'm':
+                            [self toggleGameMouse];
+                            return true;
+
                         // toggle (full-panel) fullscreen
                         case 'f':
                             [self toggleFullPanel];
@@ -1442,14 +1447,44 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     [self handleMouseEvent:event button:INPUT_BUTTON_MIDDLE down:false];
 }
 
+/*
+ * Ctrl+Alt+M: a game that warps the pointer back to the centre every frame
+ * (mouse look) needs relative motion, which the absolute tablet cannot give:
+ * each host move puts the pointer back where the host cursor is.  Bring the
+ * guest's relative USB mouse in front of the tablet, or back, and grab; the
+ * relative grab freezes the host cursor and sends deltas.
+ */
+- (void) toggleGameMouse
+{
+    bool toRel = isAbsoluteEnabled;
+
+    with_bql(^{
+        qemu_input_handler_activate_kind(toRel ? INPUT_EVENT_MASK_REL : INPUT_EVENT_MASK_ABS);
+    });
+    [self notifyMouseModeChange];
+    if (isAbsoluteEnabled == toRel) {
+        return;
+    }
+    if (isMouseGrabbed) {
+        CGAssociateMouseAndMouseCursorPosition(isAbsoluteEnabled);
+        [self setGrabTitle];
+    } else {
+        [self grabMouse];
+    }
+}
+
+- (void) setGrabTitle
+{
+    [[self window] setTitle:window_title(isAbsoluteEnabled ?
+        "  (Press  " UC_CTRL_KEY " " UC_ALT_KEY " G  to release Mouse,  " UC_CTRL_KEY " " UC_ALT_KEY " M  for game mouse)" :
+        "  (Game mouse:  " UC_CTRL_KEY " " UC_ALT_KEY " M  desktop mouse,  " UC_CTRL_KEY " " UC_ALT_KEY " G  release)")];
+}
+
 - (void) grabMouse
 {
     COCOA_DEBUG("QemuCocoaView: grabMouse\n");
 
-    if (qemu_name)
-        [[self window] setTitle:window_title("  (Press  " UC_CTRL_KEY " " UC_ALT_KEY " G  to release Mouse)")];
-    else
-        [[self window] setTitle:window_title("  (Press  " UC_CTRL_KEY " " UC_ALT_KEY " G  to release Mouse)")];
+    [self setGrabTitle];
     [self hideCursor];
     CGAssociateMouseAndMouseCursorPosition(isAbsoluteEnabled);
     isMouseGrabbed = TRUE; // while isMouseGrabbed = TRUE, QemuCocoaApp sends all events to [cocoaView handleEvent:]
