@@ -48,6 +48,7 @@
 #include "ui/console.h"
 #include "ui/qemu-pixman.h"
 #include "system/system.h"
+#include "system/runstate.h"
 #include "hw/display/ppc_mac_gpu_vp.h"
 #include "trace.h"
 
@@ -453,6 +454,7 @@ static struct {
     PPCMacGPUState *s;
     QemuThread thread;
     QemuEvent kick;
+    VMChangeStateEntry *vmse;
     bool started;
     bool stop;
     bool running;               /* the thread has taken (or is taking) a run */
@@ -12108,6 +12110,14 @@ static const MemoryRegionOps ppc_mac_gpu_cp_rptr_ops = {
     },
 };
 
+static void ppc_mac_gpu_cp_spawn(void)
+{
+    qatomic_set(&cp.stop, false);
+    cp.started = true;
+    qemu_thread_create(&cp.thread, "ppc-gpu-cp", ppc_mac_gpu_cp_thread, cp.s,
+                       QEMU_THREAD_JOINABLE);
+}
+
 static void ppc_mac_gpu_cp_start(PPCMacGPUState *s)
 {
     const char *e = getenv("PPCGPU_CP_SYNC");
@@ -12128,9 +12138,7 @@ static void ppc_mac_gpu_cp_start(PPCMacGPUState *s)
     e = getenv("PPCGPU_CP_WPTR_SYNC");
     cp.wptr_sync = cp.steal && !(e && e[0] == '0');
     qemu_event_init(&cp.kick, false);
-    cp.started = true;
-    qemu_thread_create(&cp.thread, "ppc-gpu-cp", ppc_mac_gpu_cp_thread, s,
-                       QEMU_THREAD_JOINABLE);
+    ppc_mac_gpu_cp_spawn();
     memory_region_init_io(&s->cp_wptr_mr, OBJECT(s), &ppc_mac_gpu_cp_wptr_ops,
                           s, "ppc-mac-gpu-cp-wptr", 4);
     memory_region_enable_lockless_io(&s->cp_wptr_mr);
@@ -12157,6 +12165,18 @@ static void ppc_mac_gpu_cp_stop(void)
     qemu_thread_join(&cp.thread);
     bql_lock();
     cp.started = false;
+}
+
+static void ppc_mac_gpu_vm_state(void *opaque, bool running, RunState state)
+{
+    if (running) {
+        if (cp.s && !cp.started) {
+            ppc_mac_gpu_cp_spawn();
+        }
+    } else if (state == RUN_STATE_SHUTDOWN) {
+        ppc_mac_gpu_cp_stop();
+        r200_flush(opaque);
+    }
 }
 
 /* The last command packets pushed in by hand, for the stall report. */
@@ -15594,6 +15614,7 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
     pci_register_bar(dev, PPC_MAC_GPU_MMIO_BAR,
                      PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
     ppc_mac_gpu_cp_start(s);
+    cp.vmse = qemu_add_vm_change_state_handler(ppc_mac_gpu_vm_state, s);
     ppc_mac_gpu_csq_ring_start(s);
 
     /* BAR1: I/O space alias to first 256 bytes of MMIO */
@@ -16026,6 +16047,7 @@ static void ppc_mac_gpu_exit(PCIDevice *dev)
 {
     PPCMacGPUState *s = PPC_MAC_GPU(dev);
 
+    qemu_del_vm_change_state_handler(cp.vmse);
     ppc_mac_gpu_cp_stop();
     timer_del(&s->vblank_timer);
     ppc_mac_gpu_shadow_free(s);
