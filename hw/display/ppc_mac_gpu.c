@@ -6744,6 +6744,26 @@ static void r200_gpu2d_done(PPCMacGPUState *s, uint64_t lo, uint64_t hi)
     }
 }
 
+static bool r200_gpu_untile(PPCMacGPUState *s, uint32_t so, uint32_t sp, uint32_t sx,
+                            uint32_t sy, uint32_t dof, uint32_t dp, uint32_t dx, uint32_t dy,
+                            uint32_t w, uint32_t h, uint32_t bpp)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_GPU2D_UNTILE");
+        on = !(e && e[0] == '0');
+    }
+    uint64_t dst = (uint64_t)dof + (uint64_t)dy * dp + (uint64_t)dx * bpp;
+    uint64_t dst_hi = dst + (uint64_t)(h - 1) * dp + (uint64_t)w * bpp;
+    if (!on || !r200_gpu2d_on() || !s->renderer || !s->renderer->untile_2d_r200 ||
+        !w || !h || (uint64_t)w * h * bpp < 256 * KiB || dst_hi > s->vram_size ||
+        !s->renderer->untile_2d_r200(s->renderer_opaque, so, sp, sx, sy, dst, dp, w, h, bpp)) {
+        return false;
+    }
+    r200_gpu2d_done(s, dst, dst_hi);
+    return true;
+}
+
 /* The 2D engine's SRCCOPY on the GPU: true if recorded (nothing left to do). */
 static bool r200_gpu_copy(PPCMacGPUState *s, uint32_t src_offset, uint32_t src_pitch,
                           uint32_t src_x, uint32_t src_y, uint32_t dst_offset,
@@ -7082,6 +7102,10 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
             gpu_done = r200_gpu_copy(s, src_offset, src_pitch ? src_pitch : dst_pitch,
                                      src_x, src_y, dst_offset, dst_pitch, dst_x, dst_y,
                                      blit_w, blit_h, gbpp);
+        } else if (rop3 == 0xCC && src_type != 3 && !gart && src_mt && !dst_mt) {
+            gpu_done = r200_gpu_untile(s, src_offset, src_pitch ? src_pitch : dst_pitch,
+                                       src_x, src_y, dst_offset, dst_pitch, dst_x, dst_y,
+                                       blit_w, blit_h, gbpp);
         } else if (rop3 == 0xF0 && !dst_mt) {
             gpu_done = r200_gpu_fill(s, dst_offset, dst_pitch, dst_x, dst_y, blit_w, blit_h,
                                      s->regs.dp_brush_frgd_clr, gbpp);

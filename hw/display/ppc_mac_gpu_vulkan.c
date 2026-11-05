@@ -1856,14 +1856,14 @@ static bool vk_tile_staging(VkDeviceSize need)
     return true;
 }
 
-static uint64_t vk_zs_copy(VkCommandBuffer cb, const VkImg *im, uint32_t y, uint32_t h,
-                           uint32_t band, bool to_vram)
+static uint64_t vk_zs_copy_at(VkCommandBuffer cb, uint64_t addr, uint32_t pitch, uint32_t y,
+                              uint32_t h, uint32_t band, bool to_vram)
 {
     if (!vk_zstage()) {
         return 0;
     }
-    uint64_t lo = im->addr + (uint64_t)(y / band) * band * im->pitch;
-    uint64_t hi = MIN(im->addr + (uint64_t)ROUND_UP(y + h, band) * im->pitch, V.vram_size);
+    uint64_t lo = addr + (uint64_t)(y / band) * band * pitch;
+    uint64_t hi = MIN(addr + (uint64_t)ROUND_UP(y + h, band) * pitch, V.vram_size);
     VkBufferCopy c = { to_vram ? 0 : lo, to_vram ? lo : 0, hi - lo };
 
     if (hi > lo) {
@@ -1872,6 +1872,12 @@ static uint64_t vk_zs_copy(VkCommandBuffer cb, const VkImg *im, uint32_t y, uint
         vk_full_barrier(cb);
     }
     return lo;
+}
+
+static uint64_t vk_zs_copy(VkCommandBuffer cb, const VkImg *im, uint32_t y, uint32_t h,
+                           uint32_t band, bool to_vram)
+{
+    return vk_zs_copy_at(cb, im->addr, im->pitch, y, h, band, to_vram);
 }
 
 /*
@@ -3327,6 +3333,45 @@ static bool vk_copy_2d_r200(void *opaque, uint64_t src, uint32_t src_pitch,
     }
     vk_full_barrier(cb);
     vk_note_read(src, src_hi);
+    vk_gpu_wrote(dst, dst_hi);
+    V.stat_2d++;
+    return true;
+}
+
+static bool vk_untile_2d_r200(void *opaque, uint32_t base, uint32_t pitch, uint32_t x,
+                              uint32_t y, uint64_t dst, uint32_t dst_pitch, uint32_t w,
+                              uint32_t h, uint32_t bpp)
+{
+    uint64_t row = (uint64_t)w * bpp;
+    if (!V.vram || !h || h > 4096 || row % 4 || x * bpp % 4 || dst % 4 || dst_pitch % 4 ||
+        !vk_zstage() || !vk_tile_init()) {
+        return false;
+    }
+    uint64_t lo = base + (uint64_t)(y / 8) * 8 * pitch;
+    uint64_t hi = base + (uint64_t)ROUND_UP(y + h, 8) * pitch;
+    uint64_t dst_hi = dst + (uint64_t)(h - 1) * dst_pitch + row;
+    if (hi > V.vram_size || dst_hi > V.vram_size || (lo < dst_hi && dst < hi) ||
+        !vk_tile_staging(MAX(row * h, hi - lo))) {
+        return false;
+    }
+    vk_writeback_range(lo, hi);
+    VkCommandBuffer cb = vk_transfer_begin(dst, dst_hi);
+    vk_zs_copy_at(cb, base, pitch, y, h, 8, false);
+    uint32_t pc[9] = { base - lo, pitch, x, y, w, h, bpp, 1, 1 };
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, V.tile_pipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, V.tile_pl, 0, 1,
+                            &V.tile_set, 0, NULL);
+    vkCmdPushConstants(cb, V.tile_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+    vkCmdDispatch(cb, DIV_ROUND_UP(row / 4 * h, 64), 1, 1);
+    vk_full_barrier(cb);
+    VkBufferCopy *r = g_new(VkBufferCopy, h);
+    for (uint32_t i = 0; i < h; i++) {
+        r[i] = (VkBufferCopy){ i * row, dst + (uint64_t)i * dst_pitch, row };
+    }
+    vkCmdCopyBuffer(cb, V.tile_buf, V.vram_buf, h, r);
+    g_free(r);
+    vk_full_barrier(cb);
+    vk_note_read(lo, hi);
     vk_gpu_wrote(dst, dst_hi);
     V.stat_2d++;
     return true;
@@ -5441,6 +5486,7 @@ static PPCMacGPURenderer vulkan_renderer = {
     .draw_r300        = vk_draw_r300,
     .zpass_r300       = vk_zpass_r300,
     .flush_r200       = vk_flush_r200,
+    .untile_2d_r200   = vk_untile_2d_r200,
     .busy_r200        = vk_busy_r200,
     .wait_busy_r200   = vk_wait_busy_r200,
     .vram_generation  = vk_vram_generation,

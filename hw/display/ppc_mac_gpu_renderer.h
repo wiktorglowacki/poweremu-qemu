@@ -449,6 +449,9 @@ typedef struct PPCMacGPURenderer {
     bool (*copy_2d_r200)(void *opaque, uint64_t src, uint32_t src_pitch,
                          uint64_t dst, uint32_t dst_pitch,
                          uint32_t row_bytes, uint32_t h);
+    bool (*untile_2d_r200)(void *opaque, uint32_t base, uint32_t pitch, uint32_t x,
+                           uint32_t y, uint64_t dst, uint32_t dst_pitch, uint32_t w,
+                           uint32_t h, uint32_t bpp);
     bool (*fill_2d_r200)(void *opaque, uint64_t dst, uint32_t dst_pitch,
                          uint32_t row_bytes, uint32_t h, uint32_t pattern);
 
