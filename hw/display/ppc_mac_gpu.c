@@ -3877,6 +3877,7 @@ static void r300_arrays_sync(PPCMacGPUState *s, uint32_t nvtx)
         uint64_t lo, hi;
     } iv[R300_MAX_ARRAYS], t;
     uint32_t vtx_size = r300_reg(s->r3, 0x20B4);    /* VAP_VTX_SIZE, dwords */
+    int64_t first = r300_index_offset(s->r3);
     unsigned n = 0;
 
     if (!r200_read_sync() || !r200_read_memo()) {
@@ -3886,7 +3887,7 @@ static void r300_arrays_sync(PPCMacGPUState *s, uint32_t nvtx)
      * real reaches past the last array's element that far. */
     vtx_size = MIN(MAX(vtx_size, 1), 384);
     for (unsigned k = 0; k < s->r3_arrays.count && k < R300_MAX_ARRAYS; k++) {
-        uint32_t lo = s->r3_arrays.a[k].addr;
+        uint32_t lo = s->r3_arrays.a[k].addr + (uint32_t)(first * s->r3_arrays.a[k].stride_dw * 4);
         uint32_t size = MAX(s->r3_arrays.a[k].size_dw, vtx_size);
         uint64_t bytes = ((uint64_t)(nvtx ? nvtx - 1 : 0) *
                           s->r3_arrays.a[k].stride_dw + size) * 4;

@@ -231,6 +231,14 @@ typedef struct R300Indices {
     uint32_t ndw;
 } R300Indices;
 
+/* VAP_INDEX_OFFSET (0x208C): a signed 24-bit offset the fetch adds to every
+ * vertex index, how the driver starts a VRAM array at glDrawArrays' first
+ * vertex without moving the LOAD_VBPNTR addresses. */
+static inline int32_t r300_index_offset(const R300State *st)
+{
+    return (int32_t)(r300_reg(st, 0x208C) << 8) >> 8;
+}
+
 /* Decode a 3D_LOAD_VBPNTR (type-3 0x2F) body. */
 void r300_load_vbpntr(R300Arrays *arr, const uint32_t *d, uint32_t ndw);
 

@@ -159,6 +159,7 @@ typedef struct Fetch {
     const uint32_t *immd;       /* immediate vertex data, or NULL */
     uint32_t immd_dw;
     uint32_t vtx_size;          /* VAP_VTX_SIZE, dwords */
+    int32_t index_offset;       /* VAP_INDEX_OFFSET, added to every array index */
     unsigned swap;              /* VAP_CNTL_STATUS.VC_SWAP */
     uint32_t warn;
     const char *why;            /* first fetch failure */
@@ -193,7 +194,7 @@ static bool fetch_dwords(Fetch *f, unsigned k, uint32_t vtx, unsigned cursor,
         k = f->arr->count - 1;
     }
     uint32_t addr = f->arr->a[k].addr +
-                    (vtx * f->arr->a[k].stride_dw + cursor) * 4;
+                    ((vtx + (uint32_t)f->index_offset) * f->arr->a[k].stride_dw + cursor) * 4;
     if (!f->read(f->opaque, addr, out, count * 4)) {
         f->why = "vertex array outside VRAM and the GART";
         return false;
@@ -1899,6 +1900,7 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     f.read = read;
     f.opaque = opaque;
     f.swap = r300_reg(st, VAP_CNTL_STATUS) & 3;
+    f.index_offset = r300_index_offset(st);
     f.vtx_size = r300_reg(st, VAP_VTX_SIZE) & 0x7F;
     f.immd = immd;
     f.immd_dw = immd_dw;
