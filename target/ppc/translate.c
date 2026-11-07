@@ -7386,14 +7386,8 @@ static void ppc_tr_tb_exit(DisasContextBase *dcbase, CPUState *cs)
 
     switch (is_jmp) {
     case DISAS_TOO_MANY:
-        if (use_goto_tb(ctx, nip)) {
-            pmu_count_insns(ctx);
-            tcg_gen_goto_tb(0);
-            gen_update_nip(ctx, nip);
-            tcg_gen_exit_tb(ctx->base.tb, 0);
-            break;
-        }
-        /* fall through */
+        gen_goto_tb(ctx, 0, nip);
+        break;
     case DISAS_CHAIN_UPDATE:
         gen_update_nip(ctx, nip);
         /* fall through */
