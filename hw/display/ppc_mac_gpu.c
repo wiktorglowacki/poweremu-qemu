@@ -462,6 +462,8 @@ static struct {
     uint32_t steal_max;         /* ... when at most this many dwords wait */
     bool wptr_sync;             /* small kicks after an RPTR poll run inline */
     bool polled;                /* the guest polled RPTR since the last kick */
+    bool early_submit;
+    uint32_t wait_polls;
     bool synced_wptr;           /* the last kick was carried out by WPTR */
     unsigned epoch;             /* bumped whenever the ring changes hands */
     bool aborted;               /* the replay was taken over mid-segment */
@@ -5259,6 +5261,10 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         }
         r200_rate.gpu_vs += pkt.vs_glsl != NULL;
         int rr = s->renderer->draw_r300(s->renderer_opaque, vram, s->vram_size, &pkt);
+        if (qatomic_read(&cp.wait_polls) >= 2 && !s->renderer->draw_queue_async &&
+            s->renderer->submit_r200) {
+            s->renderer->submit_r200(s->renderer_opaque, NULL, NULL);
+        }
         r300_cpu_copy_learn(s, rr >= 0);
         if (s->r3_dump && g_r300_arm_rt && pkt.rt_gpu_addr == g_r300_arm_rt) {
             fprintf(s->r3_dump, "   renderer -> %d\n", rr);
@@ -11964,6 +11970,7 @@ static void ppc_mac_gpu_cp_kick(PPCMacGPUState *s, uint32_t wptr)
     uint32_t old = qatomic_xchg(&s->regs.cp_rb_wptr, wptr);
 
     cps_count(cps.wr, R200_CP_RB_WPTR);
+    qatomic_set(&cp.wait_polls, 0);
     if (unlikely(cps_on())) {
         cps.kicks++;
         cps.kick_dw += (wptr - old) & ((2u << (s->regs.cp_rb_cntl & 0x3f)) - 1);
@@ -12127,6 +12134,8 @@ static uint64_t ppc_mac_gpu_cp_rptr_read(void *opaque, hwaddr addr,
             bql_unlock();
         }
         rptr = qatomic_load_acquire(&s->regs.cp_rb_rptr);
+    } else if (pending > 4096 && cp.early_submit) {
+        qatomic_set(&cp.wait_polls, cp.wait_polls + 1);
     }
     return rptr;
 }
@@ -12182,6 +12191,8 @@ static void ppc_mac_gpu_cp_start(PPCMacGPUState *s)
     cp.yield_waiter = cp.handoff && !(e && e[0] == '0');
     e = getenv("PPCGPU_CP_WPTR_SYNC");
     cp.wptr_sync = cp.steal && !(e && e[0] == '0');
+    e = getenv("PPCGPU_CP_EARLY_SUBMIT");
+    cp.early_submit = !(e && e[0] == '0');
     qemu_event_init(&cp.kick, false);
     ppc_mac_gpu_cp_spawn();
     memory_region_init_io(&s->cp_wptr_mr, OBJECT(s), &ppc_mac_gpu_cp_wptr_ops,
