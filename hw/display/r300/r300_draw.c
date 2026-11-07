@@ -474,16 +474,26 @@ static void rs_values(const R300State *st, const Layout *l, const Route *r,
 
 static void set_uniforms(const R300State *st, R300DrawPacket *pkt)
 {
+    static __thread uint32_t raw[R300_US_NUM_CONSTS * 4];
+    static __thread float consts[R300_US_NUM_CONSTS][4];
+    static int cache = -1;
+    const uint32_t *param = &st->regs[(PFS_PARAM_0_X - R300_REG_BASE) / 4];
     R300FSUniforms *u = &pkt->uniforms;
     uint32_t outfmt = r300_reg(st, US_OUT_FMT_0);
     uint32_t bc = r300_reg(st, RB3D_BLEND_COLOR);
 
+    if (cache < 0) {
+        const char *e = getenv("PPCGPU_FS_CONST_CACHE");
+        cache = !(e && e[0] == '0');
+    }
     memset(u, 0, sizeof(*u));
-    for (int i = 0; i < R300_US_NUM_CONSTS; i++) {
-        for (int c = 0; c < 4; c++) {
-            u->consts[i][c] = r300_float24(r300_reg(st, PFS_PARAM_0_X + 16 * i + 4 * c));
+    if (!cache || memcmp(raw, param, sizeof(raw))) {
+        memcpy(raw, param, sizeof(raw));
+        for (int i = 0; i < R300_US_NUM_CONSTS * 4; i++) {
+            consts[i / 4][i % 4] = r300_float24(param[i]);
         }
     }
+    memcpy(u->consts, consts, sizeof(consts));
     u->blend_color[0] = ((bc >> 16) & 0xFF) / 255.0f;
     u->blend_color[1] = ((bc >> 8) & 0xFF) / 255.0f;
     u->blend_color[2] = (bc & 0xFF) / 255.0f;
