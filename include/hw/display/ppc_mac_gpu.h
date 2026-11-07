@@ -884,6 +884,8 @@ struct PPCMacGPUState {
      */
     bool     disp_stride_override_active;
     uint32_t disp_stride_override_value;   /* bytes per scanline */
+    uint32_t disp_stride_override_at[4];
+    uint32_t disp_stride_override_seen;
 
     /*
      * Render targets the Metal backend drew into during the current frame.

@@ -1608,6 +1608,16 @@ static void ppc_mac_gpu_vblank(void *opaque)
  * taking it would size the shadow buffer (and the surface handed to the UI)
  * shorter than the rows read out of it.
  */
+static bool r200_override_seen_at(PPCMacGPUState *s, uint32_t offset)
+{
+    for (uint32_t i = 0; i < MIN(s->disp_stride_override_seen, 4); i++) {
+        if (s->disp_stride_override_at[i] == offset) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void r200_set_present_pitch(PPCMacGPUState *s, uint32_t dst_pitch)
 {
     uint32_t min = s->disp.width * ((s->disp.bpp + 7) / 8);
@@ -1622,6 +1632,14 @@ static void r200_set_present_pitch(PPCMacGPUState *s, uint32_t dst_pitch)
             pitch_reject_log++;
         }
         return;
+    }
+    if (!s->disp_stride_override_active ||
+        s->disp_stride_override_value != dst_pitch) {
+        s->disp_stride_override_seen = 0;
+    }
+    if (!r200_override_seen_at(s, s->regs.crtc_offset)) {
+        s->disp_stride_override_at[s->disp_stride_override_seen++ % 4] =
+            s->regs.crtc_offset;
     }
     s->disp_stride_override_active = true;
     s->disp_stride_override_value = dst_pitch;
@@ -1749,7 +1767,9 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
      * CRTC-derived stride. This prevents every-frame reset from
      * undoing the pitch correction.
      */
-    if (s->disp_stride_override_active && s->disp_stride_override_value > 0) {
+    if (s->disp_stride_override_active && s->disp_stride_override_value > 0 &&
+        (!s->disp_stride_override_seen ||
+         r200_override_seen_at(s, s->regs.crtc_offset))) {
         if (m->stride != s->disp_stride_override_value) {
             static int stride_override_log = 0;
             if (stride_override_log < 20) {
@@ -5355,7 +5375,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
             /* The compositor presents by drawing the visible frame buffer
              * at the card's 3D pitch (a multiple of 32 pixels): scan out
              * at that pitch, as the R200 path does for its present BLT. */
-            if (pkt.rt_gpu_addr == s->disp.offset &&
+            if (pkt.rt_gpu_addr == s->regs.crtc_offset &&
                 pkt.rt_pitch * pkt.rt_bpp != s->disp.stride) {
                 r200_set_present_pitch(s, pkt.rt_pitch * pkt.rt_bpp);
             }
