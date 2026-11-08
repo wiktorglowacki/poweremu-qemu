@@ -36,6 +36,7 @@
 #include "qemu/rcu.h"
 #include "qemu/main-loop.h"
 #include "qemu/processor.h"
+#include "hw/core/cpu.h"
 #include "hw/pci/pci_device.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
@@ -102,6 +103,147 @@ static bool gpu_diag_on(void)
         on = getenv("PPCGPU_DIAG") != NULL;
     }
     return on;
+}
+
+/*
+ * PPCGPU_DRAIN_TRACE=FILE: which guest code waits for the GPU.  A wait runs
+ * from the first busy CP_CSQ_STAT / RBBM_STATUS poll to the first idle one;
+ * at its start the guest's call chain (LR, then the return addresses up the
+ * stack's back chain) is taken.  Chains are counted with their total wait,
+ * and FILE is rewritten with the totals every 10 s.
+ */
+typedef struct DrainSite {
+    uint64_t count, ns;
+} DrainSite;
+
+static struct {
+    int on;
+    FILE *f;
+    GHashTable *sites;
+    DrainSite *cur;
+    int64_t start, t0, last_dump;
+    uint64_t waits, wait_ns;
+} drain_trace = { .on = -1 };
+
+static bool drain_trace_on(void)
+{
+    if (drain_trace.on < 0) {
+        const char *e = getenv("PPCGPU_DRAIN_TRACE");
+
+        drain_trace.f = e && *e ? fopen(e, "w") : NULL;
+        drain_trace.on = drain_trace.f != NULL;
+        drain_trace.sites = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+        drain_trace.start = drain_trace.last_dump = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    }
+    return drain_trace.on;
+}
+
+static uint32_t drain_trace_reg(CPUState *cs, int reg)
+{
+    g_autoptr(GByteArray) b = g_byte_array_new();
+
+    return CPU_GET_CLASS(cs)->gdb_read_register(cs, b, reg) >= 4 ? ldl_be_p(b->data) : 0;
+}
+
+static void drain_trace_begin(void)
+{
+    CPUState *cs = current_cpu;
+    char chain[160];
+    uint32_t sp;
+    int len;
+
+    if (!drain_trace_on() || drain_trace.cur || !cs) {
+        return;
+    }
+    /* gdb numbering: r1 is the stack pointer, 67 the link register */
+    sp = drain_trace_reg(cs, 1);
+    len = snprintf(chain, sizeof(chain), "%08x", drain_trace_reg(cs, 67));
+    for (int i = 0; i < 12 && sp && len < (int)sizeof(chain) - 10; i++) {
+        uint8_t w[4];
+        uint32_t next;
+
+        if (cpu_memory_rw_debug(cs, sp, w, 4, false)) {
+            break;
+        }
+        next = ldl_be_p(w);
+        if (next <= sp || cpu_memory_rw_debug(cs, next + 4, w, 4, false)) {
+            break;
+        }
+        len += snprintf(chain + len, sizeof(chain) - len, " %08x", ldl_be_p(w));
+        sp = next;
+    }
+    drain_trace.cur = g_hash_table_lookup(drain_trace.sites, chain);
+    if (!drain_trace.cur) {
+        drain_trace.cur = g_new0(DrainSite, 1);
+        g_hash_table_insert(drain_trace.sites, g_strdup(chain), drain_trace.cur);
+    }
+    drain_trace.t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+}
+
+static gint drain_trace_cmp(gconstpointer a, gconstpointer b, gpointer sites)
+{
+    const DrainSite *x = g_hash_table_lookup(sites, *(char **)a);
+    const DrainSite *y = g_hash_table_lookup(sites, *(char **)b);
+
+    return x->ns < y->ns ? 1 : x->ns > y->ns ? -1 : 0;
+}
+
+static void drain_trace_end(void)
+{
+    int64_t now;
+
+    if (!drain_trace.cur) {
+        return;
+    }
+    now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    drain_trace.cur->count++;
+    drain_trace.cur->ns += now - drain_trace.t0;
+    drain_trace.waits++;
+    drain_trace.wait_ns += now - drain_trace.t0;
+    drain_trace.cur = NULL;
+    if (now - drain_trace.last_dump >= 10 * NANOSECONDS_PER_SECOND) {
+        g_autofree gpointer keys = g_hash_table_get_keys_as_array(drain_trace.sites, NULL);
+        guint n = g_hash_table_size(drain_trace.sites);
+
+        drain_trace.last_dump = now;
+        g_qsort_with_data(keys, n, sizeof(char *), drain_trace_cmp, drain_trace.sites);
+        rewind(drain_trace.f);
+        fprintf(drain_trace.f, "%.1f s, %" PRIu64 " waits, %.1f ms waiting, %u chains\n",
+                (now - drain_trace.start) / 1e9, drain_trace.waits, drain_trace.wait_ns / 1e6, n);
+        for (guint i = 0; i < n && i < 60; i++) {
+            const char *k = ((char **)keys)[i];
+            const DrainSite *d = g_hash_table_lookup(drain_trace.sites, k);
+
+            fprintf(drain_trace.f, "%9.1f ms %7" PRIu64 " x %6.0f us  %s\n",
+                    d->ns / 1e6, d->count, d->ns / 1e3 / d->count, k);
+        }
+        /* the code around each return address, to find it in a binary */
+        fprintf(drain_trace.f, "code at addr-16:\n");
+        g_autoptr(GHashTable) seen = g_hash_table_new(g_direct_hash, g_direct_equal);
+        for (guint i = 0; i < n && i < 60; i++) {
+            g_auto(GStrv) addrs = g_strsplit(((char **)keys)[i], " ", -1);
+
+            for (char **a = addrs; *a; a++) {
+                uint32_t addr = strtoul(*a, NULL, 16);
+                uint8_t code[32];
+
+                if (!addr || g_hash_table_contains(seen, GUINT_TO_POINTER(addr)) ||
+                    cpu_memory_rw_debug(current_cpu, addr - 16, code, sizeof(code), false)) {
+                    continue;
+                }
+                g_hash_table_add(seen, GUINT_TO_POINTER(addr));
+                fprintf(drain_trace.f, "%08x ", addr);
+                for (int j = 0; j < 32; j++) {
+                    fprintf(drain_trace.f, "%02x", code[j]);
+                }
+                fprintf(drain_trace.f, "\n");
+            }
+        }
+        fflush(drain_trace.f);
+        if (ftruncate(fileno(drain_trace.f), ftell(drain_trace.f))) {
+            /* a longer old listing only leaves stale lines at the end */
+        }
+    }
 }
 
 /* ========================================================================
@@ -12920,6 +13062,9 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
             r200_async_drain();
             if (s->renderer->busy_r200(s->renderer_opaque)) {
                 val |= R200_RBBM_ACTIVE;
+                drain_trace_begin();
+            } else {
+                drain_trace_end();
             }
         }
         gpu_debug_log("STATUS_RD RBBM_STATUS -> 0x%08x (%u free)", val, val & 0x7f);
@@ -13272,6 +13417,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
          */
         if (s->csq_drain) {
             bool busy = false;
+            drain_trace_begin();
             r200_async_drain();
             if (s->renderer && s->renderer->wait_busy_r200) {
                 /* a batch takes ~0.3 ms: one or two polls instead of hundreds */
@@ -13283,6 +13429,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
                 val = 0x00000100;       /* primary queue: rptr 0, wptr 1 */
             } else {
                 s->csq_drain = false;
+                drain_trace_end();
             }
         }
         break;
