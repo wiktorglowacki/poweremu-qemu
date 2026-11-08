@@ -128,6 +128,7 @@ typedef struct VkBatch {
     VkFence fence;
     int64_t submitted;          /* g_get_monotonic_time() at vkQueueSubmit */
     uint32_t draws;
+    uint32_t wb;                /* images written back at its commit */
     GArray *pools;              /* VkDescriptorPool */
     unsigned pool_cur;
     GPtrArray *chunks;          /* VkChunk * used by this batch */
@@ -2994,6 +2995,7 @@ static uint32_t vk_commit_ex(void (*done)(void *, uint32_t), void *arg,
         vk_full_barrier(b->cb);
     }
     V.stat_wb_commit += V.stat_writebacks - wb0;
+    b->wb = V.stat_writebacks - wb0;
     V.stat_commits++;
     VkMemoryBarrier mb = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -3122,9 +3124,71 @@ static bool vk_flush_r200(void *opaque)
     return true;
 }
 
+/*
+ * PPCGPU_VK_WAIT_STATS=FILE: what a guest idle wait (CP_CSQ_STAT drain) waits
+ * for.  Per batch waited on: draws, write-backs, submit-to-done time and how
+ * long it had already run when the guest started waiting; plus the CPU time
+ * of commits made inside the waits.  FILE is rewritten every 10 s.
+ */
+static struct {
+    int on;
+    FILE *f;
+    uint32_t last_seq, wait_seq;
+    int64_t wait_start, last_dump;
+    uint64_t commits, commit_us, commit_draws;
+    uint64_t n[2], gpu_us[2], draws[2], wbs[2], ran_us[2], waited_us[2];
+} vkw = { .on = -1 };
+
+static bool vk_wait_stats(void)
+{
+    if (vkw.on < 0) {
+        const char *e = getenv("PPCGPU_VK_WAIT_STATS");
+
+        vkw.f = e && *e ? fopen(e, "w") : NULL;
+        vkw.on = vkw.f != NULL;
+        vkw.last_dump = g_get_monotonic_time();
+    }
+    return vkw.on;
+}
+
+static void vk_wait_note(uint32_t seq, int64_t submitted, uint32_t draws, uint32_t wb, int64_t now)
+{
+    int k = wb != 0;
+
+    if ((int32_t)(seq - vkw.last_seq) <= 0) {
+        return;
+    }
+    vkw.last_seq = seq;
+    vkw.n[k]++;
+    vkw.gpu_us[k] += now - submitted;
+    vkw.draws[k] += draws;
+    vkw.wbs[k] += wb;
+    vkw.ran_us[k] += MAX(vkw.wait_start - submitted, 0);
+    vkw.waited_us[k] += now - MAX(vkw.wait_start, submitted);
+    if (now - vkw.last_dump >= 10 * G_USEC_PER_SEC) {
+        vkw.last_dump = now;
+        rewind(vkw.f);
+        fprintf(vkw.f, "commits inside waits: %" PRIu64 ", %.0f us CPU, %.0f draws avg\n",
+                vkw.commits, vkw.commits ? (double)vkw.commit_us / vkw.commits : 0.0,
+                vkw.commits ? (double)vkw.commit_draws / vkw.commits : 0.0);
+        for (int i = 0; i < 2; i++) {
+            uint64_t c = MAX(vkw.n[i], 1);
+
+            fprintf(vkw.f, "%s write-back: %" PRIu64 " batches, GPU %.0f us, ran before the wait %.0f us, "
+                    "waited %.0f us, %.0f draws, %.1f write-backs avg\n",
+                    i ? "with" : "without", vkw.n[i], (double)vkw.gpu_us[i] / c,
+                    (double)vkw.ran_us[i] / c, (double)vkw.waited_us[i] / c,
+                    (double)vkw.draws[i] / c, (double)vkw.wbs[i] / c);
+        }
+        fflush(vkw.f);
+    }
+}
+
 static bool vk_wait_busy_r200(void *opaque, uint32_t us)
 {
     VkBatch *newest;
+    int64_t t0 = us && vk_wait_stats() ? g_get_monotonic_time() : 0;
+    uint32_t cur_draws = V.cur ? V.cur->draws : 0;
 
     if (!us && !V.cur) {
         bool available = false;
@@ -3138,11 +3202,22 @@ static bool vk_wait_busy_r200(void *opaque, uint32_t us)
     }
     vk_commit_ex(NULL, NULL, true);
     newest = vk_newest_pending();
+    if (t0 && cur_draws) {
+        vkw.commits++;
+        vkw.commit_us += g_get_monotonic_time() - t0;
+        vkw.commit_draws += cur_draws;
+    }
     if (!newest) {
         return false;
     }
+    uint32_t seq = newest->seq, draws = newest->draws, wb = newest->wb;
+    int64_t submitted = newest->submitted;
+
+    if (t0 && vkw.wait_seq != seq) {
+        vkw.wait_seq = seq;
+        vkw.wait_start = t0;
+    }
     if (us && bql_locked() && qemu_in_vcpu_thread()) {
-        uint32_t seq = newest->seq;
         int64_t end = g_get_monotonic_time() + us;
 
         bql_unlock();
@@ -3150,11 +3225,17 @@ static bool vk_wait_busy_r200(void *opaque, uint32_t us)
             cpu_relax();
         }
         bql_lock();
+        if (t0 && vk_seq_done(seq)) {
+            vk_wait_note(seq, submitted, draws, wb, g_get_monotonic_time());
+        }
         return !vk_seq_done(seq);
     }
     if (vk_fence_wait(newest, us)) {
         /* A barrier opens every batch, so the newest finishing means all did. */
         vk_set_done(newest->seq);
+        if (t0) {
+            vk_wait_note(seq, submitted, draws, wb, g_get_monotonic_time());
+        }
         return false;
     }
     return true;
