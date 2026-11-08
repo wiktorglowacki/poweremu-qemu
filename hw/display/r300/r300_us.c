@@ -661,6 +661,24 @@ uint32_t r300_us_num_targets(const R300State *st)
  * Resource bindings (descriptor set 0).  r300_spirv.c maps them onto the
  * Metal argument table: see R300_BIND_* in r300_us.h.
  */
+/*
+ * PPCGPU_VS_INVARIANT=0: positions are not declared invariant (the old
+ * shaders).  By default they are, so two passes over the same geometry with
+ * different vertex programs (a lit base pass and an unlit env-map pass) get
+ * the same depth: Metal's compiler otherwise lets them differ, and the second
+ * pass's LEQUAL test passes on scattered pixels only (reVC cars on the Mac).
+ */
+const char *r300_glsl_invariant(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_VS_INVARIANT");
+        on = !(e && e[0] == '0');
+    }
+    return on ? "invariant gl_Position;\n" : "";
+}
+
 static const char us_prelude_vs[] =
 "layout(std430, set = 0, binding = 2) readonly buffer R300VB {\n"
 "    R300Vertex vb[];\n"
@@ -1563,7 +1581,7 @@ static char *us_to_glsl(const R300State *st, const R300FSDesc *desc,
      * distances when VAP_CLIP_CNTL enables any. */
     r300_sb_printf(&sb,
         "#ifdef R300_VS\n%s"
-        "%s"
+        "%s%s"
         "void main()\n"
         "{\n"
         "    R300Vertex x = vb[gl_VertexIndex];\n"
@@ -1576,6 +1594,7 @@ static char *us_to_glsl(const R300State *st, const R300FSDesc *desc,
         "#else\n\n",
         us_prelude_vs,
         ucp ? "out gl_PerVertex { vec4 gl_Position; float gl_ClipDistance[6]; };\n" : "",
+        r300_glsl_invariant(),
         ucp ? "    for (int i = 0; i < 6; i++) gl_ClipDistance[i] = x.ucp[i];\n" : "");
 
     r300_sb_printf(&sb, "%s%s%s", us_prelude,

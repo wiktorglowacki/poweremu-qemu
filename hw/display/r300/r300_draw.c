@@ -1489,7 +1489,7 @@ static const GpuVs *gpu_vs_get(const R300State *st, const R300PVSProgram *prog,
             "layout(location = 6) out vec4 v6; layout(location = 7) out vec4 v7;\n"
             "layout(location = 8) out vec4 v8; layout(location = 9) out vec4 v9;\n"
             "layout(location = 10) out vec4 aux;\n"
-            "%s"
+            "%s%s"
             "vec4 pvs_c(int x) { return x >= 0 && x <= %d ? vs.c[x] : vec4(0.0); }\n"
             "\n"
             "void main()\n"
@@ -1497,6 +1497,7 @@ static const GpuVs *gpu_vs_get(const R300State *st, const R300PVSProgram *prog,
             "    uint vb = uint(gl_VertexIndex) * vs.info.x;\n",
             r300_pvs_glsl_helpers,
             clip ? "out gl_PerVertex { vec4 gl_Position; float gl_ClipDistance[6]; };\n" : "",
+            r300_glsl_invariant(),
             prog->max_const);
         for (unsigned i = 0, slot = 0; i < R300_PVS_NUM_INPUTS; i++) {
             if (in_used & (1u << i)) {

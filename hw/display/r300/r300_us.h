@@ -163,7 +163,8 @@ char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
 char *r300_us_glsl_cached(const R300State *st, const R300FSDesc *desc,
                           uint32_t flags, uint32_t *id, uint32_t *sampler_mask,
                           const char **err);
-char *r300_us_glsl_by_id(uint32_t id);              /* malloc'd copy, or NULL */
+char *r300_us_glsl_by_id(uint32_t id);
+const char *r300_glsl_invariant(void);   /* the vertex stages' position declaration */              /* malloc'd copy, or NULL */
 bool r300_us_glsl_writes_w(uint32_t id, const char *glsl);
 
 /*
