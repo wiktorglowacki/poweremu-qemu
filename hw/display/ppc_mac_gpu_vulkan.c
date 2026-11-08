@@ -129,6 +129,7 @@ typedef struct VkBatch {
     int64_t submitted;          /* g_get_monotonic_time() at vkQueueSubmit */
     uint32_t draws;
     uint32_t wb;                /* images written back at its commit */
+    uint32_t wbz;               /* of those, depth images */
     GArray *pools;              /* VkDescriptorPool */
     unsigned pool_cur;
     GPtrArray *chunks;          /* VkChunk * used by this batch */
@@ -2959,6 +2960,8 @@ static void vk_img_written(VkImg *im, uint32_t x0, uint32_t y0,
 static uint32_t vk_commit_ex(void (*done)(void *, uint32_t), void *arg,
                              bool writeback_z)
 {
+    uint64_t wb_all = V.stat_writebacks, wbz0 = V.stat_wb_z;
+
     if (writeback_z && vk_lazy_z()) {
         for (int i = 0; i < VK_MAX_IMG; i++) {
             if (V.img[i].live && V.img[i].dirty && V.img[i].z) {
@@ -2995,7 +2998,8 @@ static uint32_t vk_commit_ex(void (*done)(void *, uint32_t), void *arg,
         vk_full_barrier(b->cb);
     }
     V.stat_wb_commit += V.stat_writebacks - wb0;
-    b->wb = V.stat_writebacks - wb0;
+    b->wb = V.stat_writebacks - wb_all;
+    b->wbz = V.stat_wb_z - wbz0;
     V.stat_commits++;
     VkMemoryBarrier mb = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -3136,7 +3140,7 @@ static struct {
     uint32_t last_seq, wait_seq;
     int64_t wait_start, last_dump;
     uint64_t commits, commit_us, commit_draws;
-    uint64_t n[2], gpu_us[2], draws[2], wbs[2], ran_us[2], waited_us[2];
+    uint64_t n[2], gpu_us[2], draws[2], wbs[2], wbzs[2], ran_us[2], waited_us[2];
 } vkw = { .on = -1 };
 
 static bool vk_wait_stats(void)
@@ -3151,7 +3155,8 @@ static bool vk_wait_stats(void)
     return vkw.on;
 }
 
-static void vk_wait_note(uint32_t seq, int64_t submitted, uint32_t draws, uint32_t wb, int64_t now)
+static void vk_wait_note(uint32_t seq, int64_t submitted, uint32_t draws, uint32_t wb, uint32_t wbz,
+                         int64_t now)
 {
     int k = wb != 0;
 
@@ -3163,6 +3168,7 @@ static void vk_wait_note(uint32_t seq, int64_t submitted, uint32_t draws, uint32
     vkw.gpu_us[k] += now - submitted;
     vkw.draws[k] += draws;
     vkw.wbs[k] += wb;
+    vkw.wbzs[k] += wbz;
     vkw.ran_us[k] += MAX(vkw.wait_start - submitted, 0);
     vkw.waited_us[k] += now - MAX(vkw.wait_start, submitted);
     if (now - vkw.last_dump >= 10 * G_USEC_PER_SEC) {
@@ -3175,10 +3181,10 @@ static void vk_wait_note(uint32_t seq, int64_t submitted, uint32_t draws, uint32
             uint64_t c = MAX(vkw.n[i], 1);
 
             fprintf(vkw.f, "%s write-back: %" PRIu64 " batches, GPU %.0f us, ran before the wait %.0f us, "
-                    "waited %.0f us, %.0f draws, %.1f write-backs avg\n",
+                    "waited %.0f us, %.0f draws, %.1f write-backs (%.1f depth) avg\n",
                     i ? "with" : "without", vkw.n[i], (double)vkw.gpu_us[i] / c,
                     (double)vkw.ran_us[i] / c, (double)vkw.waited_us[i] / c,
-                    (double)vkw.draws[i] / c, (double)vkw.wbs[i] / c);
+                    (double)vkw.draws[i] / c, (double)vkw.wbs[i] / c, (double)vkw.wbzs[i] / c);
         }
         fflush(vkw.f);
     }
@@ -3210,7 +3216,7 @@ static bool vk_wait_busy_r200(void *opaque, uint32_t us)
     if (!newest) {
         return false;
     }
-    uint32_t seq = newest->seq, draws = newest->draws, wb = newest->wb;
+    uint32_t seq = newest->seq, draws = newest->draws, wb = newest->wb, wbz = newest->wbz;
     int64_t submitted = newest->submitted;
 
     if (t0 && vkw.wait_seq != seq) {
@@ -3226,7 +3232,7 @@ static bool vk_wait_busy_r200(void *opaque, uint32_t us)
         }
         bql_lock();
         if (t0 && vk_seq_done(seq)) {
-            vk_wait_note(seq, submitted, draws, wb, g_get_monotonic_time());
+            vk_wait_note(seq, submitted, draws, wb, wbz, g_get_monotonic_time());
         }
         return !vk_seq_done(seq);
     }
@@ -3234,7 +3240,7 @@ static bool vk_wait_busy_r200(void *opaque, uint32_t us)
         /* A barrier opens every batch, so the newest finishing means all did. */
         vk_set_done(newest->seq);
         if (t0) {
-            vk_wait_note(seq, submitted, draws, wb, g_get_monotonic_time());
+            vk_wait_note(seq, submitted, draws, wb, wbz, g_get_monotonic_time());
         }
         return false;
     }
