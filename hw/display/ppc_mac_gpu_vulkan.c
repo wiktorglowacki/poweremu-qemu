@@ -329,6 +329,7 @@ static struct {
     VkImage dummy_img[3];
     VkDeviceMemory dummy_mem[3];
     VkImageView dummy_view[3];
+    VkSampler dummy_sampler;    /* what unbound units get */
     bool dummy_ready;
 
     /* completion waiter */
@@ -4024,6 +4025,7 @@ static bool vk_dummies(void)
         vkCmdClearColorImage(cb, V.dummy_img[i], VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &sr);
     }
     vk_full_barrier(cb);
+    V.dummy_sampler = vk_sampler(0, 1);
     V.dummy_ready = true;
     return true;
 }
@@ -4447,7 +4449,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         VkImageView view = VK_NULL_HANDLE;
 
         tii[t] = (VkDescriptorImageInfo){
-            vk_sampler(td->filter0, td->levels),
+            td->bound ? vk_sampler(td->filter0, td->levels) : V.dummy_sampler,
             V.dummy_view[raw ? 0 : MIN(td->dim, 2u)], VK_IMAGE_LAYOUT_GENERAL };
         u.tex_addr[t][0] = u.tex_addr[t][1] = 0;
         if (!td->bound) {
