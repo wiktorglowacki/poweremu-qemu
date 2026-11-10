@@ -297,12 +297,21 @@ static void pmac_ide_wait_pio(MACIOIDEState *d)
     }
 }
 
+static bool pmac_ide_lockfree;
+
 /* PowerMac IDE memory IO */
 static uint64_t pmac_ide_read(void *opaque, hwaddr addr, unsigned size)
 {
     MACIOIDEState *d = opaque;
     uint64_t retval = 0xffffffff;
     int reg = addr >> 4;
+    uint32_t fast;
+
+    if (pmac_ide_lockfree && reg == 0 && size == 2 &&
+        ide_data_fast_rw(&d->bus, false, &fast)) {
+        return fast;
+    }
+    BQL_LOCK_GUARD();
 
     if (reg == 0x7 || reg == 0x8 || reg == 0x16) {
         pmac_ide_wait_pio(d);
@@ -357,6 +366,13 @@ static void pmac_ide_write(void *opaque, hwaddr addr, uint64_t val,
 {
     MACIOIDEState *d = opaque;
     int reg = addr >> 4;
+    uint32_t fast = val;
+
+    if (pmac_ide_lockfree && reg == 0 && size == 2 &&
+        ide_data_fast_rw(&d->bus, true, &fast)) {
+        return;
+    }
+    BQL_LOCK_GUARD();
 
     switch (reg) {
     case 0x0:
@@ -498,6 +514,11 @@ static void macio_ide_initfn(Object *obj)
 
     ide_bus_init(&s->bus, sizeof(s->bus), DEVICE(obj), 0, 2);
     memory_region_init_io(&s->mem, obj, &pmac_ide_ops, s, "pmac-ide", 0x1000);
+    pmac_ide_lockfree = !getenv("PPC_IDE_PIO_LOCKFREE") ||
+                        atoi(getenv("PPC_IDE_PIO_LOCKFREE"));
+    if (pmac_ide_lockfree) {
+        memory_region_enable_lockless_io(&s->mem);
+    }
     sysbus_init_mmio(d, &s->mem);
     sysbus_init_irq(d, &s->real_ide_irq);
     sysbus_init_irq(d, &s->real_dma_irq);

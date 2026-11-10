@@ -571,11 +571,14 @@ bool ide_transfer_start_norecurse(IDEState *s, uint8_t *buf, int size,
     s->data_ptr = buf;
     s->data_end = buf + size;
     ide_set_retry(s);
+    if (!s->bus->dma->ops->pio_transfer) {
+        s->end_transfer_func = end_transfer_func;
+    }
+    smp_wmb();
     if (!(s->status & ERR_STAT)) {
         s->status |= DRQ_STAT;
     }
     if (!s->bus->dma->ops->pio_transfer) {
-        s->end_transfer_func = end_transfer_func;
         return false;
     }
     s->bus->dma->ops->pio_transfer(s->bus->dma);
@@ -2391,6 +2394,33 @@ static bool ide_is_pio_out(IDEState *s)
     }
 
     abort();
+}
+
+/*
+ * One 16-bit word of a PIO transfer without the BQL, unless it is the last
+ * one (that runs end_transfer_func).  Only the vCPU thread moves data_ptr
+ * while DRQ is set without BSY; a completion sets DRQ last, after smp_wmb().
+ */
+bool ide_data_fast_rw(IDEBus *bus, bool is_write, uint32_t *val)
+{
+    IDEState *s = ide_bus_active_if(bus);
+    uint8_t *p;
+
+    if ((qatomic_read(&s->status) & (BUSY_STAT | DRQ_STAT)) != DRQ_STAT) {
+        return false;
+    }
+    smp_rmb();
+    p = s->data_ptr;
+    if (s->io8 || p + 2 >= s->data_end || ide_is_pio_out(s) == is_write) {
+        return false;
+    }
+    if (is_write) {
+        *(uint16_t *)p = le16_to_cpu(*val);
+    } else {
+        *val = cpu_to_le16(*(uint16_t *)p);
+    }
+    s->data_ptr = p + 2;
+    return true;
 }
 
 void ide_data_writew(void *opaque, uint32_t addr, uint32_t val)

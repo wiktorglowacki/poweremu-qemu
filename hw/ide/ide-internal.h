@@ -413,6 +413,7 @@ uint32_t ide_status_read(void *opaque, uint32_t addr);
 void ide_ctrl_write(void *opaque, uint32_t addr, uint32_t val);
 void ide_data_writew(void *opaque, uint32_t addr, uint32_t val);
 uint32_t ide_data_readw(void *opaque, uint32_t addr);
+bool ide_data_fast_rw(IDEBus *bus, bool is_write, uint32_t *val);
 void ide_data_writel(void *opaque, uint32_t addr, uint32_t val);
 uint32_t ide_data_readl(void *opaque, uint32_t addr);
 
