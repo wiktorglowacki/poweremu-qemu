@@ -1439,7 +1439,7 @@ GEN_VXFORM_ENV(vsumsws, 4, 30);
  * the helper and leaves the TB, as the scalar ops' do (fp-impl.c.inc).
  * PPC_INLINE_VFP=0 keeps the helpers.
  */
-enum { VFP_ADD, VFP_SUB, VFP_MADD, VFP_NMSUB };
+enum { VFP_ADD, VFP_SUB, VFP_MADD, VFP_NMSUB, VFP_MAX, VFP_MIN };
 
 static bool vmx_fp_on(DisasContext *ctx)
 {
@@ -1466,6 +1466,12 @@ static void vmx_fp_emit_slow(DisasContext *ctx, NativeFPSlow *sp)
         break;
     case VFP_SUB:
         gen_helper_vsubfp(tcg_env, rd, ra, rb);
+        break;
+    case VFP_MAX:
+        gen_helper_vmaxfp(tcg_env, rd, ra, rb);
+        break;
+    case VFP_MIN:
+        gen_helper_vminfp(tcg_env, rd, ra, rb);
         break;
     case VFP_MADD:
         gen_helper_vmaddfp(tcg_env, rd, ra, rb, gen_avr_ptr(sp->z));
@@ -1554,6 +1560,21 @@ static void gen_vmx_fp_fma(DisasContext *ctx, int op)
     vmx_st(rD(ctx->opcode), r);
 }
 
+/*
+ * vmaxfp, vminfp.  A denormal operand that NJ makes zero wins on the host
+ * only where zero would, so only a denormal result needs the helper.
+ */
+static void gen_vmx_fp_maxmin(DisasContext *ctx, int op)
+{
+    TCGv_vec r = tcg_temp_new_vec(TCG_TYPE_V128);
+    TCGv_vec n = tcg_temp_new_vec(TCG_TYPE_V128);
+
+    tcg_gen_fmaxmin_vec(op == VFP_MIN, r, n, vmx_ld(rA(ctx->opcode)),
+                        vmx_ld(rB(ctx->opcode)));
+    vmx_fp_check(ctx, op, n, 0x00800000, NULL, 0);
+    vmx_st(rD(ctx->opcode), r);
+}
+
 #define GEN_VXFORM_FP(name, gen, op)                                    \
 static void glue(gen_, name)(DisasContext *ctx)                         \
 {                                                                       \
@@ -1574,8 +1595,8 @@ static void glue(gen_, name)(DisasContext *ctx)                         \
 
 GEN_VXFORM_FP(vaddfp, gen_vmx_fp_addsub, VFP_ADD)
 GEN_VXFORM_FP(vsubfp, gen_vmx_fp_addsub, VFP_SUB)
-GEN_VXFORM_ENV(vmaxfp, 5, 16);
-GEN_VXFORM_ENV(vminfp, 5, 17);
+GEN_VXFORM_FP(vmaxfp, gen_vmx_fp_maxmin, VFP_MAX)
+GEN_VXFORM_FP(vminfp, gen_vmx_fp_maxmin, VFP_MIN)
 GEN_VXFORM_HETRO(vextublx, 6, 24)
 GEN_VXFORM_HETRO(vextuhlx, 6, 25)
 GEN_VXFORM_HETRO(vextuwlx, 6, 26)

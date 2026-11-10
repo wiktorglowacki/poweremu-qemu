@@ -925,6 +925,35 @@ void tcg_gen_ffma_vec(unsigned vece, unsigned kind, TCGv_vec r,
     op->args[4] = kind;
 }
 
+/*
+ * V128 of singles: r = the larger (smaller for min) of a and b with -0
+ * below +0, where neither is a NaN; n = r there up to the sign of a zero,
+ * and a NaN where a or b is one.  Without TCG_TARGET_HAS_fmax_ieee the
+ * host's maximum is its second operand for a NaN or two zeros, so both
+ * orders together have both operands then: their AND is +0 unless both
+ * are -0, their OR -0 unless both are +0, and a NaN's OR stays a NaN.
+ */
+void tcg_gen_fmaxmin_vec(bool min, TCGv_vec r, TCGv_vec n,
+                         TCGv_vec a, TCGv_vec b)
+{
+    if (TCG_TARGET_HAS_fmax_ieee) {
+        tcg_gen_fop_vec(MO_32, 4 + min, r, a, b);
+        tcg_gen_mov_vec(n, r);
+    } else {
+        TCGv_vec t = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_fop_vec(MO_32, 4 + min, t, a, b);
+        tcg_gen_fop_vec(MO_32, 4 + min, n, b, a);
+        if (min) {
+            tcg_gen_or_vec(MO_32, n, n, t);
+            tcg_gen_mov_vec(r, n);
+        } else {
+            tcg_gen_and_vec(MO_32, r, n, t);
+            tcg_gen_or_vec(MO_32, n, n, t);
+        }
+    }
+}
+
 void tcg_gen_cmpsel_vec(TCGCond cond, unsigned vece, TCGv_vec r,
                         TCGv_vec a, TCGv_vec b, TCGv_vec c, TCGv_vec d)
 {
