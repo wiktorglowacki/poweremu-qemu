@@ -40,6 +40,7 @@ BENCH = ['vperm x4', 'vmrghb/vmrglh/vsldoi/vpkuhum',
          'vmaddfp x4 (float)', 'lfs/fmadds/stfs x4 (scalar)',
          'fmadd x4 dependent', 'fmadd x4 independent', 'fadd x4 dependent',
          'add x4 dependent (integer)']
+BENCH2 = ['lvsl/lvsr x2']
 
 
 def tool(name):
@@ -192,6 +193,8 @@ def main():
         print(f'bench {"vmhraddshs x4 dependent":36s} {vt / tbfreq * 1e3:8.1f} ms')
         st = mon.words(RESULTS + 0x214 * 4, 1)[0]
         print(f'bench {"sraw/rotlwi x4 dependent":36s} {st / tbfreq * 1e3:8.1f} ms')
+        for name, t in zip(BENCH2, mon.words(RESULTS + 0x2f0 * 4, len(BENCH2))):
+            print(f'bench {name:36s} {t / tbfreq * 1e3:8.1f} ms')
         mt, mn = mon.words(RESULTS + 0x20b * 4, 2)
         print(f'bench {"mandelbrot 64x48x256 (fcmpu exits)":36s} {mt / tbfreq * 1e3:8.1f} ms'
               f'  ({mn} iterations)')

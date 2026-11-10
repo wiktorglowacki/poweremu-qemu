@@ -571,76 +571,71 @@ static void trans_vmrgow(DisasContext *ctx)
 }
 
 /*
- * lvsl VRT,RA,RB - Load Vector for Shift Left
+ * lvsl/lvsr VRT,RA,RB - Load Vector for Shift Left/Right
  *
- * Let the EA be the sum (rA|0)+(rB). Let sh=EA[28–31].
+ * Let the EA be the sum (rA|0)+(rB). Let sh=EA[28-31].
  * Let X be the 32-byte value 0x00 || 0x01 || 0x02 || ... || 0x1E || 0x1F.
- * Bytes sh:sh+15 of X are placed into vD.
+ * lvsl places bytes sh:sh+15 of X into vD, lvsr bytes (16-sh):(31-sh).
+ *
+ * In host (little-endian) byte order both are 16-byte windows of X
+ * reversed: lvsl at offset 16 - sh, lvsr at offset sh.
+ * PPC_INLINE_LVS=0 computes the two halves with a multiply instead.
  */
-static bool trans_LVSL(DisasContext *ctx, arg_LVSL *a)
+static bool lvs_table_on(void)
 {
+    static int on = -1;
+    if (on < 0) {
+        on = g_strcmp0(getenv("PPC_INLINE_LVS"), "0") && vmx_host_tbl();
+    }
+    return on;
+}
+
+static bool do_lvs(DisasContext *ctx, arg_X *a, bool right)
+{
+    static const uint8_t rev[32] QEMU_ALIGNED(16) = {
+        31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16,
+        15, 14, 13, 12, 11, 10,  9,  8,  7,  6,  5,  4,  3,  2,  1,  0
+    };
     TCGv_i64 result = tcg_temp_new_i64();
     TCGv_i64 sh = tcg_temp_new_i64();
-    TCGv EA = tcg_temp_new();
+    TCGv EA;
 
     REQUIRE_INSNS_FLAGS(ctx, ALTIVEC);
     REQUIRE_VECTOR(ctx);
 
-    /* Get sh(from description) by anding EA with 0xf. */
     EA = do_ea_calc(ctx, a->ra, cpu_gpr[a->rb]);
+    if (lvs_table_on()) {
+        TCGv_i32 ofs = tcg_temp_new_i32();
+        TCGv_ptr p = tcg_temp_new_ptr();
+        TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_trunc_tl_i32(ofs, EA);
+        tcg_gen_andi_i32(ofs, ofs, 15);
+        if (!right) {
+            tcg_gen_subfi_i32(ofs, 16, ofs);
+        }
+        tcg_gen_ext_i32_ptr(p, ofs);
+        tcg_gen_add_ptr(p, p, tcg_constant_ptr(rev));
+        tcg_gen_ld_vec(v, p, 0);
+        vmx_st(a->rt, v);
+        return true;
+    }
     tcg_gen_extu_tl_i64(sh, EA);
     tcg_gen_andi_i64(sh, sh, 0xfULL);
-
-    /*
-     * Create bytes sh:sh+7 of X(from description) and place them in
-     * higher doubleword of vD.
-     */
     tcg_gen_muli_i64(sh, sh, 0x0101010101010101ULL);
-    tcg_gen_addi_i64(result, sh, 0x0001020304050607ull);
-    /*
-     * Create bytes sh+8:sh+15 of X(from description) and place them in
-     * lower doubleword of vD.
-     */
-    tcg_gen_addi_i64(sh, sh, 0x08090a0b0c0d0e0fULL);
+    if (right) {
+        tcg_gen_subfi_i64(result, 0x1011121314151617ULL, sh);
+        tcg_gen_subfi_i64(sh, 0x18191a1b1c1d1e1fULL, sh);
+    } else {
+        tcg_gen_addi_i64(result, sh, 0x0001020304050607ull);
+        tcg_gen_addi_i64(sh, sh, 0x08090a0b0c0d0e0fULL);
+    }
     set_avr64_pair(a->rt, result, sh);
     return true;
 }
 
-/*
- * lvsr VRT,RA,RB - Load Vector for Shift Right
- *
- * Let the EA be the sum (rA|0)+(rB). Let sh=EA[28–31].
- * Let X be the 32-byte value 0x00 || 0x01 || 0x02 || ... || 0x1E || 0x1F.
- * Bytes (16-sh):(31-sh) of X are placed into vD.
- */
-static bool trans_LVSR(DisasContext *ctx, arg_LVSR *a)
-{
-    TCGv_i64 result = tcg_temp_new_i64();
-    TCGv_i64 sh = tcg_temp_new_i64();
-    TCGv EA = tcg_temp_new();
-
-    REQUIRE_INSNS_FLAGS(ctx, ALTIVEC);
-    REQUIRE_VECTOR(ctx);
-
-    /* Get sh(from description) by anding EA with 0xf. */
-    EA = do_ea_calc(ctx, a->ra, cpu_gpr[a->rb]);
-    tcg_gen_extu_tl_i64(sh, EA);
-    tcg_gen_andi_i64(sh, sh, 0xfULL);
-
-    /*
-     * Create bytes (16-sh):(23-sh) of X(from description) and place them in
-     * higher doubleword of vD.
-     */
-    tcg_gen_muli_i64(sh, sh, 0x0101010101010101ULL);
-    tcg_gen_subfi_i64(result, 0x1011121314151617ULL, sh);
-    /*
-     * Create bytes (24-sh):(32-sh) of X(from description) and place them in
-     * lower doubleword of vD.
-     */
-    tcg_gen_subfi_i64(sh, 0x18191a1b1c1d1e1fULL, sh);
-    set_avr64_pair(a->rt, result, sh);
-    return true;
-}
+TRANS(LVSL, do_lvs, false)
+TRANS(LVSR, do_lvs, true)
 
 /*
  * vsl VRT,VRA,VRB - Vector Shift Left
