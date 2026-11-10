@@ -433,7 +433,8 @@ static void screamer_update_settings(ScreamerState *s)
         AUD_log(s_spk, "Could not open voice\n");
         return;
     }
-    AUD_set_active_out(s->voice, true);
+    AUD_set_active_out(s->voice, timer_pending(s->pace_timer) ||
+                                 !screamer_idle_off());
 }
 
 static void screamer_update_volume(ScreamerState *s)
