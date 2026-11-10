@@ -152,6 +152,9 @@ static void set_avr64_pair(int regno, TCGv_i64 hi, TCGv_i64 lo)
 static bool vmx_fastmem(DisasContext *ctx)
 {
     static int on = -1;
+#ifdef TARGET_PPC64
+    return false;   /* the op takes a 32-bit address */
+#endif
     if (on < 0) {
         on = g_strcmp0(getenv("PPC_INLINE_LVX"), "0") &&
              tcg_can_emit_vec_op(INDEX_op_fastmem_ld_vec, TCG_TYPE_V128,
