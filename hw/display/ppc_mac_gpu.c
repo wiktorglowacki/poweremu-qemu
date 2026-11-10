@@ -4060,6 +4060,14 @@ static void r300_arrays_sync(PPCMacGPUState *s, uint32_t nvtx)
     int64_t first = r300_index_offset(s->r3);
     unsigned n = 0;
 
+    static int win = -1;
+
+    if (win < 0) {
+        win = ppc_gpu_env_on("PPCGPU_FETCH_WIN");
+    }
+    for (unsigned k = 0; k < s->r3_arrays.count; k++) {
+        s->r3_arrays.a[k].win = NULL;
+    }
     if (!r200_read_sync() || !r200_read_memo()) {
         return;                 /* PPCGPU_READ_MEMO=0: the old per-read checks */
     }
@@ -4073,13 +4081,30 @@ static void r300_arrays_sync(PPCMacGPUState *s, uint32_t nvtx)
                           s->r3_arrays.a[k].stride_dw + size) * 4;
         unsigned j;
 
+        uint32_t gpu_lo = lo;
+
         if (!r300_to_vram(s, &lo, 0)) {
-            continue;                   /* the array is in the GART */
+            /* the array is in the GART: its first page */
+            uint8_t *page = win ? r200_agp_page(s, gpu_lo) : NULL;
+
+            if (page) {
+                s->r3_arrays.a[k].win = page;
+                s->r3_arrays.a[k].win_lo = gpu_lo & ~0xFFFu;
+                s->r3_arrays.a[k].win_len = 0x1000;
+            }
+            continue;
         }
         iv[n].lo = lo;
         iv[n].hi = MIN((uint64_t)lo + bytes, s->vram_size);
         if (iv[n].hi <= iv[n].lo) {
             continue;
+        }
+        if (win) {
+            /* the extent checked below, as the fetch may read it */
+            s->r3_arrays.a[k].win = (s->vram_ptr ? s->vram_ptr :
+                (uint8_t *)memory_region_get_ram_ptr(&s->vram)) + lo;
+            s->r3_arrays.a[k].win_lo = gpu_lo;
+            s->r3_arrays.a[k].win_len = iv[n].hi - iv[n].lo;
         }
         for (j = n; j > 0 && iv[j - 1].lo > iv[j].lo; j--) {
             t = iv[j]; iv[j] = iv[j - 1]; iv[j - 1] = t;

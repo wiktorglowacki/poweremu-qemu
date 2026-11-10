@@ -5,6 +5,13 @@
 #include "../../hw/display/r300/r300_draw.h"
 
 static bool no_read(void *o, uint32_t a, void *d, uint32_t l) { return false; }
+static uint8_t mem[192];
+static bool mem_read(void *o, uint32_t a, void *d, uint32_t l)
+{
+    if (a < 0x1000 || a - 0x1000 + l > sizeof(mem)) return false;
+    memcpy(d, mem + a - 0x1000, l);
+    return true;
+}
 
 int main(void)
 {
@@ -58,5 +65,39 @@ int main(void)
            p.uniforms.out_sel[0], p.uniforms.out_sel[1], p.uniforms.out_sel[2],
            p.uniforms.out_sel[3], p.uniforms.rt_swap32);
     r300_draw_free(&p);
+
+    /* The same vertices from arrays: a host window must fetch what the
+     * read callback does, for FLOAT_4 and for a D3DCOLOR element, with
+     * the last vertex outside the window. */
+    for (unsigned i = 0; i < 48; i++) {
+        memcpy(&mem[4 * i], &pkt3[1 + i], 4);
+        mem[4 * i] ^= mem[4 * i + 3];           /* bytes that differ */
+    }
+    for (int pass = 0; pass < 2; pass++) {
+        uint32_t vbuf[1] = { 0x00040035 };
+        R300DrawPacket q[2];
+        if (pass) {
+            r300_state_write(&st, 0x2150, 0x01050003);
+            r300_state_write(&st, 0x21E0, 0xF688F688 ^ 0x00010000);
+        }
+        for (int w = 0; w < 2; w++) {
+            for (unsigned k = 0; k < 3; k++) {
+                arr.a[k].addr = 0x1000 + 16 * k;
+                arr.a[k].size_dw = 4;
+                arr.a[k].stride_dw = 12;
+                arr.a[k].win = w ? mem + 16 * k : NULL;
+                arr.a[k].win_lo = 0x1000 + 16 * k;
+                arr.a[k].win_len = 3 * 48 - 16 * k;
+            }
+            arr.count = 3;
+            ok = r300_draw_build(&st, &arr, 0x34, vbuf, 1, mem_read, NULL, &q[w], &err);
+            if (!ok) { printf("array build failed: %s\n", err); return 1; }
+        }
+        assert(q[0].num_verts == q[1].num_verts && q[0].num_verts);
+        assert(!memcmp(q[0].verts, q[1].verts, q[0].num_verts * sizeof(R300Vertex)));
+        r300_draw_free(&q[0]);
+        r300_draw_free(&q[1]);
+    }
+    printf("array fetch through a window: same vertices\n");
     return 0;
 }

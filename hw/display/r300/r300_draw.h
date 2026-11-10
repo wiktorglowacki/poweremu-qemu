@@ -34,6 +34,8 @@ typedef struct R300Arrays {
         uint32_t addr;          /* GPU address */
         uint32_t size_dw;       /* dwords per element */
         uint32_t stride_dw;     /* dwords between elements */
+        const uint8_t *win;     /* host bytes of GPU addresses [win_lo, */
+        uint32_t win_lo, win_len;   /* win_lo + win_len), or NULL */
     } a[R300_MAX_ARRAYS];
 } R300Arrays;
 

@@ -175,6 +175,23 @@ static unsigned psc_dwords(unsigned type)
     return n[type & 15];
 }
 
+/* Where PSC element k of vertex vtx lies (needs arrays), and its host
+ * bytes when the array's window holds all count dwords. */
+static const uint8_t *fetch_win(const Fetch *f, unsigned k, uint32_t vtx,
+                                unsigned cursor, unsigned count, uint32_t *addr)
+{
+    /* More elements than arrays: the rest are interleaved in the last one
+     * (fetch_vertex keeps the cursor running for them). */
+    if (k >= f->arr->count) {
+        k = f->arr->count - 1;
+    }
+    *addr = f->arr->a[k].addr +
+            ((vtx + (uint32_t)f->index_offset) * f->arr->a[k].stride_dw + cursor) * 4;
+    uint32_t rel = *addr - f->arr->a[k].win_lo;
+    return f->arr->a[k].win && rel < f->arr->a[k].win_len &&
+           count * 4 <= f->arr->a[k].win_len - rel ? f->arr->a[k].win + rel : NULL;
+}
+
 /* Fetch dwords for PSC element k of vertex vtx starting at *cursor. */
 static bool fetch_dwords(Fetch *f, unsigned k, uint32_t vtx, unsigned cursor,
                          unsigned count, uint32_t *out)
@@ -192,14 +209,11 @@ static bool fetch_dwords(Fetch *f, unsigned k, uint32_t vtx, unsigned cursor,
         f->why = "vertex element with no 3D_LOAD_VBPNTR array";
         return false;
     }
-    /* More elements than arrays: the rest are interleaved in the last one
-     * (fetch_vertex keeps the cursor running for them). */
-    if (k >= f->arr->count) {
-        k = f->arr->count - 1;
-    }
-    uint32_t addr = f->arr->a[k].addr +
-                    ((vtx + (uint32_t)f->index_offset) * f->arr->a[k].stride_dw + cursor) * 4;
-    if (!f->read(f->opaque, addr, out, count * 4)) {
+    uint32_t addr;
+    const uint8_t *p = fetch_win(f, k, vtx, cursor, count, &addr);
+    if (p) {
+        memcpy(out, p, count * 4);
+    } else if (!f->read(f->opaque, addr, out, count * 4)) {
         f->why = "vertex array outside VRAM and the GART";
         return false;
     }
@@ -305,7 +319,18 @@ static bool fetch_vertex(Fetch *f, uint32_t vtx, float in[R300_PVS_NUM_INPUTS][4
             cursor = 0;                 /* each array starts afresh */
         }
         cursor += skip;
-        if (!n) {
+        const uint8_t *p;
+        uint32_t addr;
+        if (type <= 3 && x == 0xF688 && !f->immd && f->arr->count &&
+            (p = fetch_win(f, k, vtx, cursor, n, &addr))) {
+            /* FLOAT_1..4, identity swizzle, all four written */
+            uint32_t v[4] = { 0, 0, 0, 0x3F800000 };
+            for (unsigned i = 0; i <= type; i++) {
+                memcpy(&v[i], p + 4 * i, 4);
+                v[i] = vc_swap(v[i], f->swap);
+            }
+            memcpy(in[dst], v, sizeof(v));
+        } else if (!n) {
             f->warn |= R300_WARN_VTXFMT;
         } else if (!fetch_dwords(f, k, vtx, cursor, n, w)) {
             return false;
