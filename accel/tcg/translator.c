@@ -284,6 +284,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     db->record_start = 0;
     db->record_len = 0;
 
+    db->plugin_enabled = false;
     ops->init_disas_context(db, cpu);
     tcg_debug_assert(db->is_jmp == DISAS_NEXT);  /* no early exit */
 
