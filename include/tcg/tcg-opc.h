@@ -308,6 +308,8 @@ DEF(fcvt_vec, 1, 1, 1, TCG_OPF_VECTOR)
  * AArch64's SQRDMULH, which saturates that case to 32767.
  */
 DEF(mulhrs_vec, 1, 2, 0, TCG_OPF_VECTOR)
+/* r = (a + b + 1) >> 1 unsigned, without overflow. */
+DEF(avgu_vec, 1, 2, 0, TCG_OPF_VECTOR)
 
 DEF(last_generic, 0, 0, 0, TCG_OPF_NOT_PRESENT)
 

@@ -379,6 +379,8 @@ static bool tcg_target_const_match(int64_t val, int ct,
 #define OPC_PMAXSW      (0xee | P_EXT | P_DATA16)
 #define OPC_PMAXSD      (0x3d | P_EXT38 | P_DATA16)
 #define OPC_VPMAXSQ     (0x3d | P_EXT38 | P_DATA16 | P_VEXW | P_EVEX)
+#define OPC_PAVGB       (0xe0 | P_EXT | P_DATA16)
+#define OPC_PAVGW       (0xe3 | P_EXT | P_DATA16)
 #define OPC_PMAXUB      (0xde | P_EXT | P_DATA16)
 #define OPC_PMAXUW      (0x3e | P_EXT38 | P_DATA16)
 #define OPC_PMAXUD      (0x3f | P_EXT38 | P_DATA16)
@@ -3741,6 +3743,9 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_mulhrs_vec:
         insn = OPC_PMULHRSW;
         goto gen_simd;
+    case INDEX_op_avgu_vec:
+        insn = vece == MO_8 ? OPC_PAVGB : OPC_PAVGW;
+        goto gen_simd;
     case INDEX_op_concat_i64_vec:
         tcg_out_pair_to_vec(s, TCG_TYPE_I64, a0, a1, a2);
         break;
@@ -4111,6 +4116,7 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_x86_vpshldi_vec:
     case INDEX_op_fop_vec:
     case INDEX_op_mulhrs_vec:
+    case INDEX_op_avgu_vec:
 #if TCG_TARGET_REG_BITS == 32
     case INDEX_op_dup2_vec:
 #endif
@@ -4170,6 +4176,8 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
         return TCG_TARGET_HAS_tbl_vec && type == TCG_TYPE_V128 && vece == MO_8;
     case INDEX_op_mulhrs_vec:
         return TCG_TARGET_HAS_mulhrs_vec && vece == MO_16;
+    case INDEX_op_avgu_vec:
+        return TCG_TARGET_HAS_avgu_vec && vece <= MO_16;
     case INDEX_op_concat_i64_vec:
         return TCG_TARGET_HAS_concat_i64_vec && type == TCG_TYPE_V128;
     case INDEX_op_fastmem_ld_vec:

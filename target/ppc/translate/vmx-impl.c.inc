@@ -3732,8 +3732,39 @@ static void gen_vavgs(unsigned vece, TCGv_vec t, TCGv_vec a, TCGv_vec b)
     do_vavg(vece, t, a, b, tcg_gen_sari_vec);
 }
 
+/*
+ * Averages on the host's rounding average (x86 pavgb/pavgw, AArch64
+ * urhadd); the signed ones with both inputs and the result biased by the
+ * sign bit.  PPC_INLINE_VAVG=0 keeps the shift-and-add form.
+ */
+static void gen_vavgu_host(unsigned vece, TCGv_vec t, TCGv_vec a, TCGv_vec b)
+{
+    tcg_gen_avgu_vec(vece, t, a, b);
+}
+
+static void gen_vavgs_host(unsigned vece, TCGv_vec t, TCGv_vec a, TCGv_vec b)
+{
+    TCGv_vec m = tcg_constant_vec_matching(t, vece, 1ull << ((8 << vece) - 1));
+
+    tcg_gen_xor_vec(vece, a, a, m);
+    tcg_gen_xor_vec(vece, b, b, m);
+    tcg_gen_avgu_vec(vece, t, a, b);
+    tcg_gen_xor_vec(vece, t, t, m);
+}
+
+static bool vavg_host(int vece)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = g_strcmp0(getenv("PPC_INLINE_VAVG"), "0") != 0;
+    }
+    return on && tcg_can_emit_vec_op(INDEX_op_avgu_vec, TCG_TYPE_V128,
+                                     vece) > 0;
+}
+
 static bool do_vx_vavg(DisasContext *ctx, arg_VX *a, int sign, int vece)
 {
+    static const TCGOpcode vecop_list_h[] = { INDEX_op_avgu_vec, 0 };
     static const TCGOpcode vecop_list_s[] = {
         INDEX_op_add_vec, INDEX_op_sari_vec, 0
     };
@@ -3784,11 +3815,16 @@ static bool do_vx_vavg(DisasContext *ctx, arg_VX *a, int sign, int vece)
         },
     };
 
+    GVecGen3 g = op[sign][vece];
+
     REQUIRE_VECTOR(ctx);
 
+    if (vavg_host(vece)) {
+        g.fniv = sign ? gen_vavgs_host : gen_vavgu_host;
+        g.opt_opc = vecop_list_h;
+    }
     tcg_gen_gvec_3(avr_full_offset(a->vrt), avr_full_offset(a->vra),
-                   avr_full_offset(a->vrb), 16, 16, &op[sign][vece]);
-
+                   avr_full_offset(a->vrb), 16, 16, &g);
 
     return true;
 }

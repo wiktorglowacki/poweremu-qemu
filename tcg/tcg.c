@@ -2488,6 +2488,8 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
             && TCG_TARGET_HAS_tbl_vec;
     case INDEX_op_mulhrs_vec:
         return has_type && TCG_TARGET_HAS_mulhrs_vec;
+    case INDEX_op_avgu_vec:
+        return has_type && TCG_TARGET_HAS_avgu_vec;
     case INDEX_op_concat_i64_vec:
         return type == TCG_TYPE_V128 && TCG_TARGET_HAS_v128
             && TCG_TARGET_HAS_concat_i64_vec;

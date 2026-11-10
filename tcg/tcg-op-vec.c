@@ -604,6 +604,12 @@ void tcg_gen_mulhrs_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
     do_op3_nofail(vece, r, a, b, INDEX_op_mulhrs_vec);
 }
 
+/* See avgu_vec in tcg-opc.h; callers check tcg_can_emit_vec_op. */
+void tcg_gen_avgu_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    do_op3_nofail(vece, r, a, b, INDEX_op_avgu_vec);
+}
+
 void tcg_gen_ssadd_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
 {
     do_op3_nofail(vece, r, a, b, INDEX_op_ssadd_vec);
