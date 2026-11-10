@@ -114,6 +114,12 @@ static const int tcg_target_reg_alloc_order[] = {
 static bool use_vbmi_tbl;
 /* tbl_vec as vpermi2b alone (indexes are below 32); PPC_TBL_MOD=0 restores. */
 static bool tbl_mod32;
+/*
+ * Variable shifts of elements the host cannot shift (8-bit; 16-bit without
+ * AVX512BW) go through elements of twice the width: PPC_VSH_EXPAND=0 leaves
+ * them to the out-of-line helpers, =2 also expands 16-bit ones (tests).
+ */
+static int vsh_expand;
 
 static const int tcg_target_call_iarg_regs[] = {
 #if TCG_TARGET_REG_BITS == 64
@@ -4183,8 +4189,10 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_shlv_vec:
     case INDEX_op_shrv_vec:
         switch (vece) {
+        case MO_8:
+            return vsh_expand ? -1 : 0;
         case MO_16:
-            return have_avx512bw;
+            return have_avx512bw && vsh_expand != 2 ? 1 : vsh_expand ? -1 : 0;
         case MO_32:
         case MO_64:
             return have_avx2;
@@ -4192,8 +4200,10 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
         return 0;
     case INDEX_op_sarv_vec:
         switch (vece) {
+        case MO_8:
+            return vsh_expand ? -1 : 0;
         case MO_16:
-            return have_avx512bw;
+            return have_avx512bw && vsh_expand != 2 ? 1 : vsh_expand ? -1 : 0;
         case MO_32:
             return have_avx2;
         case MO_64:
@@ -4350,6 +4360,47 @@ static void expand_vec_rotv(TCGType type, unsigned vece, TCGv_vec v0,
     }
     tcg_gen_or_vec(vece, v0, v0, t);
     tcg_temp_free_vec(t);
+}
+
+/*
+ * v0 = v1 shifted by v2 per element (counts below the element width),
+ * done in elements of twice the width: the upper half of each with the
+ * count shifted down, the lower half masked or moved up and back.
+ */
+static void expand_vec_shv(TCGType type, unsigned vece, TCGOpcode opc,
+                           TCGv_vec v0, TCGv_vec v1, TCGv_vec v2)
+{
+    unsigned w = vece + 1, half = 8 << vece;
+    TCGv_vec m = tcg_constant_vec(type, w, MAKE_64BIT_MASK(0, half));
+    TCGv_vec lo = tcg_temp_new_vec(type);
+    TCGv_vec hi = tcg_temp_new_vec(type);
+    TCGv_vec c = tcg_temp_new_vec(type);
+
+    tcg_gen_shri_vec(w, c, v2, half);
+    if (opc == INDEX_op_shlv_vec) {
+        tcg_gen_andc_vec(w, hi, v1, m);
+        tcg_gen_shlv_vec(w, hi, hi, c);
+        tcg_gen_and_vec(w, c, v2, m);
+        tcg_gen_shlv_vec(w, lo, v1, c);
+        tcg_gen_and_vec(w, lo, lo, m);
+    } else if (opc == INDEX_op_shrv_vec) {
+        tcg_gen_shrv_vec(w, hi, v1, c);
+        tcg_gen_andc_vec(w, hi, hi, m);
+        tcg_gen_and_vec(w, c, v2, m);
+        tcg_gen_and_vec(w, lo, v1, m);
+        tcg_gen_shrv_vec(w, lo, lo, c);
+    } else {
+        tcg_gen_sarv_vec(w, hi, v1, c);
+        tcg_gen_andc_vec(w, hi, hi, m);
+        tcg_gen_and_vec(w, c, v2, m);
+        tcg_gen_shli_vec(w, lo, v1, half);
+        tcg_gen_sarv_vec(w, lo, lo, c);
+        tcg_gen_shri_vec(w, lo, lo, half);
+    }
+    tcg_gen_or_vec(w, v0, lo, hi);
+    tcg_temp_free_vec(lo);
+    tcg_temp_free_vec(hi);
+    tcg_temp_free_vec(c);
 }
 
 static void expand_vec_rotls(TCGType type, unsigned vece,
@@ -4520,6 +4571,13 @@ void tcg_expand_vec_op(TCGOpcode opc, TCGType type, unsigned vece,
         expand_vec_rotls(type, vece, v0, v1, temp_tcgv_i32(arg_temp(a2)));
         break;
 
+    case INDEX_op_shlv_vec:
+    case INDEX_op_shrv_vec:
+    case INDEX_op_sarv_vec:
+        v2 = temp_tcgv_vec(arg_temp(a2));
+        expand_vec_shv(type, vece, opc, v0, v1, v2);
+        break;
+
     case INDEX_op_rotlv_vec:
         v2 = temp_tcgv_vec(arg_temp(a2));
         expand_vec_rotv(type, vece, v0, v1, v2, false);
@@ -4673,6 +4731,7 @@ static void tcg_target_init(TCGContext *s)
     use_vbmi_tbl = have_avx512vbmi && have_avx512bw
                    && !(vbmi_env && vbmi_env[0] == '0');
     tbl_mod32 = use_vbmi_tbl && g_strcmp0(getenv("PPC_TBL_MOD"), "0");
+    vsh_expand = !have_avx2 ? 0 : atoi(getenv("PPC_VSH_EXPAND") ?: "1");
     tcg_target_available_regs[TCG_TYPE_I32] = ALL_GENERAL_REGS;
     if (TCG_TARGET_REG_BITS == 64) {
         tcg_target_available_regs[TCG_TYPE_I64] = ALL_GENERAL_REGS;

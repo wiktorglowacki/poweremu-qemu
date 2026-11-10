@@ -55,6 +55,9 @@ enum {
     OP_LVEBX, OP_LVEHX, OP_LVEWX, OP_STVEBX, OP_STVEHX, OP_STVEWX,
     OP_MMIO_VEB, OP_MMIO_VEH, OP_MMIO_VEW,
     OP_ISYNC_SMC,
+    OP_VSLB, OP_VSLH, OP_VSLW, OP_VSRB, OP_VSRH, OP_VSRW,
+    OP_VSRAB, OP_VSRAH, OP_VSRAW, OP_VRLB, OP_VRLH, OP_VRLW,
+    OP_VAVGUB, OP_VAVGUH, OP_VAVGUW, OP_VAVGSB, OP_VAVGSH, OP_VAVGSW,
     OP_VADDFP, OP_VSUBFP, OP_VMAXFP, OP_VMINFP, OP_VMADDFP, OP_VNMSUBFP,
     OP_VREFP, OP_VCFSX, OP_VCFUX, OP_VCTSXS, OP_VCTUXS,
     NOPS
@@ -496,6 +499,35 @@ static void run_op(int op, V a, V b, V c, int sh, V *got, V *exp,
                      + (uint32_t)a.h[2 * i + 1] * b.h[2 * i + 1];
         }
         break;
+#define SHV(OPC, insn, f, expr)                                             \
+    case OPC:                                                               \
+        ASM3(insn, r, a, b);                                                \
+        for (i = 0; i < 16 / sizeof(e.f[0]); i++) {                         \
+            unsigned bits = 8 * sizeof(e.f[0]);                             \
+            unsigned n = b.f[i] & (bits - 1);                               \
+            uint32_t x = a.f[i], m = bits == 32 ? ~0u : (1u << bits) - 1;   \
+            (void)x; (void)m; (void)n;                                      \
+            e.f[i] = expr;                                                  \
+        }                                                                   \
+        break;
+    SHV(OP_VSLB, "vslb", b, x << n)
+    SHV(OP_VSLH, "vslh", h, x << n)
+    SHV(OP_VSLW, "vslw", w, x << n)
+    SHV(OP_VSRB, "vsrb", b, x >> n)
+    SHV(OP_VSRH, "vsrh", h, x >> n)
+    SHV(OP_VSRW, "vsrw", w, x >> n)
+    SHV(OP_VSRAB, "vsrab", sb, a.sb[i] >> n)
+    SHV(OP_VSRAH, "vsrah", sh, a.sh[i] >> n)
+    SHV(OP_VSRAW, "vsraw", sw, a.sw[i] >> n)
+    SHV(OP_VRLB, "vrlb", b, x << n | (n ? (x & m) >> (bits - n) : 0))
+    SHV(OP_VRLH, "vrlh", h, x << n | (n ? (x & m) >> (bits - n) : 0))
+    SHV(OP_VRLW, "vrlw", w, x << n | (n ? (x & m) >> (bits - n) : 0))
+    SHV(OP_VAVGUB, "vavgub", b, ((uint64_t)a.b[i] + b.b[i] + 1) >> 1)
+    SHV(OP_VAVGUH, "vavguh", h, ((uint64_t)a.h[i] + b.h[i] + 1) >> 1)
+    SHV(OP_VAVGUW, "vavguw", w, ((uint64_t)a.w[i] + b.w[i] + 1) >> 1)
+    SHV(OP_VAVGSB, "vavgsb", sb, ((int64_t)a.sb[i] + b.sb[i] + 1) >> 1)
+    SHV(OP_VAVGSH, "vavgsh", sh, ((int64_t)a.sh[i] + b.sh[i] + 1) >> 1)
+    SHV(OP_VAVGSW, "vavgsw", sw, ((int64_t)a.sw[i] + b.sw[i] + 1) >> 1)
 #define FP3(OPC, insn, expr)                                               \
     case OPC:                                                               \
         ASM3(insn, r, a, b);                                                \
@@ -875,6 +907,31 @@ static void bench(void)
                      : : "v"(a.v), "v"(b.v) : "v4", "v5", "v6", "v7");
     }
     res[0x2f2] = tb() - t0;
+
+    t0 = tb();
+    for (i = 0; i < BENCH_ITERS; i++) {
+        asm volatile("vslb 4,%0,%1\n\tvsrb 5,%0,%1\n\t"
+                     "vsrab 6,%0,%1\n\tvslb 7,%1,%1"
+                     : : "v"(a.v), "v"(c.v) : "v4", "v5", "v6", "v7");
+    }
+    res[0x2f3] = tb() - t0;
+
+    t0 = tb();
+    for (i = 0; i < BENCH_ITERS; i++) {
+        asm volatile("vslh 4,%0,%1\n\tvsrh 5,%0,%1\n\t"
+                     "vsrah 6,%0,%1\n\tvslh 7,%1,%1"
+                     : : "v"(a.v), "v"(c.v) : "v4", "v5", "v6", "v7");
+    }
+    res[0x2f4] = tb() - t0;
+
+    t0 = tb();
+    for (i = 0; i < BENCH_ITERS; i++) {
+        asm volatile("vavgub 4,%0,%1\n\tvavgub 5,%0,%2\n\t"
+                     "vavguh 6,%0,%1\n\tvavgsb 7,%1,%2"
+                     : : "v"(a.v), "v"(b.v), "v"(c.v)
+                     : "v4", "v5", "v6", "v7");
+    }
+    res[0x2f5] = tb() - t0;
 
     /* ffmpeg's unaligned load with lvsl hoisted (chroma MC loop), x4 */
     {

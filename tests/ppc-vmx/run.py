@@ -33,6 +33,8 @@ lvsl lvsr lvx ldu16 ldu15 vmhraddshs vmhaddshs vperm(d=b) deadst-ld deadst-call
 mmio-vec mmio-lvx
 lvebx lvehx lvewx stvebx stvehx stvewx mmio-veb mmio-veh mmio-vew
 isync-smc
+vslb vslh vslw vsrb vsrh vsrw vsrab vsrah vsraw vrlb vrlh vrlw
+vavgub vavguh vavguw vavgsb vavgsh vavgsw
 vaddfp vsubfp vmaxfp vminfp vmaddfp vnmsubfp vrefp vcfsx vcfux vctsxs vctuxs
 """.split()
 BENCH = ['vperm x4', 'vmrghb/vmrglh/vsldoi/vpkuhum',
@@ -41,7 +43,10 @@ BENCH = ['vperm x4', 'vmrghb/vmrglh/vsldoi/vpkuhum',
          'fmadd x4 dependent', 'fmadd x4 independent', 'fadd x4 dependent',
          'add x4 dependent (integer)']
 BENCH2 = ['lvsl/lvsr x2', 'vperm x4 independent',
-          'vmrghb/vmrglh/vsldoi/vpkuhum indep.']
+          'vmrghb/vmrglh/vsldoi/vpkuhum indep.',
+          'vslb/vsrb/vsrab/vslb independent',
+          'vslh/vsrh/vsrah/vslh independent',
+          'vavgub/vavgub/vavguh/vavgsb indep.']
 
 
 def tool(name):
