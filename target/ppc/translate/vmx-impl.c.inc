@@ -1452,7 +1452,6 @@ static bool vmx_fp_host(void)
     return on;
 }
 
-/* For the ops with a slow path, which is not for every TB */
 static bool vmx_fp_on(DisasContext *ctx)
 {
     return vmx_fp_host() && ctx->n_nfp < ARRAY_SIZE(ctx->nfp)
@@ -1493,9 +1492,8 @@ static void vmx_fp_emit_slow(DisasContext *ctx, NativeFPSlow *sp)
 }
 
 /*
- * Leave for op's slow path if an element of r is a NaN (softfloat picks
- * its payload) or one of r and den[] has 0 < |x| < tiny (the bits of a
- * positive single).  The caller stores r afterwards.
+ * To op's slow path if an element of r is a NaN or one of r and den[] has
+ * 0 < |x| < tiny (|x| - 1 wraps 0 to the maximum).
  */
 static void vmx_fp_check(DisasContext *ctx, int op, TCGv_vec r, uint32_t tiny,
                          TCGv_vec *den, int nden)
@@ -1514,7 +1512,6 @@ static void vmx_fp_check(DisasContext *ctx, int op, TCGv_vec r, uint32_t tiny,
         .op = NATIVE_VMX - op, .frt = rD(ctx->opcode),
         .x = rA(ctx->opcode), .y = rB(ctx->opcode), .z = rC(ctx->opcode),
     };
-    /* |x| - 1 is below tiny - 1 for those, and 0 becomes the maximum */
     tcg_gen_and_vec(MO_32, mag, r, abs);
     tcg_gen_sub_vec(MO_32, t, mag, one);
     for (int i = 0; i < nden; i++) {
