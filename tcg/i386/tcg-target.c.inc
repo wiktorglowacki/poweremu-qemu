@@ -3587,9 +3587,11 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_x86_punpckh_vec:
         insn = punpckh_insn[vece];
         goto gen_simd;
+    case INDEX_op_packss_vec:
     case INDEX_op_x86_packss_vec:
         insn = packss_insn[vece];
         goto gen_simd;
+    case INDEX_op_packus_vec:
     case INDEX_op_x86_packus_vec:
         insn = packus_insn[vece];
         goto gen_simd;
@@ -4128,6 +4130,8 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_avgu_vec:
     case INDEX_op_zipl_vec:
     case INDEX_op_ziph_vec:
+    case INDEX_op_packss_vec:
+    case INDEX_op_packus_vec:
 #if TCG_TARGET_REG_BITS == 32
     case INDEX_op_dup2_vec:
 #endif
@@ -4193,6 +4197,10 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_ziph_vec:
     case INDEX_op_ext_vec:
         return TCG_TARGET_HAS_zip_vec && type == TCG_TYPE_V128;
+    case INDEX_op_packss_vec:
+    case INDEX_op_packus_vec:
+        return TCG_TARGET_HAS_zip_vec && type == TCG_TYPE_V128
+               && vece <= MO_16;
     case INDEX_op_concat_i64_vec:
         return TCG_TARGET_HAS_concat_i64_vec && type == TCG_TYPE_V128;
     case INDEX_op_fastmem_ld_vec:

@@ -49,7 +49,8 @@ BENCH2 = ['lvsl/lvsr x2', 'vperm x4 independent',
           'vavgub/vavgub/vavguh/vavgsb indep.',
           'vmhraddshs/vmhaddshs x2 independent',
           'vmrghb/vmrglb/vmrghh/vmrglw indep.',
-          'vupkhsb/vupklsb/vupkhsh/vupklsh ind.']
+          'vupkhsb/vupklsb/vupkhsh/vupklsh ind.',
+          'vpkshus/vpkuhus/vpkshss/vpkswss ind.']
 
 
 def tool(name):

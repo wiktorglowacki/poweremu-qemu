@@ -1304,6 +1304,19 @@ GEN_VXFORM_SHUFFLE(vpkuhum, (tcg_env, rd, ra, rb), 0, VMX_PACK_H);
 GEN_VXFORM_SHUFFLE(vpkuwum, (tcg_env, rd, ra, rb), 0, VMX_PACK_W);
 GEN_VXFORM_ENV(vpkudum, 7, 17);
 
+/* PPC_INLINE_VPKS=0 keeps the clamp-and-permute form of the packs. */
+static bool vmx_host_pack(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = g_strcmp0(getenv("PPC_INLINE_VPKS"), "0") &&
+             tcg_can_emit_vec_op(INDEX_op_packss_vec, TCG_TYPE_V128,
+                                 MO_8) > 0;
+    }
+    return on;
+}
+
 /*
  * Saturating packs: clamp each element of vA and vB to the narrower
  * range (noting in VSCR[SAT] any that changed), then pack as above.
@@ -1316,6 +1329,10 @@ static void gen_vmx_pack_sat(DisasContext *ctx, unsigned vece, bool sign_in,
     static const TCGOpcode vecop_list[] = {
         INDEX_op_smax_vec, INDEX_op_smin_vec, INDEX_op_umin_vec, 0
     };
+    static const TCGOpcode pack_list[] = {
+        INDEX_op_packss_vec, INDEX_op_packus_vec, INDEX_op_umin_vec,
+        INDEX_op_add_vec, 0
+    };
     const TCGOpcode *hold_list = tcg_swap_vecop_list(vecop_list);
     TCGv_vec in[2], sat, x;
     int i;
@@ -1324,6 +1341,41 @@ static void gen_vmx_pack_sat(DisasContext *ctx, unsigned vece, bool sign_in,
     in[1] = vmx_ld(rB(ctx->opcode));
     sat = tcg_temp_new_vec(TCG_TYPE_V128);
     x = tcg_temp_new_vec(TCG_TYPE_V128);
+    if (vmx_host_pack()) {
+        /*
+         * The host's saturating pack (vA's elements are the host's high
+         * half).  An element saturates when its bits above the result's
+         * are not all zero: as it is (unsigned result), or once biased
+         * by half the result's range (signed result).
+         */
+        TCGv_vec max = tcg_constant_vec(TCG_TYPE_V128, vece,
+                                        MAKE_64BIT_MASK(0, 4 << vece));
+
+        TCGv_vec t = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_swap_vecop_list(pack_list);
+        if (lo < 0) {
+            TCGv_vec bias = tcg_constant_vec(TCG_TYPE_V128, vece, -lo);
+
+            tcg_gen_packss_vec(vece - 1, x, in[1], in[0]);
+            tcg_gen_add_vec(vece, sat, in[0], bias);
+            tcg_gen_add_vec(vece, t, in[1], bias);
+            tcg_gen_or_vec(vece, sat, sat, t);
+        } else if (sign_in) {
+            tcg_gen_or_vec(vece, sat, in[0], in[1]);
+            tcg_gen_packus_vec(vece - 1, x, in[1], in[0]);
+        } else {
+            tcg_gen_or_vec(vece, sat, in[0], in[1]);
+            tcg_gen_umin_vec(vece, t, in[0], max);
+            tcg_gen_umin_vec(vece, x, in[1], max);
+            tcg_gen_packus_vec(vece - 1, x, x, t);
+        }
+        tcg_gen_andc_vec(vece, sat, sat, max);
+        vmx_accumulate_sat(sat);
+        vmx_st(rD(ctx->opcode), x);
+        tcg_swap_vecop_list(hold_list);
+        return;
+    }
     tcg_gen_dupi_vec(MO_8, sat, 0);
     for (i = 0; i < 2; i++) {
         if (sign_in) {

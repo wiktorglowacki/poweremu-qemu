@@ -618,6 +618,17 @@ void tcg_gen_ext_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, unsigned c)
               tcgv_vec_arg(r), tcgv_vec_arg(a), tcgv_vec_arg(b), c);
 }
 
+/* See packss_vec in tcg-opc.h (vece: the result's); hosts with zipl_vec. */
+void tcg_gen_packss_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    do_op3_nofail(vece, r, a, b, INDEX_op_packss_vec);
+}
+
+void tcg_gen_packus_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    do_op3_nofail(vece, r, a, b, INDEX_op_packus_vec);
+}
+
 /* See zipl_vec in tcg-opc.h; callers check tcg_can_emit_vec_op. */
 void tcg_gen_zipl_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
 {

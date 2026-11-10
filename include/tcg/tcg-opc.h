@@ -325,6 +325,13 @@ DEF(ziph_vec, 1, 2, 0, TCG_OPF_VECTOR)
  * 0 < c < 16 (x86 palignr, AArch64 EXT).
  */
 DEF(ext_vec, 1, 2, 1, TCG_OPF_VECTOR)
+/*
+ * V128 r = the signed elements of twice the width of a (low half of r)
+ * and b (high half) narrowed with signed (packss) or unsigned (packus)
+ * saturation (x86 packsswb and its kin, AArch64 SQXTN/SQXTUN).
+ */
+DEF(packss_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(packus_vec, 1, 2, 0, TCG_OPF_VECTOR)
 /* r = (a + b + 1) >> 1 unsigned, without overflow. */
 DEF(avgu_vec, 1, 2, 0, TCG_OPF_VECTOR)
 

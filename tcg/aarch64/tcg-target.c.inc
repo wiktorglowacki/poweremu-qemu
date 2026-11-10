@@ -2800,6 +2800,19 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_avgu_vec:
         tcg_out_insn(s, 3616, URHADD, is_q, vece, a0, a1, a2);
         break;
+    case INDEX_op_packss_vec:
+    case INDEX_op_packus_vec:
+        /* SQXTN/SQXTUN the low half from a1, then the "2" form from a2. */
+        {
+            uint32_t insn = (opc == INDEX_op_packss_vec ? 0x0e214800
+                             : 0x2e212800) | vece << 22;
+            TCGReg d = a0 == a2 ? TCG_VEC_TMP0 : a0;
+
+            tcg_out32(s, insn | (a1 & 0x1f) << 5 | (d & 0x1f));
+            tcg_out32(s, insn | 1 << 30 | (a2 & 0x1f) << 5 | (d & 0x1f));
+            tcg_out_mov(s, type, a0, d);
+        }
+        break;
     case INDEX_op_ext_vec:
         tcg_out32(s, 0x6e000000 | (a2 & 0x1f) << 16 | args[3] << 11
                   | (a1 & 0x1f) << 5 | (a0 & 0x1f));
@@ -3067,6 +3080,9 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_ziph_vec:
     case INDEX_op_ext_vec:
         return type == TCG_TYPE_V128;
+    case INDEX_op_packss_vec:
+    case INDEX_op_packus_vec:
+        return type == TCG_TYPE_V128 && vece <= MO_16;
     case INDEX_op_sqdmulh_vec:
     case INDEX_op_sqrdmulh_vec:
         return vece == MO_16 || vece == MO_32;
@@ -3326,6 +3342,8 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_avgu_vec:
     case INDEX_op_zipl_vec:
     case INDEX_op_ziph_vec:
+    case INDEX_op_packss_vec:
+    case INDEX_op_packus_vec:
     case INDEX_op_ext_vec:
     case INDEX_op_sqdmulh_vec:
     case INDEX_op_sqrdmulh_vec:

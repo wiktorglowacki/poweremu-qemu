@@ -2493,6 +2493,8 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_zipl_vec:
     case INDEX_op_ziph_vec:
     case INDEX_op_ext_vec:
+    case INDEX_op_packss_vec:
+    case INDEX_op_packus_vec:
         return type == TCG_TYPE_V128 && TCG_TARGET_HAS_v128
             && TCG_TARGET_HAS_zip_vec;
     case INDEX_op_sqdmulh_vec:

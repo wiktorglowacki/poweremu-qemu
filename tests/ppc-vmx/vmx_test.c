@@ -111,6 +111,38 @@ static V rand_vec(uint32_t *s)
  * Random halfwords, half of them edge values (vmhraddshs corners); with
  * all_min every lane is -32768 (the -32768 * -32768 product).
  */
+/*
+ * Pack inputs near the narrow range: k 1 inside it for every pack, 2 as
+ * signed narrow values, 3 as 1 with one element on or just past an edge.
+ */
+static V small_vec(uint32_t *s, int words, int k)
+{
+    static const int32_t edge[2][4] = {
+        { 0x80, 0xff, 0x100, -0x81 }, { 0x8000, 0xffff, 0x10000, -0x8001 }
+    };
+    V r;
+    uint32_t x;
+    int i;
+
+    for (i = 0; i < (words ? 4 : 8); i++) {
+        x = rnd(s);
+        if (words) {
+            r.sw[i] = k == 2 ? (int16_t)x : x & 0x7fff;
+        } else {
+            r.sh[i] = k == 2 ? (int8_t)x : x & 0x7f;
+        }
+    }
+    if (k == 3) {
+        x = rnd(s);
+        if (words) {
+            r.sw[x & 3] = edge[1][(x >> 8) & 3];
+        } else {
+            r.sh[x & 7] = edge[0][(x >> 8) & 3];
+        }
+    }
+    return r;
+}
+
 static V rand_hvec(uint32_t *s, int all_min)
 {
     static const int16_t edge[16] = {
@@ -958,6 +990,14 @@ static void bench(void)
     }
     res[0x2f8] = tb() - t0;
 
+    t0 = tb();
+    for (i = 0; i < BENCH_ITERS; i++) {
+        asm volatile("vpkshus 4,%0,%1\n\tvpkuhus 5,%0,%1\n\t"
+                     "vpkshss 6,%0,%1\n\tvpkswss 7,%0,%1"
+                     : : "v"(a.v), "v"(b.v) : "v4", "v5", "v6", "v7");
+    }
+    res[0x2f9] = tb() - t0;
+
     /* ffmpeg's unaligned load with lvsl hoisted (chroma MC loop), x4 */
     {
         V buf[8], m;
@@ -1676,6 +1716,12 @@ int main(void)
 
             if (op == OP_LVX && it < 4) {
                 a = b = concat_edges[it];
+            }
+            if (op >= OP_VPKUHUS && op <= OP_VPKSWSS && (it & 3)) {
+                int words = op == OP_VPKUWUS || op == OP_VPKSWUS ||
+                            op == OP_VPKSWSS;
+                a = small_vec(&seed, words, it & 3);
+                b = small_vec(&seed, words, it & 3);
             }
             if (op == OP_VMHRADDSHS || op == OP_VMHADDSHS) {
                 a = rand_hvec(&seed, (it & 7) == 0);
