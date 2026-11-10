@@ -998,6 +998,53 @@ static void bench(void)
     }
     res[0x2f9] = tb() - t0;
 
+    /* float: ordinary values, results unused or (dependent) staying so */
+    {
+        V fa, fb, fc;
+        fa.w[0] = fa.w[1] = fa.w[2] = 0x3fc00000; fa.w[3] = 0;
+        fb.w[0] = fb.w[1] = fb.w[2] = 0x3e800000; fb.w[3] = 0;
+        fc.w[0] = fc.w[1] = fc.w[2] = 0xbf000000; fc.w[3] = 0;
+        t0 = tb();
+        for (i = 0; i < BENCH_ITERS; i++) {
+            asm volatile("vaddfp 4,%0,%1\n\tvsubfp 5,%0,%1\n\t"
+                         "vaddfp 6,%1,%2\n\tvsubfp 7,%2,%0"
+                         : : "v"(fa.v), "v"(fb.v), "v"(fc.v)
+                         : "v4", "v5", "v6", "v7");
+        }
+        res[0x2fa] = tb() - t0;
+        t0 = tb();
+        for (i = 0; i < BENCH_ITERS; i++) {
+            asm volatile("vmaddfp 4,%0,%1,%2\n\tvnmsubfp 5,%0,%1,%2\n\t"
+                         "vmaddfp 6,%1,%2,%0\n\tvnmsubfp 7,%2,%0,%1"
+                         : : "v"(fa.v), "v"(fb.v), "v"(fc.v)
+                         : "v4", "v5", "v6", "v7");
+        }
+        res[0x2fb] = tb() - t0;
+        t0 = tb();
+        for (i = 0; i < BENCH_ITERS; i++) {
+            asm volatile("vmaxfp 4,%0,%1\n\tvminfp 5,%0,%1\n\t"
+                         "vmaxfp 6,%1,%2\n\tvminfp 7,%2,%0"
+                         : : "v"(fa.v), "v"(fb.v), "v"(fc.v)
+                         : "v4", "v5", "v6", "v7");
+        }
+        res[0x2fc] = tb() - t0;
+        t0 = tb();
+        for (i = 0; i < BENCH_ITERS; i++) {
+            asm volatile("vcmpgtfp 4,%0,%1\n\tvcmpgefp 5,%0,%1\n\t"
+                         "vcmpeqfp 6,%1,%2\n\tvcmpgtfp 7,%2,%0"
+                         : : "v"(fa.v), "v"(fb.v), "v"(fc.v)
+                         : "v4", "v5", "v6", "v7");
+        }
+        res[0x2fd] = tb() - t0;
+        t0 = tb();
+        for (i = 0; i < BENCH_ITERS; i++) {
+            asm volatile("vaddfp %0,%0,%1\n\tvsubfp %0,%0,%1\n\t"
+                         "vaddfp %0,%0,%2\n\tvsubfp %0,%0,%2"
+                         : "+v"(fa.v) : "v"(fb.v), "v"(fc.v));
+        }
+        res[0x2fe] = tb() - t0;
+    }
+
     /* ffmpeg's unaligned load with lvsl hoisted (chroma MC loop), x4 */
     {
         V buf[8], m;
@@ -1623,14 +1670,14 @@ static uint32_t vfd_word(uint32_t *seed)
     case n:                                                                 \
         if (form == 1) {                                                    \
             r = a;                                                          \
-            asm volatile(insn " %0,%0,%1\n\tmfcr %2"                        \
+            asm volatile(insn " %0,%0,%2\n\tmfcr %1"                        \
                          : "+v"(r.v), "=r"(cr) : "v"(b.v) : "cr6");         \
         } else if (form == 2) {                                             \
             r = b;                                                          \
-            asm volatile(insn " %0,%1,%0\n\tmfcr %2"                        \
+            asm volatile(insn " %0,%2,%0\n\tmfcr %1"                        \
                          : "+v"(r.v), "=r"(cr) : "v"(a.v) : "cr6");         \
         } else {                                                            \
-            asm volatile(insn " %0,%1,%2\n\tmfcr %3"                        \
+            asm volatile(insn " %0,%2,%3\n\tmfcr %1"                        \
                          : "=&v"(r.v), "=r"(cr) : "v"(a.v), "v"(b.v) : "cr6"); \
         }                                                                   \
         break;
@@ -1675,6 +1722,34 @@ static uint32_t vfd_word(uint32_t *seed)
         }                                                                   \
         break;
 
+/* a, b, c: sums, products and fused sums at the edges of the denormals */
+static const uint32_t vfd_edge[24][3] = {
+    { 0x00ffffff, 0x00000000, 0x3f000000 },   /* a * c rounds up to 2^-126 */
+    { 0x00fffffe, 0x00000000, 0x3f000000 },   /* largest denormal, exact */
+    { 0x00ffffff, 0x80000000, 0xbf000000 },
+    { 0x00800001, 0x80800000, 0x3f800000 },   /* a + b: smallest denormal */
+    { 0x00ffffff, 0x80800000, 0x3f800000 },   /* a + b: largest denormal */
+    { 0x00800000, 0x00800000, 0x3f800000 },
+    { 0x0d800000, 0x00000001, 0x3f800000 },   /* 2^-100 and a denormal */
+    { 0x0d7fffff, 0x00000001, 0x3f800000 },
+    { 0x0d800000, 0x807fffff, 0x3f800000 },
+    { 0x0d000000, 0x007fffff, 0x3f800000 },
+    { 0x0d000001, 0x807fffff, 0xbf800000 },
+    { 0x00000001, 0x80000001, 0x3f800000 },   /* denormals cancelling */
+    { 0x807fffff, 0x807fffff, 0x3f800000 },
+    { 0x007fffff, 0x007fffff, 0x40000000 },   /* two denormals, normal sum */
+    { 0x007fffff, 0x3f800000, 0x7f000000 },   /* denormal * large */
+    { 0x7f000000, 0xbf800000, 0x007fffff },
+    { 0x00000001, 0x00000000, 0x7f7fffff },
+    { 0x3f800000, 0x00000001, 0x3f800001 },   /* denormal addend */
+    { 0x3f800001, 0x80000001, 0x3f800001 },
+    { 0x1e000000, 0x00000000, 0x20800000 },   /* product 2^-125, 2^-126 */
+    { 0x1e000000, 0x80800000, 0x20000000 },
+    { 0x1e7fffff, 0x00000000, 0x20000000 },   /* product just under 2^-126 */
+    { 0x00800000, 0x00800001, 0x00800000 },
+    { 0x80800000, 0x00800000, 0x3f800000 },   /* exact cancellation */
+};
+
 static void vfp_diff(uint32_t *seed)
 {
     volatile uint32_t *out = (volatile uint32_t *)VFD_BASE;
@@ -1709,7 +1784,13 @@ static void vfp_diff(uint32_t *seed)
                 break;
             }
         }
-        if ((it & 7) == 0) {
+        if (it < (int)(sizeof(vfd_edge) / sizeof(vfd_edge[0]))) {
+            for (int i = 0; i < 4; i++) {
+                a.w[i] = vfd_edge[(it + i) % 24][0];
+                b.w[i] = vfd_edge[(it + i) % 24][1];
+                c.w[i] = vfd_edge[(it + i) % 24][2];
+            }
+        } else if ((it & 7) == 0) {
             /* every lane ordinary, as real code's are */
             for (int i = 0; i < 4; i++) {
                 a.w[i] = (a.w[i] & 0x807fffff) | (120 + (k >> (3 * i) & 7)) << 23;
