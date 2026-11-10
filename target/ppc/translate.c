@@ -118,7 +118,7 @@ void ppc_translate_init(void)
         ppc_mtmsr_ee = !(e && e[0] == '0');
     }
 #endif
-#if defined(__aarch64__) && !HOST_BIG_ENDIAN && \
+#if (defined(__aarch64__) || defined(__x86_64__)) && !HOST_BIG_ENDIAN && \
     !defined(TARGET_PPC64) && !defined(CONFIG_USER_ONLY)
     ppc_inline_ve = g_strcmp0(getenv("PPC_INLINE_VE"), "0") != 0;
 #endif
