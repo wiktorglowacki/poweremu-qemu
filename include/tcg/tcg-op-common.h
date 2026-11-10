@@ -466,6 +466,8 @@ void tcg_gen_fastmem_ld_vec(TCGv_vec r, TCGv_i32 addr, unsigned mmu_idx);
 void tcg_gen_fastmem_st_vec(TCGv_vec v, TCGv_i32 addr, unsigned mmu_idx);
 void tcg_gen_mulhrs_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_avgu_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_sqdmulh_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_sqrdmulh_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_concat_i64_vec(TCGv_vec r, TCGv_i64 lo, TCGv_i64 hi);
 void tcg_gen_fop_vec(unsigned vece, unsigned op, TCGv_vec r,
                      TCGv_vec a, TCGv_vec b);

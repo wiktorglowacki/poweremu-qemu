@@ -610,6 +610,17 @@ void tcg_gen_avgu_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
     do_op3_nofail(vece, r, a, b, INDEX_op_avgu_vec);
 }
 
+/* See sqdmulh_vec in tcg-opc.h; callers check tcg_can_emit_vec_op. */
+void tcg_gen_sqdmulh_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    do_op3_nofail(vece, r, a, b, INDEX_op_sqdmulh_vec);
+}
+
+void tcg_gen_sqrdmulh_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    do_op3_nofail(vece, r, a, b, INDEX_op_sqrdmulh_vec);
+}
+
 void tcg_gen_ssadd_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
 {
     do_op3_nofail(vece, r, a, b, INDEX_op_ssadd_vec);

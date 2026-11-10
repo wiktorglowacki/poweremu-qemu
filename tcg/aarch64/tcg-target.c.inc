@@ -637,6 +637,8 @@ typedef enum {
     I3616_UMAX      = 0x2e206400,
     I3616_UMIN      = 0x2e206c00,
     I3616_URHADD    = 0x2e201400,
+    I3616_SQDMULH   = 0x0e20b400,
+    I3616_SQRDMULH  = 0x2e20b400,
     I3616_UQADD     = 0x2e200c00,
     I3616_UQSUB     = 0x2e202c00,
     I3616_USHL      = 0x2e204400,
@@ -2796,6 +2798,12 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_avgu_vec:
         tcg_out_insn(s, 3616, URHADD, is_q, vece, a0, a1, a2);
         break;
+    case INDEX_op_sqdmulh_vec:
+        tcg_out_insn(s, 3616, SQDMULH, is_q, vece, a0, a1, a2);
+        break;
+    case INDEX_op_sqrdmulh_vec:
+        tcg_out_insn(s, 3616, SQRDMULH, is_q, vece, a0, a1, a2);
+        break;
     case INDEX_op_not_vec:
         tcg_out_insn(s, 3617, NOT, is_q, 0, a0, a1);
         break;
@@ -3043,6 +3051,9 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_umin_vec:
     case INDEX_op_avgu_vec:
         return vece < MO_64;
+    case INDEX_op_sqdmulh_vec:
+    case INDEX_op_sqrdmulh_vec:
+        return vece == MO_16 || vece == MO_32;
     case INDEX_op_tbl_vec:
         return type == TCG_TYPE_V128 && vece == MO_8;
     case INDEX_op_concat_i64_vec:
@@ -3297,6 +3308,8 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_umax_vec:
     case INDEX_op_umin_vec:
     case INDEX_op_avgu_vec:
+    case INDEX_op_sqdmulh_vec:
+    case INDEX_op_sqrdmulh_vec:
     case INDEX_op_shlv_vec:
     case INDEX_op_shrv_vec:
     case INDEX_op_sarv_vec:

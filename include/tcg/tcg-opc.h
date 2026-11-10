@@ -308,6 +308,12 @@ DEF(fcvt_vec, 1, 1, 1, TCG_OPF_VECTOR)
  * AArch64's SQRDMULH, which saturates that case to 32767.
  */
 DEF(mulhrs_vec, 1, 2, 0, TCG_OPF_VECTOR)
+/*
+ * r = sat((2 * a * b) >> esize), sqrdmulh_vec with half an LSB added first
+ * (AArch64 SQDMULH, SQRDMULH): only MIN * MIN saturates.
+ */
+DEF(sqdmulh_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(sqrdmulh_vec, 1, 2, 0, TCG_OPF_VECTOR)
 /* r = (a + b + 1) >> 1 unsigned, without overflow. */
 DEF(avgu_vec, 1, 2, 0, TCG_OPF_VECTOR)
 

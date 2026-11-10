@@ -2817,6 +2817,8 @@ TRANS_FLAGS(ALTIVEC, VMSUMSHS, do_va_env_helper, gen_helper_VMSUMSHS)
  * where bit 14 of the full product (= of the low product) is set.  Only
  * -32768 * -32768 wraps: it gives 0x8000, which no in-range product
  * reaches, so in those lanes add 32767 and then 1 more, each saturating.
+ * AArch64's SQRDMULH/SQDMULH are both products but saturate that lane
+ * to 32767, so there it is found from the inputs.
  * PPC_NATIVE_VMH=0 keeps the helpers (A/B tests).
  */
 static const TCGOpcode vmx_vmh_list[] = {
@@ -2825,13 +2827,22 @@ static const TCGOpcode vmx_vmh_list[] = {
     INDEX_op_ssadd_vec, INDEX_op_sssub_vec, 0
 };
 
-static bool vmx_vmh_native(void)
+static const TCGOpcode vmx_vmh_sq_list[] = {
+    INDEX_op_sqdmulh_vec, INDEX_op_sqrdmulh_vec, INDEX_op_cmp_vec,
+    INDEX_op_add_vec, INDEX_op_sub_vec, INDEX_op_ssadd_vec,
+    INDEX_op_sssub_vec, 0
+};
+
+/* 0: helper, 1: mulhrs_vec, 2: sqdmulh_vec/sqrdmulh_vec */
+static int vmx_vmh_native(void)
 {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("PPC_NATIVE_VMH");
-        on = !(e && e[0] == '0')
-             && tcg_can_emit_vecop_list(vmx_vmh_list, TCG_TYPE_V128, MO_16);
+        on = e && e[0] == '0' ? 0
+           : tcg_can_emit_vecop_list(vmx_vmh_list, TCG_TYPE_V128, MO_16) ? 1
+           : tcg_can_emit_vecop_list(vmx_vmh_sq_list, TCG_TYPE_V128, MO_16)
+           ? 2 : 0;
     }
     return on;
 }
@@ -2840,14 +2851,16 @@ static bool do_vmhaddshs(DisasContext *ctx, arg_VA *a, bool round)
 {
     const TCGOpcode *hold_list;
     TCGv_vec va, vb, p, m, t, r, sat;
+    int kind = vmx_vmh_native();
 
-    if (!vmx_vmh_native()) {
+    if (!kind) {
         return do_va_env_helper(ctx, a, round ? gen_helper_VMHRADDSHS
                                               : gen_helper_VMHADDSHS);
     }
     REQUIRE_VECTOR(ctx);
 
-    hold_list = tcg_swap_vecop_list(vmx_vmh_list);
+    hold_list = tcg_swap_vecop_list(kind == 1 ? vmx_vmh_list
+                                              : vmx_vmh_sq_list);
     va = vmx_ld(a->vra);
     vb = vmx_ld(a->vrb);
     p = tcg_temp_new_vec(TCG_TYPE_V128);
@@ -2855,16 +2868,29 @@ static bool do_vmhaddshs(DisasContext *ctx, arg_VA *a, bool round)
     t = tcg_temp_new_vec(TCG_TYPE_V128);
     r = tcg_temp_new_vec(TCG_TYPE_V128);
     sat = tcg_temp_new_vec(TCG_TYPE_V128);
-    tcg_gen_mulhrs_vec(MO_16, p, va, vb);
-    if (!round) {
-        tcg_gen_mul_vec(MO_16, t, va, vb);
-        tcg_gen_shli_vec(MO_16, t, t, 1);
-        tcg_gen_sari_vec(MO_16, t, t, 15);          /* -(bit 14) */
-        tcg_gen_add_vec(MO_16, p, p, t);
+    if (kind == 2) {
+        TCGv_vec min = tcg_constant_vec(TCG_TYPE_V128, MO_16, 0x8000);
+
+        if (round) {
+            tcg_gen_sqrdmulh_vec(MO_16, p, va, vb);
+        } else {
+            tcg_gen_sqdmulh_vec(MO_16, p, va, vb);
+        }
+        tcg_gen_cmp_vec(TCG_COND_EQ, MO_16, m, va, min);
+        tcg_gen_cmp_vec(TCG_COND_EQ, MO_16, t, vb, min);
+        tcg_gen_and_vec(MO_16, m, m, t);
+    } else {
+        tcg_gen_mulhrs_vec(MO_16, p, va, vb);
+        if (!round) {
+            tcg_gen_mul_vec(MO_16, t, va, vb);
+            tcg_gen_shli_vec(MO_16, t, t, 1);
+            tcg_gen_sari_vec(MO_16, t, t, 15);      /* -(bit 14) */
+            tcg_gen_add_vec(MO_16, p, p, t);
+        }
+        tcg_gen_cmp_vec(TCG_COND_EQ, MO_16, m, p,
+                        tcg_constant_vec(TCG_TYPE_V128, MO_16, 0x8000));
+        tcg_gen_xor_vec(MO_16, p, p, m);            /* 0x8000 -> 32767 */
     }
-    tcg_gen_cmp_vec(TCG_COND_EQ, MO_16, m, p,
-                    tcg_constant_vec(TCG_TYPE_V128, MO_16, 0x8000));
-    tcg_gen_xor_vec(MO_16, p, p, m);                /* 0x8000 -> 32767 */
     vb = vmx_ld(a->rc);
     tcg_gen_ssadd_vec(MO_16, r, p, vb);
     tcg_gen_add_vec(MO_16, t, p, vb);
