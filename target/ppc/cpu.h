@@ -1326,6 +1326,8 @@ struct CPUArchState {
     ppc_vsr_t vsr[64] QEMU_ALIGNED(16);
     /* Non-zero if and only if VSCR_SAT should be set */
     ppc_vsr_t vscr_sat QEMU_ALIGNED(16);
+    /* All ones if and only if VSCR[NJ] is set */
+    ppc_vsr_t vscr_nj QEMU_ALIGNED(16);
     /* Scratch for the inline float AltiVec ops' checks (vmx-impl.c.inc) */
     ppc_vsr_t vfp_chk QEMU_ALIGNED(16);
     /* SPE registers */

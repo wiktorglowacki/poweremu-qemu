@@ -1441,7 +1441,7 @@ GEN_VXFORM_ENV(vsumsws, 4, 30);
  */
 enum { VFP_ADD, VFP_SUB, VFP_MADD, VFP_NMSUB, VFP_MAX, VFP_MIN };
 
-static bool vmx_fp_on(DisasContext *ctx)
+static bool vmx_fp_host(void)
 {
     static int on = -1;
 
@@ -1449,7 +1449,13 @@ static bool vmx_fp_on(DisasContext *ctx)
         on = g_strcmp0(getenv("PPC_INLINE_VFP"), "0") &&
              tcg_can_emit_vec_op(INDEX_op_fop_vec, TCG_TYPE_V128, MO_32) > 0;
     }
-    return on && ctx->n_nfp < ARRAY_SIZE(ctx->nfp)
+    return on;
+}
+
+/* For the ops with a slow path, which is not for every TB */
+static bool vmx_fp_on(DisasContext *ctx)
+{
+    return vmx_fp_host() && ctx->n_nfp < ARRAY_SIZE(ctx->nfp)
            && !ctx->singlestep_enabled && !ctx->pmu_insn_cnt
            && !(tb_cflags(ctx->base.tb) & CF_USE_ICOUNT);
 }
@@ -1874,10 +1880,82 @@ static bool do_vcmpq(DisasContext *ctx, arg_VX_bf *a, bool sign)
 TRANS(VCMPSQ, do_vcmpq, true)
 TRANS(VCMPUQ, do_vcmpq, false)
 
-GEN_VXRFORM(vcmpeqfp, 3, 3)
-GEN_VXRFORM(vcmpgefp, 3, 7)
-GEN_VXRFORM(vcmpgtfp, 3, 11)
-GEN_VXRFORM(vcmpbfp, 3, 15)
+/*
+ * The float compares on the host's (fop_vec 6 a == b, 7 a >= b, 8 a > b;
+ * false for a NaN, as the helper's), with no slow path: NJ reads denormal
+ * operands as zero, which changes the result only where both operands are
+ * below 2^-126 in magnitude, and they are equal then.  vcmpbfp (fop < 0)
+ * is not (a <= b) in bit 0 and not (a >= -b) in bit 1 of each element.
+ */
+static void gen_vmx_fp_cmp(DisasContext *ctx, int fop, bool rc)
+{
+    TCGv_vec a = vmx_ld(rA(ctx->opcode));
+    TCGv_vec b = vmx_ld(rB(ctx->opcode));
+    TCGv_vec r = tcg_temp_new_vec(TCG_TYPE_V128);
+    TCGv_vec t = tcg_temp_new_vec(TCG_TYPE_V128);
+    TCGv_vec nj = tcg_temp_new_vec(TCG_TYPE_V128);
+
+    tcg_gen_or_vec(MO_32, t, a, b);
+    tcg_gen_and_vec(MO_32, t, t,
+                    tcg_constant_vec(TCG_TYPE_V128, MO_32, 0x7f800000));
+    tcg_gen_cmp_vec(TCG_COND_EQ, MO_32, t, t,
+                    tcg_constant_vec(TCG_TYPE_V128, MO_32, 0));
+    tcg_gen_ld_vec(nj, tcg_env, offsetof(CPUPPCState, vscr_nj));
+    tcg_gen_and_vec(MO_32, t, t, nj);
+    if (fop < 0) {
+        TCGv_vec ge = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec sign = tcg_constant_vec(TCG_TYPE_V128, MO_32, 0x80000000);
+
+        tcg_gen_fop_vec(MO_32, 7, r, b, a);
+        tcg_gen_xor_vec(MO_32, ge, b, sign);
+        tcg_gen_fop_vec(MO_32, 7, ge, a, ge);
+        tcg_gen_or_vec(MO_32, r, r, t);
+        tcg_gen_or_vec(MO_32, ge, ge, t);
+        tcg_gen_andc_vec(MO_32, r, sign, r);
+        tcg_gen_andc_vec(MO_32, ge,
+                         tcg_constant_vec(TCG_TYPE_V128, MO_32, 0x40000000),
+                         ge);
+        tcg_gen_or_vec(MO_32, r, r, ge);
+    } else {
+        tcg_gen_fop_vec(MO_32, fop, r, a, b);
+        if (fop == 8) {
+            tcg_gen_andc_vec(MO_32, r, r, t);
+        } else {
+            tcg_gen_or_vec(MO_32, r, r, t);
+        }
+    }
+    vmx_st(rD(ctx->opcode), r);
+    if (rc) {
+        do_vcmp_rc(rD(ctx->opcode));
+    }
+}
+
+#define GEN_VXRFORM_FP1(opname, name, fop, rc)                          \
+static void glue(gen_, name)(DisasContext *ctx)                         \
+{                                                                       \
+    TCGv_ptr ra, rb, rd;                                                \
+    if (unlikely(!ctx->altivec_enabled)) {                              \
+        gen_exception(ctx, POWERPC_EXCP_VPU);                           \
+        return;                                                         \
+    }                                                                   \
+    if (vmx_fp_host()) {                                                \
+        gen_vmx_fp_cmp(ctx, fop, rc);                                   \
+        return;                                                         \
+    }                                                                   \
+    ra = gen_avr_ptr(rA(ctx->opcode));                                  \
+    rb = gen_avr_ptr(rB(ctx->opcode));                                  \
+    rd = gen_avr_ptr(rD(ctx->opcode));                                  \
+    gen_helper_##opname(tcg_env, rd, ra, rb);                           \
+}
+
+#define GEN_VXRFORM_FP(name, fop)                                       \
+    GEN_VXRFORM_FP1(name, name, fop, false)                             \
+    GEN_VXRFORM_FP1(name##_dot, name##_, fop, true)
+
+GEN_VXRFORM_FP(vcmpeqfp, 6)
+GEN_VXRFORM_FP(vcmpgefp, 7)
+GEN_VXRFORM_FP(vcmpgtfp, 8)
+GEN_VXRFORM_FP(vcmpbfp, -1)
 
 static void gen_vsplti(DisasContext *ctx, int vece)
 {

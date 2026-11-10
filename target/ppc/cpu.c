@@ -58,6 +58,7 @@ void ppc_store_vscr(CPUPPCState *env, uint32_t vscr)
     /* Which bit we set is completely arbitrary, but clear the rest.  */
     env->vscr_sat.u64[0] = vscr & (1u << VSCR_SAT);
     env->vscr_sat.u64[1] = 0;
+    memset(&env->vscr_nj, -((vscr >> VSCR_NJ) & 1), sizeof(env->vscr_nj));
     set_flush_to_zero((vscr >> VSCR_NJ) & 1, &env->vec_status);
     set_flush_inputs_to_zero((vscr >> VSCR_NJ) & 1, &env->vec_status);
 }
