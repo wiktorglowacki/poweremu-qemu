@@ -2647,6 +2647,29 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         tcg_out_dup_vec(s, type, MO_64, a0, a1);
         tcg_out_insn(s, 3605, INS, 0, a0, a2, 24, 0);
         break;
+    case INDEX_op_fastmem_ld_vec:
+    case INDEX_op_fastmem_st_vec:
+        /*
+         * [window + (uint32_t)a1]; REV64 v.16b and EXT v, v, v, #8
+         * reverse the 16 bytes.
+         */
+        tcg_out_movi(s, TCG_TYPE_PTR, TCG_REG_TMP1, tcg_fastmem_base[a2]);
+        if (opc == INDEX_op_fastmem_ld_vec) {
+            tcg_out_ldst_r(s, I3312_LDRVQ, a0, TCG_REG_TMP1, TCG_TYPE_I32,
+                           a1);
+            a2 = a0;
+        } else {
+            a2 = a0;
+            a0 = TCG_VEC_TMP0;
+        }
+        tcg_out32(s, 0x4e200800 | (a2 & 0x1f) << 5 | (a0 & 0x1f));
+        tcg_out32(s, 0x6e004000 | (a0 & 0x1f) << 16 | (a0 & 0x1f) << 5
+                  | (a0 & 0x1f));
+        if (opc == INDEX_op_fastmem_st_vec) {
+            tcg_out_ldst_r(s, I3312_STRVQ, a0, TCG_REG_TMP1, TCG_TYPE_I32,
+                           a1);
+        }
+        break;
     case INDEX_op_add_vec:
         if (is_scalar) {
             tcg_out_insn(s, 3611, ADD, vece, a0, a1, a2);
@@ -3019,6 +3042,9 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
         return type == TCG_TYPE_V128 && vece == MO_8;
     case INDEX_op_concat_i64_vec:
         return use_concat_vec && type == TCG_TYPE_V128 && vece == MO_64;
+    case INDEX_op_fastmem_ld_vec:
+    case INDEX_op_fastmem_st_vec:
+        return type == TCG_TYPE_V128;
     case INDEX_op_fop_vec:
     case INDEX_op_ffma_vec:
     case INDEX_op_fcvt_vec:
@@ -3248,6 +3274,10 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
 
     case INDEX_op_concat_i64_vec:
         return C_O1_I2(w, r, r);
+    case INDEX_op_fastmem_ld_vec:
+        return C_O1_I1(w, r);
+    case INDEX_op_fastmem_st_vec:
+        return C_O0_I2(w, r);
 
     case INDEX_op_add_vec:
     case INDEX_op_sub_vec:

@@ -144,6 +144,30 @@ static void set_avr64_pair(int regno, TCGv_i64 hi, TCGv_i64 lo)
     vmx_st(regno, v);
 }
 
+/*
+ * lvx/stvx as one vector access to the fastmem window where the block
+ * has one and the site was not sent back to softmmu (fastmem_ld_vec).
+ * PPC_INLINE_LVX=0 keeps the two 8-byte halves.
+ */
+static bool vmx_fastmem(DisasContext *ctx)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = g_strcmp0(getenv("PPC_INLINE_LVX"), "0") &&
+             tcg_can_emit_vec_op(INDEX_op_fastmem_ld_vec, TCG_TYPE_V128,
+                                 MO_8) > 0;
+    }
+    return on && ctx->fastmem && !ctx->le_mode &&
+           !(ctx->default_tcg_memop_mask & MO_NOFASTMEM);
+}
+
+static TCGv_i32 vmx_ea32(TCGv EA)
+{
+    TCGv_i32 a = tcg_temp_new_i32();
+    tcg_gen_trunc_tl_i32(a, EA);
+    return a;
+}
+
 static bool trans_LVX(DisasContext *ctx, arg_X *a)
 {
     TCGv EA;
@@ -151,10 +175,16 @@ static bool trans_LVX(DisasContext *ctx, arg_X *a)
     TCGv_i64 lo = tcg_temp_new_i64(), hi = tcg_temp_new_i64();
     REQUIRE_INSNS_FLAGS(ctx, ALTIVEC);
     REQUIRE_VECTOR(ctx);
-    gen_set_access_type(ctx, ACCESS_INT);
-    avr = tcg_temp_new_i128();
     EA = do_ea_calc(ctx, a->ra, cpu_gpr[a->rb]);
     tcg_gen_andi_tl(EA, EA, ~0xf);
+    if (vmx_fastmem(ctx)) {
+        TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V128);
+        tcg_gen_fastmem_ld_vec(v, vmx_ea32(EA), ctx->mem_idx);
+        vmx_st(a->rt, v);
+        return true;
+    }
+    gen_set_access_type(ctx, ACCESS_INT);
+    avr = tcg_temp_new_i128();
     tcg_gen_qemu_ld_i128(avr, EA, ctx->mem_idx,
                          DEF_MEMOP(MO_128 | MO_ATOM_IFALIGN_PAIR));
     tcg_gen_extr_i128_i64(lo, hi, avr);
@@ -175,10 +205,14 @@ static bool trans_STVX(DisasContext *ctx, arg_STVX *a)
     TCGv_i128 avr;
     REQUIRE_INSNS_FLAGS(ctx, ALTIVEC);
     REQUIRE_VECTOR(ctx);
-    gen_set_access_type(ctx, ACCESS_INT);
-    avr = tcg_temp_new_i128();
     EA = do_ea_calc(ctx, a->ra, cpu_gpr[a->rb]);
     tcg_gen_andi_tl(EA, EA, ~0xf);
+    if (vmx_fastmem(ctx)) {
+        tcg_gen_fastmem_st_vec(vmx_ld(a->rt), vmx_ea32(EA), ctx->mem_idx);
+        return true;
+    }
+    gen_set_access_type(ctx, ACCESS_INT);
+    avr = tcg_temp_new_i128();
     get_avr_full(avr, a->rt);
     tcg_gen_qemu_st_i128(avr, EA, ctx->mem_idx,
                          DEF_MEMOP(MO_128 | MO_ATOM_IFALIGN_PAIR));

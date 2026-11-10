@@ -49,10 +49,56 @@ _start:
     sync
     isync
     lis     9,0x1000
+#if WATCH == 2
+    lis     3,0x0200
+    ori     3,3,0x4010
+#else
     li      3,0x4010
+#endif
     mtmsr   3
     isync
-#if WATCH
+#if WATCH == 2
+    lis     3,0x0011
+    ori     3,3,0x2233
+    stw     3,0x3000(9)
+    lis     3,0x4455
+    ori     3,3,0x6677
+    stw     3,0x3004(9)
+    lis     3,0x8899
+    ori     3,3,0xaabb
+    stw     3,0x3008(9)
+    lis     3,0xccdd
+    ori     3,3,0xeeff
+    stw     3,0x300c(9)
+    addi    8,9,0x3005
+    lvx     1,0,8
+    addi    8,9,0x3020
+    stvewx  1,0,8
+    li      7,12
+    stvewx  1,7,8
+    li      7,3
+    lvsl    2,0,7
+    addi    8,9,0x3047
+    stvx    2,0,8
+    lis     6,0xdead
+    ori     6,6,0xbeef
+    b       fault_load
+after:
+    addi    8,9,0x3030
+    stvewx  1,0,8
+    b       done
+.org 0x200
+fault_load:
+    addi    6,9,0x3ff8
+    addi    6,6,0x10
+    lvx     1,0,6
+    b       fault_store
+.org 0x210
+fault_store:
+    addi    6,6,0x10
+    stvx    2,0,6
+    b       after
+#elif WATCH
     lwz     3,0x3000(9)
     stw     3,0x3000(9)
     li      4,0x55

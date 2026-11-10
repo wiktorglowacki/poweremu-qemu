@@ -793,6 +793,19 @@ void tcg_gen_tbl_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec idx)
               temp_arg(rt), temp_arg(at), temp_arg(bt), temp_arg(it));
 }
 
+/* See fastmem_ld_vec in tcg-opc.h; callers check tcg_can_emit_vec_op. */
+void tcg_gen_fastmem_ld_vec(TCGv_vec r, TCGv_i32 addr, unsigned mmu_idx)
+{
+    vec_gen_3(INDEX_op_fastmem_ld_vec, TCG_TYPE_V128, MO_8,
+              tcgv_vec_arg(r), tcgv_i32_arg(addr), mmu_idx);
+}
+
+void tcg_gen_fastmem_st_vec(TCGv_vec v, TCGv_i32 addr, unsigned mmu_idx)
+{
+    vec_gen_3(INDEX_op_fastmem_st_vec, TCG_TYPE_V128, MO_8,
+              tcgv_vec_arg(v), tcgv_i32_arg(addr), mmu_idx);
+}
+
 /*
  * V128 r = { lo, hi }: lo in the 64-bit element at host byte offset 0,
  * hi in the one at offset 8.  Without the host op: two dups and a select.

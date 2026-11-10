@@ -950,9 +950,9 @@ static inline void tcg_out_vex_modrm_pool(TCGContext *s, int opc, int r)
     tcg_out32(s, 0);
 }
 
-/* Output "r = v op m128" with m128 the 64-bit d x 2 from the constant pool. */
-static void tcg_out_vex_pool_q2(TCGContext *s, int opc, int r, int v,
-                                uint64_t d)
+/* Output "r = v op m128" with m128 = d1:d0 from the constant pool. */
+static void tcg_out_vex_pool_qq(TCGContext *s, int opc, int r, int v,
+                                uint64_t d0, uint64_t d1)
 {
     if (opc & P_EVEX) {
         tcg_out_evex_opc(s, opc, r, v, 0, 0, 0, false);
@@ -962,11 +962,18 @@ static void tcg_out_vex_pool_q2(TCGContext *s, int opc, int r, int v,
     tcg_out8(s, LOWREGMASK(r) << 3 | 5);
     tcg_out32(s, 0);
     if (TCG_TARGET_REG_BITS == 64) {
-        new_pool_l2(s, R_386_PC32, s->code_ptr - 4, -4, d, d);
+        new_pool_l2(s, R_386_PC32, s->code_ptr - 4, -4, d0, d1);
     } else {
         new_pool_l4(s, R_386_32, s->code_ptr - 4, 0,
-                    (uint32_t)d, d >> 32, (uint32_t)d, d >> 32);
+                    (uint32_t)d0, d0 >> 32, (uint32_t)d1, d1 >> 32);
     }
+}
+
+/* Output "r = v op m128" with m128 the 64-bit d x 2 from the constant pool. */
+static void tcg_out_vex_pool_q2(TCGContext *s, int opc, int r, int v,
+                                uint64_t d)
+{
+    tcg_out_vex_pool_qq(s, opc, r, v, d, d);
 }
 
 /* Output "r = v op m128" with m128 the byte c x 16 from the constant pool. */
@@ -3738,6 +3745,29 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         tcg_out_pair_to_vec(s, TCG_TYPE_I64, a0, a1, a2);
         break;
 
+#if TCG_TARGET_REG_BITS == 64
+    case INDEX_op_fastmem_ld_vec:
+    case INDEX_op_fastmem_st_vec:
+        /* [window + (uint32_t)a1] and a vpshufb that reverses 16 bytes. */
+        tcg_out_ext32u(s, TCG_REG_L0, a1);
+        tcg_out_movi(s, TCG_TYPE_PTR, TCG_REG_L1, tcg_fastmem_base[a2]);
+        if (opc == INDEX_op_fastmem_ld_vec) {
+            tcg_out_vex_modrm_sib_offset(s, OPC_MOVDQU_VxWx, a0, 0,
+                                         TCG_REG_L1, TCG_REG_L0, 0, 0);
+            a1 = a0;
+        } else {
+            a1 = a0;
+            a0 = TCG_TMP_VEC;
+        }
+        tcg_out_vex_pool_qq(s, OPC_PSHUFB, a0, a1,
+                            0x08090a0b0c0d0e0full, 0x0001020304050607ull);
+        if (opc == INDEX_op_fastmem_st_vec) {
+            tcg_out_vex_modrm_sib_offset(s, OPC_MOVDQU_WxVx, a0, 0,
+                                         TCG_REG_L1, TCG_REG_L0, 0, 0);
+        }
+        break;
+#endif
+
     case INDEX_op_tbl_vec:
         /*
          * r[i] = (a:b)[idx[i]], 0 for idx[i] >= 32.  One half is looked
@@ -4038,6 +4068,10 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
 
     case INDEX_op_concat_i64_vec:
         return C_O1_I2(x, r, r);
+    case INDEX_op_fastmem_ld_vec:
+        return C_O1_I1(x, L);
+    case INDEX_op_fastmem_st_vec:
+        return C_O0_I2(x, L);
 
     case INDEX_op_add_vec:
     case INDEX_op_sub_vec:
@@ -4138,6 +4172,9 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
         return TCG_TARGET_HAS_mulhrs_vec && vece == MO_16;
     case INDEX_op_concat_i64_vec:
         return TCG_TARGET_HAS_concat_i64_vec && type == TCG_TYPE_V128;
+    case INDEX_op_fastmem_ld_vec:
+    case INDEX_op_fastmem_st_vec:
+        return TCG_TARGET_HAS_fastmem_vec && type == TCG_TYPE_V128;
     case INDEX_op_fop_vec:
     case INDEX_op_ffma_vec:
     case INDEX_op_fcvt_vec:

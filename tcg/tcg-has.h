@@ -97,6 +97,9 @@
 #ifndef TCG_TARGET_HAS_tbl_vec
 #define TCG_TARGET_HAS_tbl_vec          0
 #endif
+#ifndef TCG_TARGET_HAS_fastmem_vec
+#define TCG_TARGET_HAS_fastmem_vec      0
+#endif
 #ifndef TCG_TARGET_HAS_concat_i64_vec
 #define TCG_TARGET_HAS_concat_i64_vec   0
 #endif

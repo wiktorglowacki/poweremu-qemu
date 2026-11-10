@@ -50,7 +50,7 @@ def qemu_args(image, extra=()):
             '-display', 'none', '-serial', 'none', *extra]
 
 
-def dsi_case(tmp, image, fastmem):
+def dsi_case(tmp, image, fastmem, extra=None):
     sock = tmp / f'mon-{fastmem}.sock'
     vm = subprocess.Popen(qemu_args(image, ['-monitor', f'unix:{sock},server=on,wait=off']),
                           env=dict(os.environ, PPC_FASTMEM=fastmem), stdout=subprocess.DEVNULL)
@@ -62,7 +62,7 @@ def dsi_case(tmp, image, fastmem):
             time.sleep(0.05)
         else:
             raise RuntimeError(f'PPC_FASTMEM={fastmem}: guest did not take two faults')
-        return mon.words(0x30010, 12)
+        return mon.words(0x30010, 12) + (mon.words(extra, 20) if extra else [])
     finally:
         vm.kill()
         vm.wait()
@@ -98,6 +98,17 @@ with tempfile.TemporaryDirectory(prefix='ppc-fastmem-') as tmp:
         assert words == want, (f, [hex(w) for w in words])
     print('page-crossing lwz/stw into an unmapped page: DSI, memory untouched, '
           'identical with PPC_FASTMEM=0 and 1 PASS')
+    image = rom(tmp, 2)
+    got = {f: dsi_case(tmp, image, f, 0x3020) for f in ('0', '1')}
+    want = [0x40000000, 0x10004000, FAULT_LOAD + 8, 0x10004008, *MEM,
+            0x42000000, 0x10004010, FAULT_STORE + 4, 0x10004018, *MEM,
+            0x00112233, 0, 0, 0xccddeeff, 0x00112233, 0, 0, 0,
+            0x03040506, 0x0708090a, 0x0b0c0d0e, 0x0f101112, *[0] * 8]
+    for f, words in got.items():
+        assert words == want, (f, [hex(w) for w in words])
+    print('lvx/stvx: byte order, alignment, DSI on an unmapped page with rA '
+          'already updated, vD and memory untouched, identical with '
+          'PPC_FASTMEM=0 and 1 PASS')
     if not shutil.which('gdb'):
         sys.exit('gdb not found: watchpoint case skipped')
     out = watch_case(tmp, rom(tmp, 1))

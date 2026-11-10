@@ -1006,6 +1006,8 @@ static TCGRegSet op_clobber_regs(TCGOpcode opc)
         case INDEX_op_qemu_st_i64:
         case INDEX_op_qemu_ld_i128:     /* AltiVec lvx/stvx */
         case INDEX_op_qemu_st_i128:
+        case INDEX_op_fastmem_ld_vec:
+        case INDEX_op_fastmem_st_vec:
             return TCG_TARGET_LDST_CLOBBER;
         default:
             break;
@@ -2489,6 +2491,10 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_concat_i64_vec:
         return type == TCG_TYPE_V128 && TCG_TARGET_HAS_v128
             && TCG_TARGET_HAS_concat_i64_vec;
+    case INDEX_op_fastmem_ld_vec:
+    case INDEX_op_fastmem_st_vec:
+        return type == TCG_TYPE_V128 && TCG_TARGET_HAS_v128
+            && TCG_TARGET_HAS_fastmem_vec;
     case INDEX_op_fop_vec:
     case INDEX_op_ffma_vec:
     case INDEX_op_fcvt_vec:

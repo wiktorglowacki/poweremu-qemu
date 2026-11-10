@@ -277,6 +277,17 @@ DEF(cmpsel_vec, 1, 4, 1, TCG_OPF_VECTOR)
  * (a host gives 0 or wraps the index for others).
  */
 DEF(tbl_vec, 1, 3, 0, TCG_OPF_VECTOR)
+/*
+ * V128 r = the 16 guest bytes at the i32 address a in the fastmem window
+ * of MMU index c (tcg_fastmem_base[c], which must be set), as a big-endian
+ * value: host byte 15 - i is guest byte i.  fastmem_st_vec stores one.
+ * As with a qemu_ld/st that takes the window, a fault there re-executes
+ * the guest instruction, so globals are synced first.
+ */
+DEF(fastmem_ld_vec, 1, 1, 1,
+    TCG_OPF_VECTOR | TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS)
+DEF(fastmem_st_vec, 0, 2, 1,
+    TCG_OPF_VECTOR | TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS)
 /* V128 r = { lo, hi } from two i64: lo at host byte offset 0, hi at 8 */
 DEF(concat_i64_vec, 1, 2, 0, TCG_OPF_VECTOR)
 /*
