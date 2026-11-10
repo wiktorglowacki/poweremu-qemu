@@ -1439,7 +1439,7 @@ GEN_VXFORM_ENV(vsumsws, 4, 30);
  * the helper and leaves the TB, as the scalar ops' do (fp-impl.c.inc).
  * PPC_INLINE_VFP=0 keeps the helpers.
  */
-enum { VFP_ADD, VFP_SUB, VFP_NOPS };
+enum { VFP_ADD, VFP_SUB, VFP_MADD, VFP_NMSUB };
 
 static bool vmx_fp_on(DisasContext *ctx)
 {
@@ -1466,6 +1466,12 @@ static void vmx_fp_emit_slow(DisasContext *ctx, NativeFPSlow *sp)
         break;
     case VFP_SUB:
         gen_helper_vsubfp(tcg_env, rd, ra, rb);
+        break;
+    case VFP_MADD:
+        gen_helper_vmaddfp(tcg_env, rd, ra, rb, gen_avr_ptr(sp->z));
+        break;
+    case VFP_NMSUB:
+        gen_helper_vnmsubfp(tcg_env, rd, ra, rb, gen_avr_ptr(sp->z));
         break;
     default:
         g_assert_not_reached();
@@ -1529,6 +1535,22 @@ static void gen_vmx_fp_addsub(DisasContext *ctx, int op)
     tcg_gen_fop_vec(MO_32, op == VFP_SUB, r, vmx_ld(rA(ctx->opcode)),
                     vmx_ld(rB(ctx->opcode)));
     vmx_fp_check(ctx, op, r, (127 - 100) << 23, NULL, 0);
+    vmx_st(rD(ctx->opcode), r);
+}
+
+/*
+ * vmaddfp, vnmsubfp: fused, as the helper's.  A denormal operand counts
+ * (NJ makes it zero), and so does a result of magnitude 2^-126, which NJ
+ * makes zero if it was rounded up to that.
+ */
+static void gen_vmx_fp_fma(DisasContext *ctx, int op)
+{
+    TCGv_vec in[3] = { vmx_ld(rA(ctx->opcode)), vmx_ld(rC(ctx->opcode)),
+                       vmx_ld(rB(ctx->opcode)) };
+    TCGv_vec r = tcg_temp_new_vec(TCG_TYPE_V128);
+
+    tcg_gen_ffma_vec(MO_32, op == VFP_NMSUB ? 3 : 0, r, in[0], in[1], in[2]);
+    vmx_fp_check(ctx, op, r, 0x00800001, in, 3);
     vmx_st(rD(ctx->opcode), r);
 }
 
@@ -2807,6 +2829,10 @@ static void glue(gen_, name0##_##name1)(DisasContext *ctx)              \
         TCGv_ptr ra, rb, rc, rd;                                        \
         if (unlikely(!ctx->altivec_enabled)) {                          \
             gen_exception(ctx, POWERPC_EXCP_VPU);                       \
+            return;                                                     \
+        }                                                               \
+        if (vmx_fp_on(ctx)) {                                           \
+            gen_vmx_fp_fma(ctx, Rc(ctx->opcode) ? VFP_NMSUB : VFP_MADD); \
             return;                                                     \
         }                                                               \
         ra = gen_avr_ptr(rA(ctx->opcode));                              \
