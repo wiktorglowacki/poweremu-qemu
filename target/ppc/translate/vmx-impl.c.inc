@@ -1737,7 +1737,7 @@ static void glue(gen_, name)(DisasContext *ctx)                         \
  * Signed unpacks: move each source element into the top of its wider
  * result element with a shuffle, then shift it down arithmetically.
  */
-#define GEN_VXFORM_UNPACK(name, vece, ...)                               \
+#define GEN_VXFORM_UNPACK(name, vece, high, ...)                         \
 static void glue(gen_, name)(DisasContext *ctx)                         \
 {                                                                       \
     static const uint8_t table[16] QEMU_ALIGNED(16) =                   \
@@ -1751,7 +1751,13 @@ static void glue(gen_, name)(DisasContext *ctx)                         \
         static const TCGOpcode vecop_list[] = { INDEX_op_sari_vec, 0 }; \
         const TCGOpcode *hold_list = tcg_swap_vecop_list(vecop_list);   \
         TCGv_vec b = vmx_ld(rB(ctx->opcode));                           \
-        TCGv_vec r = vmx_permute(b, b, vmx_ld_const(table));            \
+        TCGv_vec r;                                                     \
+        if (!vmx_host_zip()) {                                          \
+            r = vmx_permute(b, b, vmx_ld_const(table));                 \
+        } else {                                                        \
+            r = tcg_temp_new_vec(TCG_TYPE_V128);                        \
+            (high ? tcg_gen_ziph_vec : tcg_gen_zipl_vec)(vece - 1, r, b, b); \
+        }                                                               \
         tcg_gen_sari_vec(vece, r, r, 4 << vece);                        \
         vmx_st(rD(ctx->opcode), r);                                     \
         tcg_swap_vecop_list(hold_list);                                 \
@@ -1762,14 +1768,14 @@ static void glue(gen_, name)(DisasContext *ctx)                         \
     gen_helper_##name(rd, rb);                                          \
 }
 
-GEN_VXFORM_UNPACK(vupkhsb, MO_16,
+GEN_VXFORM_UNPACK(vupkhsb, MO_16, 1,
                   0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7);
-GEN_VXFORM_UNPACK(vupkhsh, MO_32,
+GEN_VXFORM_UNPACK(vupkhsh, MO_32, 1,
                   0, 1, 0, 1, 2, 3, 2, 3, 4, 5, 4, 5, 6, 7, 6, 7);
 GEN_VXFORM_NOA(vupkhsw, 7, 25);
-GEN_VXFORM_UNPACK(vupklsb, MO_16,
+GEN_VXFORM_UNPACK(vupklsb, MO_16, 0,
                   8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15);
-GEN_VXFORM_UNPACK(vupklsh, MO_32,
+GEN_VXFORM_UNPACK(vupklsh, MO_32, 0,
                   8, 9, 8, 9, 10, 11, 10, 11, 12, 13, 12, 13, 14, 15, 14, 15);
 GEN_VXFORM_NOA(vupklsw, 7, 27);
 GEN_VXFORM_NOA(vupkhpx, 7, 13);

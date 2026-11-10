@@ -950,6 +950,14 @@ static void bench(void)
     }
     res[0x2f7] = tb() - t0;
 
+    t0 = tb();
+    for (i = 0; i < BENCH_ITERS; i++) {
+        asm volatile("vupkhsb 4,%0\n\tvupklsb 5,%0\n\t"
+                     "vupkhsh 6,%1\n\tvupklsh 7,%1"
+                     : : "v"(a.v), "v"(b.v) : "v4", "v5", "v6", "v7");
+    }
+    res[0x2f8] = tb() - t0;
+
     /* ffmpeg's unaligned load with lvsl hoisted (chroma MC loop), x4 */
     {
         V buf[8], m;
