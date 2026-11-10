@@ -548,9 +548,17 @@ static inline float32x4_t vfp_ld(ppc_avr_t *v)
     return vreinterpretq_f32_u32(vld1q_u32(v->u32));
 }
 
+/*
+ * Not a result of magnitude 2^-126 either: softfloat with NJ set returns
+ * zero for one that was below it before rounding.
+ */
 static inline bool vfp_st_checked(ppc_avr_t *r, float32x4_t x)
 {
-    if (!vfp_all_zon(x)) {
+    uint32x4_t min = vceqq_u32(vandq_u32(vreinterpretq_u32_f32(x),
+                                         vdupq_n_u32(0x7fffffff)),
+                               vdupq_n_u32(0x00800000));
+
+    if (!vfp_all_zon(x) || vmaxvq_u32(min)) {
         return false;
     }
     vst1q_u32(r->u32, vreinterpretq_u32_f32(x));
@@ -683,9 +691,17 @@ static inline __m128 vfp_ld(ppc_avr_t *v)
     return _mm_castsi128_ps(_mm_loadu_si128((const __m128i *)v->u32));
 }
 
+/*
+ * Not a result of magnitude 2^-126 either: softfloat with NJ set returns
+ * zero for one that was below it before rounding.
+ */
 static inline bool vfp_st_checked(ppc_avr_t *r, __m128 x)
 {
-    if (!vfp_all_zon(x)) {
+    __m128i min = _mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(x),
+                                                _mm_set1_epi32(0x7fffffff)),
+                                  _mm_set1_epi32(0x00800000));
+
+    if (!vfp_all_zon(x) || _mm_movemask_epi8(min)) {
         return false;
     }
     _mm_storeu_si128((__m128i *)r->u32, _mm_castps_si128(x));
