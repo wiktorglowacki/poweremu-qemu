@@ -1702,6 +1702,19 @@ static void ppc_mac_gpu_frame_clock(PPCMacGPUState *s, int64_t now,
     *period_ns = period;
 }
 
+static int64_t vblank_next_ns, vblank_served_ns;   /* ponytail: one device per machine */
+
+static bool vblank_arm_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_VBLANK_ARM");
+        on = e && e[0] == '1';
+    }
+    return on;
+}
+
 static void ppc_mac_gpu_vblank(void *opaque)
 {
     PPCMacGPUState *s = opaque;
@@ -1714,11 +1727,14 @@ static void ppc_mac_gpu_vblank(void *opaque)
      * 60 Hz into ~28 Hz, which MorphOS's compositor waits on twice a frame.
      * If we are more than a frame behind, resynchronise instead of bursting.
      */
-    static int64_t next_ns;    /* ponytail: one device per machine */
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int64_t period = NANOSECONDS_PER_SECOND / ppc_mac_gpu_refresh_hz(s);
-    next_ns = (next_ns && now - next_ns < period) ? next_ns + period : now + period;
-    timer_mod(&s->vblank_timer, next_ns);
+    vblank_next_ns = (vblank_next_ns && now - vblank_next_ns < period) ?
+                     vblank_next_ns + period : now + period;
+    timer_mod(&s->vblank_timer, vblank_next_ns);
+    if (s->regs.gen_int_cntl & R200_CRTC_VBLANK_INT) {
+        vblank_served_ns = now;
+    }
 
     /*
      * Set the per-frame CRTC interrupt status bits: VBLANK, and VLINE and
@@ -14031,12 +14047,24 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
 
     /* Interrupt */
-    case R200_GEN_INT_CNTL:
+    case R200_GEN_INT_CNTL: {
+        bool arm = (val & ~s->regs.gen_int_cntl & R200_CRTC_VBLANK_INT) &&
+                   !(s->regs.gen_int_status & R200_CRTC_VBLANK_INT) &&
+                   !r200_in_pm4 && bql_locked() && vblank_arm_on() &&
+                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - vblank_served_ns >=
+                   NANOSECONDS_PER_SECOND / ppc_mac_gpu_refresh_hz(s);
+
         s->regs.gen_int_cntl = val;
         tl_log("int_cntl 0x%x", (unsigned)val);
         /* The frame timer runs regardless (see ppc_mac_gpu_reset). */
-        ppc_mac_gpu_update_irq(s);
+        if (arm) {
+            vblank_next_ns = 0;
+            ppc_mac_gpu_vblank(s);
+        } else {
+            ppc_mac_gpu_update_irq(s);
+        }
         break;
+    }
     case R200_GEN_INT_STATUS:
         /*
          * Bit 26 (SW_INT_FIRE) is a trigger that raises bit 25 (SW_INT)
