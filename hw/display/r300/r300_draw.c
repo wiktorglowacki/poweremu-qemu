@@ -1555,7 +1555,8 @@ static const GpuVs *gpu_vs_get(const R300State *st, const R300PVSProgram *prog,
  * Returns false (pkt untouched) when the draw needs the CPU path;
  * *failed when fetching the vertices failed (the draw is dropped).
  */
-enum { SCR_XV, SCR_OUTS, SCR_HKEY, SCR_HSLOT, SCR_DUP, SCR_LIST, SCR_PROV, SCR_N };
+enum { SCR_XV, SCR_OUTS, SCR_HKEY, SCR_HSLOT, SCR_DUP, SCR_LIST, SCR_PROV, SCR_ORDER, SCR_SW,
+       SCR_VSIN, SCR_VSIDX, SCR_VSU, SCR_N };
 static void *scratch(unsigned k, size_t size);
 
 static bool gpu_vs_build(const R300State *st, Fetch *f, const R300PVSProgram *prog,
@@ -1575,15 +1576,22 @@ static bool gpu_vs_build(const R300State *st, Fetch *f, const R300PVSProgram *pr
             return false;           /* flat or solid colours */
         }
     }
-    uint32_t *list = malloc(sizeof(uint32_t) * (n * 3 + 6));
+    /* R300_GLSL_BORROW: the packet's arrays are this thread's scratch */
+    bool own = !(st->glsl_flags & R300_GLSL_BORROW);
+    size_t list_size = sizeof(uint32_t) * (n * 3 + 6);
+    uint32_t *list = own ? malloc(list_size) : scratch(SCR_VSIDX, list_size);
     uint32_t cls, nidx = r300_assemble_prov(prim, n, list, &cls, NULL);
     if (!nidx || cls != 0) {
-        free(list);
+        if (own) {
+            free(list);
+        }
         return false;               /* lines and points: expanded on the CPU */
     }
     const GpuVs *vs = gpu_vs_get(st, prog, lay, route);
     if (!vs) {
-        free(list);
+        if (own) {
+            free(list);
+        }
         return false;
     }
 
@@ -1604,7 +1612,8 @@ static bool gpu_vs_build(const R300State *st, Fetch *f, const R300PVSProgram *pr
     uint32_t *hkey = scratch(SCR_HKEY, hn * sizeof(*hkey));
     uint32_t *hval = scratch(SCR_HSLOT, hn * sizeof(*hval));
     uint32_t *pos = scratch(SCR_DUP, n * sizeof(*pos));
-    float (*in)[4] = malloc((size_t)n * stride * sizeof(*in));
+    size_t in_size = (size_t)n * stride * sizeof(float[4]);
+    float (*in)[4] = own ? malloc(in_size) : scratch(SCR_VSIN, in_size);
     uint32_t nu = 0;
     memset(hval, 0xFF, hn * sizeof(*hval));
     for (uint32_t i = 0; i < n; i++) {
@@ -1617,7 +1626,10 @@ static bool gpu_vs_build(const R300State *st, Fetch *f, const R300PVSProgram *pr
             if (!fetch_vertex(f, order[i], v)) {
                 *err = f->why ? f->why : "vertex data out of range";
                 *failed = true;
-                free(in); free(list);
+                if (own) {
+                    free(in);
+                    free(list);
+                }
                 return false;
             }
             for (unsigned k = 0; k < nin; k++) {
@@ -1637,7 +1649,11 @@ static bool gpu_vs_build(const R300State *st, Fetch *f, const R300PVSProgram *pr
 
     bool lean = gpu_vs_lean();
     uint32_t nc = lean && prog->max_const >= 0 && prog->max_const < 256 ? prog->max_const + 1 : 256;
-    R300VSUniforms *u = lean ? malloc(sizeof(*u)) : calloc(1, sizeof(*u));
+    R300VSUniforms *u = !own ? scratch(SCR_VSU, sizeof(*u)) :
+                        lean ? malloc(sizeof(*u)) : calloc(1, sizeof(*u));
+    if (!own && !lean) {
+        memset(u, 0, sizeof(*u));
+    }
     memcpy(u->c, prog->consts, nc * sizeof(u->c[0]));
     if (lean) {
         memset(u->ucp, 0, sizeof(*u) - offsetof(R300VSUniforms, ucp));
@@ -1667,6 +1683,7 @@ static bool gpu_vs_build(const R300State *st, Fetch *f, const R300PVSProgram *pr
     pkt->vs_in_vecs = nu * stride;
     pkt->vs_idx = list;
     pkt->vs_u = u;
+    pkt->vs_borrowed = !own;
     pkt->verts = NULL;
     pkt->num_verts = nidx;
     pkt->num_line_verts = 0;
@@ -1830,8 +1847,8 @@ static void *scratch(unsigned k, size_t size)
 }
 
 /*
- * Everything after vertex ordering.  order[] (n entries, malloc'd) is
- * taken over; immd is the DRAW_IMMD_2 vertex data or NULL.
+ * Everything after vertex ordering.  order[] has n entries; immd is the
+ * DRAW_IMMD_2 vertex data or NULL.
  */
 static bool draw_core(const R300State *st, const R300Arrays *arr,
                       uint32_t vf, uint32_t *order, uint32_t n,
@@ -1893,7 +1910,6 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     if (pkt->rt_view == R300_RTV_NONE) {
         pkt->warn |= R300_WARN_RTFMT;
         *err = "colour buffer format not supported";
-        free(order);
         return false;
     }
     /* Render targets B-D (multiple render targets or multiwrites) */
@@ -1923,7 +1939,6 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     pkt->rt_height = pkt->scissor[3];
     if (!pkt->rt_width || !pkt->rt_height) {
         *err = "empty colour buffer";
-        free(order);
         return false;
     }
 
@@ -1974,7 +1989,6 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         if (gpu_vs_build(st, &f, &prog, &lay, &route, prim, order, n, pkt,
                          &failed, err)) {
             pkt->warn |= f.warn;
-            free(order);
             pkt->glsl = r300_us_glsl_cached(st, &desc, st->glsl_flags,
                                             &pkt->glsl_id, &pkt->sampler_mask, err);
             pkt->sampler_mask_valid = pkt->glsl != NULL;
@@ -1985,7 +1999,6 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
             return true;
         }
         if (failed) {
-            free(order);
             return false;
         }
     }
@@ -2030,7 +2043,6 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         }
         if (!fetch_vertex(&f, order[i], in)) {
             *err = f.why ? f.why : "vertex data out of range";
-            free(order);
             return false;
         }
         if (bypass) {
@@ -2145,7 +2157,6 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         if (prim != 0) {
             pkt->warn |= R300_WARN_PRIM;
         }
-        free(order);
         *err = "primitive type not supported";
         return false;
     }
@@ -2181,7 +2192,6 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         pkt->num_line_verts = b.nline;
         pkt->prim_class = 0;
     }
-    free(order);
     if (copy) {
         copy_detect(&desc, &route, copy_coord, pkt);
     }
@@ -2217,7 +2227,7 @@ bool r300_draw_build(const R300State *st, const R300Arrays *arr,
         *err = "no vertices";
         return false;
     }
-    order = malloc(sizeof(uint32_t) * n);
+    order = scratch(SCR_ORDER, sizeof(uint32_t) * n);
     if (opcode == 0x36) {                       /* DRAW_INDX_2, inline */
         bool i32 = (vf >> 11) & 1;
         for (uint32_t i = 0; i < n; i++) {
@@ -2302,15 +2312,14 @@ bool r300_draw_build_indexed(const R300State *st, const R300Arrays *arr,
         *err = "index buffer shorter than the draw";
         return false;
     }
-    sw = malloc(sizeof(uint32_t) * (idx->ndw ? idx->ndw : 1));
+    sw = scratch(SCR_SW, sizeof(uint32_t) * (idx->ndw ? idx->ndw : 1));
     for (uint32_t k = 0; k < idx->ndw; k++) {
         sw[k] = vc_swap(idx->dw[k], swap);
     }
-    order = malloc(sizeof(uint32_t) * n);
+    order = scratch(SCR_ORDER, sizeof(uint32_t) * n);
     for (uint32_t i = 0; i < n; i++) {
         order[i] = r300_index_at(sw, idx->ndw, i32, i);
     }
-    free(sw);
     return draw_core(st, arr, vf, order, n, NULL, 0, read, opaque, pkt, err);
 }
 
@@ -2319,9 +2328,11 @@ void r300_draw_free(R300DrawPacket *pkt)
     free(pkt->glsl);
     free(pkt->verts);
     free(pkt->vs_glsl);
-    free(pkt->vs_in);
-    free(pkt->vs_idx);
-    free(pkt->vs_u);
+    if (!pkt->vs_borrowed) {
+        free(pkt->vs_in);
+        free(pkt->vs_idx);
+        free(pkt->vs_u);
+    }
     pkt->glsl = NULL;
     pkt->verts = NULL;
     pkt->vs_glsl = NULL;

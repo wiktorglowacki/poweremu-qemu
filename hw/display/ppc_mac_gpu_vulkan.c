@@ -5567,7 +5567,8 @@ fail:
 
 static PPCMacGPURenderer vulkan_renderer = {
     .name             = "vulkan",
-    .r300_glsl_flags  = R300_GLSL_VRAM_SSBO | R300_GLSL_GPU_VS | R300_GLSL_TEXT_BY_ID,
+    .r300_glsl_flags  = R300_GLSL_VRAM_SSBO | R300_GLSL_GPU_VS | R300_GLSL_TEXT_BY_ID |
+                        R300_GLSL_BORROW,
     .init             = vk_init,
     .fini             = vk_fini,
     .draw_r300        = vk_draw_r300,

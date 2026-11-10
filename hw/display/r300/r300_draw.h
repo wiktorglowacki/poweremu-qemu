@@ -188,6 +188,7 @@ typedef struct R300DrawPacket {
     uint32_t vs_in_vecs;
     uint32_t *vs_idx;
     struct R300VSUniforms *vs_u;
+    bool vs_borrowed;           /* vs_in, vs_idx and vs_u are not the packet's to free */
     uint32_t vs_nconst;
     R300FSUniforms uniforms;
     R300TexDesc tex[R300_NUM_TEX_UNITS];

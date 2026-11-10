@@ -137,6 +137,10 @@ enum {
 #define R300_GLSL_HW_Z          (1u << 3)   /* R300_FS also writes the depth
                                                R300_FS_Z would test, for a depth/
                                                stencil attachment */
+#define R300_GLSL_BORROW        (1u << 4)   /* the renderer is done with a packet
+                                               before its thread builds the next:
+                                               vs_in, vs_idx and vs_u stay the
+                                               builder's (vs_borrowed) */
 
 /*
  * Build the GLSL source for the current US program.  It compiles as three
