@@ -6914,9 +6914,16 @@ static bool r200_gpu2d_clean_dirty(PPCMacGPUState *s)
     return on && s->renderer && s->renderer->set_dirty_source;
 }
 
+static bool r200_gpu2d_open;   /* ponytail: one device per machine */
+
+static void r200_idle_submit_done(void *arg, uint32_t seq)
+{
+}
+
 /* The accounting r200_vram_access does for a CPU-side write of [lo, hi). */
 static void r200_gpu2d_done(PPCMacGPUState *s, uint64_t lo, uint64_t hi)
 {
+    r200_gpu2d_open = true;
     r200_rate.ops2d++;
     tl_log("2d-gpu");
     if (lo < (uint64_t)s->regs.crtc_offset + (uint64_t)s->disp.stride * s->disp.height &&
@@ -12207,6 +12214,18 @@ static void *ppc_mac_gpu_cp_thread(void *opaque)
             }
             cp.yield_at = g_get_monotonic_time() + cp.slice_us;
             ppc_mac_gpu_cp_run(s);
+            if (r200_gpu2d_open && !ppc_mac_gpu_cp_pending(s)) {
+                static int on = -1;
+
+                if (on < 0) {
+                    on = g_strcmp0(getenv("PPCGPU_VK_SUBMIT_2D"), "1") == 0;
+                }
+                r200_gpu2d_open = false;
+                if (on && s->renderer && s->renderer->submit_r200) {
+                    s->renderer->submit_r200(s->renderer_opaque,
+                                             r200_idle_submit_done, NULL);
+                }
+            }
             if (t0) {
                 cps.run_ns += get_clock() - t0;
             }
