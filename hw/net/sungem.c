@@ -1000,6 +1000,8 @@ static const MemoryRegionOps sungem_mmio_txdma_ops = {
     },
 };
 
+static int sungem_kick_flush = -1;
+
 static void sungem_mmio_rxdma_write(void *opaque, hwaddr addr, uint64_t val,
                                     unsigned size)
 {
@@ -1033,6 +1035,13 @@ static void sungem_mmio_rxdma_write(void *opaque, hwaddr addr, uint64_t val,
     switch (addr) {
     case RXDMA_KICK:
         trace_sungem_rx_kick(val);
+        if (sungem_kick_flush < 0) {
+            const char *e = getenv("SUNGEM_KICK_FLUSH");
+            sungem_kick_flush = !e || atoi(e);
+        }
+        if (sungem_kick_flush && sungem_can_receive(qemu_get_queue(s->nic))) {
+            qemu_flush_queued_packets(qemu_get_queue(s->nic));
+        }
         break;
     case RXDMA_CFG:
         sungem_update_masks(s);
