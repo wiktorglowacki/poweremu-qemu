@@ -314,6 +314,17 @@ DEF(mulhrs_vec, 1, 2, 0, TCG_OPF_VECTOR)
  */
 DEF(sqdmulh_vec, 1, 2, 0, TCG_OPF_VECTOR)
 DEF(sqrdmulh_vec, 1, 2, 0, TCG_OPF_VECTOR)
+/*
+ * V128 r = the low (zipl) or high (ziph) halves of a and b interleaved,
+ * a's element first (x86 punpckl/punpckh, AArch64 ZIP1/ZIP2).
+ */
+DEF(zipl_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(ziph_vec, 1, 2, 0, TCG_OPF_VECTOR)
+/*
+ * V128 r = host bytes c .. c + 15 of the 32 bytes a (low) : b (high),
+ * 0 < c < 16 (x86 palignr, AArch64 EXT).
+ */
+DEF(ext_vec, 1, 2, 1, TCG_OPF_VECTOR)
 /* r = (a + b + 1) >> 1 unsigned, without overflow. */
 DEF(avgu_vec, 1, 2, 0, TCG_OPF_VECTOR)
 

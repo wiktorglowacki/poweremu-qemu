@@ -529,7 +529,41 @@ GEN_VXFORM_V(vsubuhm, MO_16, tcg_gen_gvec_sub, 0, 17);
 GEN_VXFORM_V(vsubuwm, MO_32, tcg_gen_gvec_sub, 0, 18);
 GEN_VXFORM_V(vsubudm, MO_64, tcg_gen_gvec_sub, 0, 19);
 /* A fixed byte shuffle inline when the host can, else the helper. */
-#define GEN_VXFORM_SHUFFLE(name, helper_args, ...)                     \
+/*
+ * Merges are the host's interleave of the high (zip > 0) or low (zip < 0)
+ * elements of size |zip| - 1: a PPC high element is a host high one, and
+ * vB's comes first in host order.  vsldoi is the host's byte extract.
+ * PPC_INLINE_VMRG=0 keeps the table permutes for both.
+ */
+static bool vmx_host_zip(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = g_strcmp0(getenv("PPC_INLINE_VMRG"), "0") &&
+             tcg_can_emit_vec_op(INDEX_op_zipl_vec, TCG_TYPE_V128, MO_8) > 0;
+    }
+    return on;
+}
+
+static bool gen_vmx_zip(int rd, int ra, int rb, int zip)
+{
+    TCGv_vec r;
+
+    if (!zip || !vmx_host_zip()) {
+        return false;
+    }
+    r = tcg_temp_new_vec(TCG_TYPE_V128);
+    if (zip > 0) {
+        tcg_gen_ziph_vec(zip - 1, r, vmx_ld(rb), vmx_ld(ra));
+    } else {
+        tcg_gen_zipl_vec(-zip - 1, r, vmx_ld(rb), vmx_ld(ra));
+    }
+    vmx_st(rd, r);
+    return true;
+}
+
+#define GEN_VXFORM_SHUFFLE(name, helper_args, zip, ...)                \
 static void glue(gen_, name)(DisasContext *ctx)                         \
 {                                                                       \
     static const uint8_t table[16] QEMU_ALIGNED(16) =                   \
@@ -537,6 +571,10 @@ static void glue(gen_, name)(DisasContext *ctx)                         \
     TCGv_ptr ra, rb, rd;                                                \
     if (unlikely(!ctx->altivec_enabled)) {                              \
         gen_exception(ctx, POWERPC_EXCP_VPU);                           \
+        return;                                                         \
+    }                                                                   \
+    if (gen_vmx_zip(rD(ctx->opcode), rA(ctx->opcode), rB(ctx->opcode),  \
+                    zip)) {                                             \
         return;                                                         \
     }                                                                   \
     if (vmx_host_tbl()) {                                               \
@@ -550,17 +588,17 @@ static void glue(gen_, name)(DisasContext *ctx)                         \
     gen_helper_##name helper_args;                                      \
 }
 
-GEN_VXFORM_SHUFFLE(vmrghb, (rd, ra, rb),
+GEN_VXFORM_SHUFFLE(vmrghb, (rd, ra, rb), MO_8 + 1,
                    0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23);
-GEN_VXFORM_SHUFFLE(vmrghh, (rd, ra, rb),
+GEN_VXFORM_SHUFFLE(vmrghh, (rd, ra, rb), MO_16 + 1,
                    0, 1, 16, 17, 2, 3, 18, 19, 4, 5, 20, 21, 6, 7, 22, 23);
-GEN_VXFORM_SHUFFLE(vmrghw, (rd, ra, rb),
+GEN_VXFORM_SHUFFLE(vmrghw, (rd, ra, rb), MO_32 + 1,
                    0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23);
-GEN_VXFORM_SHUFFLE(vmrglb, (rd, ra, rb),
+GEN_VXFORM_SHUFFLE(vmrglb, (rd, ra, rb), -(MO_8 + 1),
                    8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31);
-GEN_VXFORM_SHUFFLE(vmrglh, (rd, ra, rb),
+GEN_VXFORM_SHUFFLE(vmrglh, (rd, ra, rb), -(MO_16 + 1),
                    8, 9, 24, 25, 10, 11, 26, 27, 12, 13, 28, 29, 14, 15, 30, 31);
-GEN_VXFORM_SHUFFLE(vmrglw, (rd, ra, rb),
+GEN_VXFORM_SHUFFLE(vmrglw, (rd, ra, rb), -(MO_32 + 1),
                    8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31);
 
 static void trans_vmrgew(DisasContext *ctx)
@@ -1259,8 +1297,8 @@ GEN_VXFORM_TRANS(vsr, 2, 11);
 #define VMX_PACK_H  1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31
 #define VMX_PACK_W  2, 3, 6, 7, 10, 11, 14, 15, 18, 19, 22, 23, 26, 27, 30, 31
 
-GEN_VXFORM_SHUFFLE(vpkuhum, (tcg_env, rd, ra, rb), VMX_PACK_H);
-GEN_VXFORM_SHUFFLE(vpkuwum, (tcg_env, rd, ra, rb), VMX_PACK_W);
+GEN_VXFORM_SHUFFLE(vpkuhum, (tcg_env, rd, ra, rb), 0, VMX_PACK_H);
+GEN_VXFORM_SHUFFLE(vpkuwum, (tcg_env, rd, ra, rb), 0, VMX_PACK_W);
 GEN_VXFORM_ENV(vpkudum, 7, 17);
 
 /*
@@ -2181,6 +2219,15 @@ static void gen_vsldoi(DisasContext *ctx)
     TCGv_i32 sh;
     if (unlikely(!ctx->altivec_enabled)) {
         gen_exception(ctx, POWERPC_EXCP_VPU);
+        return;
+    }
+    if (VSH(ctx->opcode) && vmx_host_zip()) {
+        /* host bytes 16 - sh .. 31 - sh of vB (low) : vA (high) */
+        TCGv_vec r = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_ext_vec(r, vmx_ld(rB(ctx->opcode)), vmx_ld(rA(ctx->opcode)),
+                        16 - VSH(ctx->opcode));
+        vmx_st(rD(ctx->opcode), r);
         return;
     }
     ra = gen_avr_ptr(rA(ctx->opcode));

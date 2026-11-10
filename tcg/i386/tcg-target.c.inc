@@ -379,6 +379,7 @@ static bool tcg_target_const_match(int64_t val, int ct,
 #define OPC_PMAXSW      (0xee | P_EXT | P_DATA16)
 #define OPC_PMAXSD      (0x3d | P_EXT38 | P_DATA16)
 #define OPC_VPMAXSQ     (0x3d | P_EXT38 | P_DATA16 | P_VEXW | P_EVEX)
+#define OPC_PALIGNR     (0x0f | P_EXT3A | P_DATA16)
 #define OPC_PAVGB       (0xe0 | P_EXT | P_DATA16)
 #define OPC_PAVGW       (0xe3 | P_EXT | P_DATA16)
 #define OPC_PMAXUB      (0xde | P_EXT | P_DATA16)
@@ -3578,9 +3579,11 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_sars_vec:
         insn = sars_insn[vece];
         goto gen_simd;
+    case INDEX_op_zipl_vec:
     case INDEX_op_x86_punpckl_vec:
         insn = punpckl_insn[vece];
         goto gen_simd;
+    case INDEX_op_ziph_vec:
     case INDEX_op_x86_punpckh_vec:
         insn = punpckh_insn[vece];
         goto gen_simd;
@@ -3677,6 +3680,11 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         insn = OPC_SHUFPS;
         sub = args[3];
         goto gen_simd_imm8;
+    case INDEX_op_ext_vec:
+        /* vpalignr shifts v:rm, so the high half goes first. */
+        tcg_out_vex_modrm(s, OPC_PALIGNR, a0, a2, a1);
+        tcg_out8(s, args[3]);
+        break;
     case INDEX_op_x86_blend_vec:
         if (vece == MO_16) {
             insn = OPC_PBLENDW;
@@ -4106,6 +4114,7 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_shrs_vec:
     case INDEX_op_sars_vec:
     case INDEX_op_cmp_vec:
+    case INDEX_op_ext_vec:
     case INDEX_op_x86_shufps_vec:
     case INDEX_op_x86_blend_vec:
     case INDEX_op_x86_packss_vec:
@@ -4117,6 +4126,8 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_fop_vec:
     case INDEX_op_mulhrs_vec:
     case INDEX_op_avgu_vec:
+    case INDEX_op_zipl_vec:
+    case INDEX_op_ziph_vec:
 #if TCG_TARGET_REG_BITS == 32
     case INDEX_op_dup2_vec:
 #endif
@@ -4178,6 +4189,10 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
         return TCG_TARGET_HAS_mulhrs_vec && vece == MO_16;
     case INDEX_op_avgu_vec:
         return TCG_TARGET_HAS_avgu_vec && vece <= MO_16;
+    case INDEX_op_zipl_vec:
+    case INDEX_op_ziph_vec:
+    case INDEX_op_ext_vec:
+        return TCG_TARGET_HAS_zip_vec && type == TCG_TYPE_V128;
     case INDEX_op_concat_i64_vec:
         return TCG_TARGET_HAS_concat_i64_vec && type == TCG_TYPE_V128;
     case INDEX_op_fastmem_ld_vec:

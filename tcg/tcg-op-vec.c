@@ -610,6 +610,25 @@ void tcg_gen_avgu_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
     do_op3_nofail(vece, r, a, b, INDEX_op_avgu_vec);
 }
 
+/* See ext_vec in tcg-opc.h; where the host has zipl_vec it has this. */
+void tcg_gen_ext_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, unsigned c)
+{
+    tcg_debug_assert(c > 0 && c < 16);
+    vec_gen_4(INDEX_op_ext_vec, TCG_TYPE_V128, MO_8,
+              tcgv_vec_arg(r), tcgv_vec_arg(a), tcgv_vec_arg(b), c);
+}
+
+/* See zipl_vec in tcg-opc.h; callers check tcg_can_emit_vec_op. */
+void tcg_gen_zipl_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    do_op3_nofail(vece, r, a, b, INDEX_op_zipl_vec);
+}
+
+void tcg_gen_ziph_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    do_op3_nofail(vece, r, a, b, INDEX_op_ziph_vec);
+}
+
 /* See sqdmulh_vec in tcg-opc.h; callers check tcg_can_emit_vec_op. */
 void tcg_gen_sqdmulh_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
 {

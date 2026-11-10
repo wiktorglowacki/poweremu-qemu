@@ -123,6 +123,8 @@
 /* vpshufb: SSSE3, implied by the AVX1 that all vector support needs. */
 #define TCG_TARGET_HAS_tbl_vec          have_avx1
 #define TCG_TARGET_HAS_fastmem_vec      (have_avx1 && TCG_TARGET_REG_BITS == 64)
+/* vpunpckl*, vpunpckh* */
+#define TCG_TARGET_HAS_zip_vec          have_avx1
 /* vpavgb, vpavgw */
 #define TCG_TARGET_HAS_avgu_vec         have_avx1
 /* vpmulhrsw: SSSE3 as well. */
