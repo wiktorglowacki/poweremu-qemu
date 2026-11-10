@@ -517,6 +517,17 @@ void helper_VPRTYBQ(ppc_avr_t *r, ppc_avr_t *b, uint32_t v)
  * the host FPU is in its default mode (round to nearest, no flush to
  * zero, NaN propagation on), as softfloat's own hardfloat path does.
  */
+/* PPC_NATIVE_VFP=0 keeps the AltiVec float ops on softfloat (A/B tests). */
+static inline bool vfp_on(void)
+{
+    static int on = -1;
+    if (unlikely(on < 0)) {
+        const char *e = getenv("PPC_NATIVE_VFP");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
 #if defined(__aarch64__)
 #include <arm_neon.h>
 
@@ -555,7 +566,7 @@ static inline bool vfp_fast(int op, ppc_avr_t *r, ppc_avr_t *a,
 {
     float32x4_t fa = vfp_ld(a), fb, fc, x;
 
-    if (!vfp_all_zon(fa)) {
+    if (!vfp_on() || !vfp_all_zon(fa)) {
         return false;
     }
     switch (op) {
@@ -604,7 +615,7 @@ static inline bool vfp_fast_cf(ppc_avr_t *r, ppc_avr_t *b, uint32_t uim,
                          : vcvtq_f32_u32(vld1q_u32(b->u32));
     float32x4_t scale = vreinterpretq_f32_u32(vdupq_n_u32((127 - uim) << 23));
 
-    return vfp_st_checked(r, vmulq_f32(x, scale));
+    return vfp_on() && vfp_st_checked(r, vmulq_f32(x, scale));
 }
 
 /* vctuxs/vctsxs: r = saturate(trunc(b * 2^uim)), noting saturation. */
@@ -618,7 +629,7 @@ static inline bool vfp_fast_ct(ppc_avr_t *r, ppc_avr_t *b, uint32_t uim,
     uint32x4_t res;
     uint64x2_t back_lo, back_hi;
 
-    if (!vfp_all_zon(fb)) {
+    if (!vfp_on() || !vfp_all_zon(fb)) {
         return false;
     }
     /* Exact in double; the conversion truncates and saturates to 64 bits. */
@@ -679,17 +690,6 @@ static inline bool vfp_st_checked(ppc_avr_t *r, __m128 x)
     }
     _mm_storeu_si128((__m128i *)r->u32, _mm_castps_si128(x));
     return true;
-}
-
-/* PPC_NATIVE_VFP=0 keeps the AltiVec float ops on softfloat (A/B tests). */
-static inline bool vfp_on(void)
-{
-    static int on = -1;
-    if (unlikely(on < 0)) {
-        const char *e = getenv("PPC_NATIVE_VFP");
-        on = !(e && e[0] == '0');
-    }
-    return on;
 }
 
 /* r = op(a, b[, c]); false (r untouched) when softfloat must decide. */
