@@ -88,19 +88,34 @@ static void cd_data_to_raw(uint8_t *buf, int lba)
     memset(buf, 0, 288);
 }
 
+static int cd_batch(IDEState *s)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("POWEREMU_ATAPI_BATCH");
+        on = !e || atoi(e);
+    }
+    if (!on || s->cd_sector_size != 2048) {
+        return 1;
+    }
+    return MIN(DIV_ROUND_UP(s->packet_transfer_size, 2048),
+               IDE_DMA_BUF_SECTORS / 4);
+}
+
 static int
 cd_read_sector_sync(IDEState *s)
 {
-    int ret;
+    int ret, n = cd_batch(s);
     block_acct_start(blk_get_stats(s->blk), &s->acct,
-                     ATAPI_SECTOR_SIZE, BLOCK_ACCT_READ);
+                     n * ATAPI_SECTOR_SIZE, BLOCK_ACCT_READ);
 
     trace_cd_read_sector_sync(s->lba);
 
     switch (s->cd_sector_size) {
     case 2048:
         ret = blk_pread(s->blk, (int64_t)s->lba << ATAPI_SECTOR_BITS,
-                        ATAPI_SECTOR_SIZE, s->io_buffer, 0);
+                        n * ATAPI_SECTOR_SIZE, s->io_buffer, 0);
         break;
     case 2352:
         ret = blk_pread(s->blk, (int64_t)s->lba << ATAPI_SECTOR_BITS,
@@ -118,8 +133,9 @@ cd_read_sector_sync(IDEState *s)
         block_acct_failed(blk_get_stats(s->blk), &s->acct);
     } else {
         block_acct_done(blk_get_stats(s->blk), &s->acct);
-        s->lba++;
+        s->lba += n;
         s->io_buffer_index = 0;
+        s->io_buffer_size = n * s->cd_sector_size;
     }
 
     return ret;
@@ -143,8 +159,9 @@ static void cd_read_sector_cb(void *opaque, int ret)
         cd_data_to_raw(s->io_buffer, s->lba);
     }
 
-    s->lba++;
+    s->lba += s->qiov.size / ATAPI_SECTOR_SIZE;
     s->io_buffer_index = 0;
+    s->io_buffer_size = s->qiov.size / ATAPI_SECTOR_SIZE * s->cd_sector_size;
     s->status &= ~BUSY_STAT;
 
     ide_atapi_cmd_reply_end(s);
@@ -153,21 +170,23 @@ static void cd_read_sector_cb(void *opaque, int ret)
 static int cd_read_sector(IDEState *s)
 {
     void *buf;
+    int n;
 
     if (s->cd_sector_size != 2048 && s->cd_sector_size != 2352) {
         block_acct_invalid(blk_get_stats(s->blk), BLOCK_ACCT_READ);
         return -EINVAL;
     }
 
+    n = cd_batch(s);
     buf = (s->cd_sector_size == 2352) ? s->io_buffer + 16 : s->io_buffer;
-    qemu_iovec_init_buf(&s->qiov, buf, ATAPI_SECTOR_SIZE);
+    qemu_iovec_init_buf(&s->qiov, buf, n * ATAPI_SECTOR_SIZE);
 
     trace_cd_read_sector(s->lba);
 
     block_acct_start(blk_get_stats(s->blk), &s->acct,
-                     ATAPI_SECTOR_SIZE, BLOCK_ACCT_READ);
+                     n * ATAPI_SECTOR_SIZE, BLOCK_ACCT_READ);
 
-    ide_buffered_readv(s, (int64_t)s->lba << 2, &s->qiov, 4,
+    ide_buffered_readv(s, (int64_t)s->lba << 2, &s->qiov, 4 * n,
                        cd_read_sector_cb, s);
 
     s->status |= BUSY_STAT;
@@ -228,7 +247,7 @@ void ide_atapi_cmd_reply_end(IDEState *s)
                                       s->io_buffer_index);
 
         /* see if a new sector must be read */
-        if (s->lba != -1 && s->io_buffer_index >= s->cd_sector_size) {
+        if (s->lba != -1 && s->io_buffer_index >= s->io_buffer_size) {
             if (!s->elementary_transfer_size) {
                 ret = cd_read_sector(s);
                 if (ret < 0) {
@@ -249,7 +268,7 @@ void ide_atapi_cmd_reply_end(IDEState *s)
         if (s->elementary_transfer_size > 0) {
             /* there are some data left to transmit in this elementary
                transfer */
-            size = s->cd_sector_size - s->io_buffer_index;
+            size = s->io_buffer_size - s->io_buffer_index;
             if (size > s->elementary_transfer_size)
                 size = s->elementary_transfer_size;
         } else {
@@ -270,8 +289,8 @@ void ide_atapi_cmd_reply_end(IDEState *s)
             s->elementary_transfer_size = size;
             /* we cannot transmit more than one sector at a time */
             if (s->lba != -1) {
-                if (size > (s->cd_sector_size - s->io_buffer_index))
-                    size = (s->cd_sector_size - s->io_buffer_index);
+                if (size > (s->io_buffer_size - s->io_buffer_index))
+                    size = (s->io_buffer_size - s->io_buffer_index);
             }
             trace_ide_atapi_cmd_reply_end_new(s, s->status);
         }
@@ -330,6 +349,7 @@ static void ide_atapi_cmd_read_pio(IDEState *s, int lba, int nb_sectors,
     s->packet_transfer_size = nb_sectors * sector_size;
     s->elementary_transfer_size = 0;
     s->io_buffer_index = sector_size;
+    s->io_buffer_size = sector_size;
     s->cd_sector_size = sector_size;
 
     ide_atapi_cmd_reply_end(s);
