@@ -172,6 +172,17 @@ static int pmac_screamer_tx_transfer(ScreamerState *s, int max)
  */
 #define SCREAMER_PACE_NS (1 * SCALE_MS)
 
+static bool screamer_idle_off(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("SCREAMER_IDLE_OFF");
+        on = !e || atoi(e);
+    }
+    return on;
+}
+
 static void screamer_pace_cb(void *opaque)
 {
     ScreamerState *s = opaque;
@@ -222,6 +233,9 @@ static void screamer_pace_cb(void *opaque)
         s->pace_idle = 0;
     } else if (++s->pace_idle > 200) {      /* ~200 ms without DMA: stop */
         timer_del(s->pace_timer);
+        if (s->voice && screamer_idle_off()) {
+            AUD_set_active_out(s->voice, false);
+        }
     }
 }
 
@@ -229,6 +243,9 @@ static void screamer_pace_start(ScreamerState *s)
 {
     s->pace_idle = 0;
     if (!timer_pending(s->pace_timer)) {
+        if (s->voice) {
+            AUD_set_active_out(s->voice, true);
+        }
         s->pace_last = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         s->pace_frac = 0;
         timer_mod(s->pace_timer, s->pace_last + SCREAMER_PACE_NS);
