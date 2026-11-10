@@ -298,6 +298,11 @@ DEF(concat_i64_vec, 1, 2, 0, TCG_OPF_VECTOR)
  * ffma_vec r = a*c + b with one rounding, constant: 0 a*c+b, 1 a*c-b,
  * 2 -(a*c+b), 3 -(a*c-b) (the negated forms negate the rounded result).
  * fcvt_vec: constant 0 double -> single (rounding), 1 single -> double.
+ * fop_vec and ffma_vec on a V128 with vece MO_32 are the same on four
+ * singles; there fop_vec also has 4 max and 5 min (-0 below +0 and a NaN
+ * for a NaN operand where TCG_TARGET_HAS_fmax_ieee, else b unless a > b
+ * or a < b) and the ordered compares 6 a == b, 7 a >= b, 8 a > b, whose
+ * elements are all ones or zero.
  */
 DEF(fop_vec, 1, 2, 1, TCG_OPF_VECTOR)
 DEF(ffma_vec, 1, 3, 1, TCG_OPF_VECTOR)

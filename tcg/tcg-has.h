@@ -94,6 +94,9 @@
 #ifndef TCG_TARGET_HAS_sqdmulh_vec
 #define TCG_TARGET_HAS_sqdmulh_vec      0
 #endif
+#ifndef TCG_TARGET_HAS_fmax_ieee
+#define TCG_TARGET_HAS_fmax_ieee        0
+#endif
 #ifndef TCG_TARGET_HAS_zip_vec
 #define TCG_TARGET_HAS_zip_vec          0
 #endif

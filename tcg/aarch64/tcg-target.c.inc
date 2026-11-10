@@ -2979,6 +2979,16 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
             static const uint32_t fop[4] = {
                 0x1e202800, 0x1e203800, 0x1e200800, 0x1e201800,
             };
+            /* 4S: FADD FSUB FMUL FDIV FMAX FMIN FCMEQ FCMGE FCMGT */
+            static const uint32_t fop_4s[9] = {
+                0x4e20d400, 0x4ea0d400, 0x6e20dc00, 0x6e20fc00, 0x4e20f400,
+                0x4ea0f400, 0x4e20e400, 0x6e20e400, 0x6ea0e400,
+            };
+            if (type == TCG_TYPE_V128) {
+                tcg_out32(s, fop_4s[args[3]] | (a2 & 0x1f) << 16
+                          | (a1 & 0x1f) << 5 | (a0 & 0x1f));
+                break;
+            }
             tcg_out32(s, fop[args[3]] | (vece == MO_64) << 22
                       | (a2 & 0x1f) << 16 | (a1 & 0x1f) << 5 | (a0 & 0x1f));
         }
@@ -2994,6 +3004,30 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         {
             static const uint32_t fma[2] = { 0x1f000000, 0x1f208000 };
             uint32_t ft = (vece == MO_64) << 22;
+
+            if (type == TCG_TYPE_V128) {
+                /*
+                 * FMLA 4S adds a*c to its destination: b, or -b (FNEG)
+                 * for a*c - b.
+                 */
+                TCGReg acc = a0 == args[3] && args[4] == 0 ? a0
+                             : TCG_VEC_TMP0;
+                if (args[4] & 1) {
+                    tcg_out32(s, 0x6ea0f800 | (args[3] & 0x1f) << 5
+                              | (acc & 0x1f));
+                } else {
+                    tcg_out_mov(s, type, acc, args[3]);
+                }
+                tcg_out32(s, 0x4e20cc00 | (a2 & 0x1f) << 16
+                          | (a1 & 0x1f) << 5 | (acc & 0x1f));
+                if (args[4] & 2) {
+                    tcg_out32(s, 0x6ea0f800 | (acc & 0x1f) << 5
+                              | (a0 & 0x1f));
+                } else {
+                    tcg_out_mov(s, type, a0, acc);
+                }
+                break;
+            }
 
             tcg_out32(s, fma[args[4] & 1] | ft | (a2 & 0x1f) << 16
                       | (args[3] & 0x1f) << 10 | (a1 & 0x1f) << 5
@@ -3096,7 +3130,9 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_fop_vec:
     case INDEX_op_ffma_vec:
     case INDEX_op_fcvt_vec:
-        return type == TCG_TYPE_V64 && (vece == MO_32 || vece == MO_64);
+        return type == TCG_TYPE_V64 ? vece == MO_32 || vece == MO_64
+               : type == TCG_TYPE_V128 && vece == MO_32
+                 && opc != INDEX_op_fcvt_vec;
 
     default:
         return 0;

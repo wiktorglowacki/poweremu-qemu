@@ -208,6 +208,9 @@ typedef struct NativeFPSlow {
     int op, frt, x, y, z;
 } NativeFPSlow;
 
+/* NativeFPSlow ops at and below this are AltiVec's (vmx-impl.c.inc) */
+#define NATIVE_VMX (-16)
+
 struct DisasContext {
     DisasContextBase base;
     bool fp_fast;           /* HFLAGS_FP_FAST */

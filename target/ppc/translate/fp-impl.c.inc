@@ -464,6 +464,8 @@ static void native_fcti(DisasContext *ctx, int frt, int frb, bool z, int rn)
     tcg_gen_or_tl(cpu_fpscr, cpu_fpscr, tl);
 }
 
+static void vmx_fp_emit_slow(DisasContext *ctx, NativeFPSlow *sp);
+
 /* After the TB's exit: each slow path, then on to the next instruction. */
 static void native_fp_emit_slow_paths(DisasContext *ctx)
 {
@@ -475,6 +477,10 @@ static void native_fp_emit_slow_paths(DisasContext *ctx)
         TCGv_i32 op = tcg_constant_i32(sp->op);
 
         gen_set_label(sp->slow);
+        if (sp->op <= NATIVE_VMX) {
+            vmx_fp_emit_slow(ctx, sp);
+            continue;
+        }
         get_fpr(t0, sp->x);
         get_fpr(t1, sp->y);
         if (sp->op == NATIVE_FCMPU) {

@@ -440,6 +440,13 @@ static bool tcg_target_const_match(int64_t val, int ct,
 #define OPC_PXOR        (0xef | P_EXT | P_DATA16)
 #define OPC_XORPS       (0x57 | P_EXT)
 /* Scalar double (F2) and single (F3) arithmetic. */
+#define OPC_ADDPS       (0x58 | P_EXT)
+#define OPC_MULPS       (0x59 | P_EXT)
+#define OPC_SUBPS       (0x5c | P_EXT)
+#define OPC_MINPS       (0x5d | P_EXT)
+#define OPC_DIVPS       (0x5e | P_EXT)
+#define OPC_MAXPS       (0x5f | P_EXT)
+#define OPC_CMPPS       (0xc2 | P_EXT)
 #define OPC_ADDSD       (0x58 | P_EXT | P_SIMDF2)
 #define OPC_ADDSS       (0x58 | P_EXT | P_SIMDF3)
 #define OPC_MULSD       (0x59 | P_EXT | P_SIMDF2)
@@ -3839,6 +3846,20 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
                 { OPC_ADDSS, OPC_ADDSD }, { OPC_SUBSS, OPC_SUBSD },
                 { OPC_MULSS, OPC_MULSD }, { OPC_DIVSS, OPC_DIVSD },
             };
+            /* The packed forms; VCMPPS's EQ_OQ, GE_OQ, GT_OQ. */
+            static const int fop_ps[9] = {
+                OPC_ADDPS, OPC_SUBPS, OPC_MULPS, OPC_DIVPS, OPC_MAXPS,
+                OPC_MINPS, OPC_CMPPS, OPC_CMPPS, OPC_CMPPS,
+            };
+            static const uint8_t cmp_ps[3] = { 0x00, 0x1d, 0x1e };
+
+            if (type == TCG_TYPE_V128) {
+                tcg_out_vex_modrm(s, fop_ps[args[3]], a0, a1, a2);
+                if (args[3] >= 6) {
+                    tcg_out8(s, cmp_ps[args[3] - 6]);
+                }
+                break;
+            }
             tcg_out_vex_modrm(s, fop_insn[args[3]][vece == MO_64],
                               a0, a1, a2);
         }
@@ -3857,18 +3878,20 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
                 { OPC_VFMADD213SS, OPC_VFMADD231SS },
                 { OPC_VFMSUB213SS, OPC_VFMSUB231SS },
             };
+            /* the packed (PS) opcodes are the scalar ones less one */
             int w = vece == MO_64 ? P_VEXW : 0;
+            int ps = type == TCG_TYPE_V128;
             int msub = args[4] & 1;
 
             a3 = args[3];
             if (a0 == a3) {
-                tcg_out_vex_modrm(s, fma_insn[msub][1] | w, a0, a1, a2);
+                tcg_out_vex_modrm(s, (fma_insn[msub][1] | w) - ps, a0, a1, a2);
             } else if (a0 == a1 || a0 == a2) {
-                tcg_out_vex_modrm(s, fma_insn[msub][0] | w, a0,
+                tcg_out_vex_modrm(s, (fma_insn[msub][0] | w) - ps, a0,
                                   a0 == a1 ? a2 : a1, a3);
             } else {
                 tcg_out_mov(s, type, a0, a3);
-                tcg_out_vex_modrm(s, fma_insn[msub][1] | w, a0, a1, a2);
+                tcg_out_vex_modrm(s, (fma_insn[msub][1] | w) - ps, a0, a1, a2);
             }
             if (args[4] & 2) {
                 tcg_out_vex_pool_q2(s, OPC_XORPS, a0, a0,
@@ -4209,8 +4232,10 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_fop_vec:
     case INDEX_op_ffma_vec:
     case INDEX_op_fcvt_vec:
-        return TCG_TARGET_HAS_fp_vec && type == TCG_TYPE_V64
-               && (vece == MO_32 || vece == MO_64);
+        return TCG_TARGET_HAS_fp_vec
+               && (type == TCG_TYPE_V64 ? vece == MO_32 || vece == MO_64
+                   : type == TCG_TYPE_V128 && vece == MO_32
+                     && opc != INDEX_op_fcvt_vec);
 
     case INDEX_op_rotli_vec:
         return have_avx512vl && vece >= MO_32 ? 1 : -1;

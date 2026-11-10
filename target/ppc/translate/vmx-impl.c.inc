@@ -1431,8 +1431,127 @@ GEN_VXFORM_ENV(vsum4sbs, 4, 28);
 GEN_VXFORM_ENV(vsum4shs, 4, 25);
 GEN_VXFORM_ENV(vsum2sws, 4, 26);
 GEN_VXFORM_ENV(vsumsws, 4, 30);
-GEN_VXFORM_ENV(vaddfp, 5, 0);
-GEN_VXFORM_ENV(vsubfp, 5, 1);
+/*
+ * Float AltiVec on the host's packed singles (fop_vec on a V128), inline
+ * where the host's result is the helper's (softfloat's with VSCR[NJ]
+ * clear or set; NJ reads denormal operands as zero and returns zero for
+ * a denormal result); any other case branches to a slow path that calls
+ * the helper and leaves the TB, as the scalar ops' do (fp-impl.c.inc).
+ * PPC_INLINE_VFP=0 keeps the helpers.
+ */
+enum { VFP_ADD, VFP_SUB, VFP_NOPS };
+
+static bool vmx_fp_on(DisasContext *ctx)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = g_strcmp0(getenv("PPC_INLINE_VFP"), "0") &&
+             tcg_can_emit_vec_op(INDEX_op_fop_vec, TCG_TYPE_V128, MO_32) > 0;
+    }
+    return on && ctx->n_nfp < ARRAY_SIZE(ctx->nfp)
+           && !ctx->singlestep_enabled && !ctx->pmu_insn_cnt
+           && !(tb_cflags(ctx->base.tb) & CF_USE_ICOUNT);
+}
+
+static void vmx_fp_emit_slow(DisasContext *ctx, NativeFPSlow *sp)
+{
+    TCGv_ptr rd = gen_avr_ptr(sp->frt);
+    TCGv_ptr ra = gen_avr_ptr(sp->x);
+    TCGv_ptr rb = gen_avr_ptr(sp->y);
+
+    switch (NATIVE_VMX - sp->op) {
+    case VFP_ADD:
+        gen_helper_vaddfp(tcg_env, rd, ra, rb);
+        break;
+    case VFP_SUB:
+        gen_helper_vsubfp(tcg_env, rd, ra, rb);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+    gen_update_nip(ctx, sp->next);
+    tcg_gen_lookup_and_goto_ptr();
+}
+
+/*
+ * Leave for op's slow path if an element of r is a NaN (softfloat picks
+ * its payload) or one of r and den[] has 0 < |x| < tiny (the bits of a
+ * positive single).  The caller stores r afterwards.
+ */
+static void vmx_fp_check(DisasContext *ctx, int op, TCGv_vec r, uint32_t tiny,
+                         TCGv_vec *den, int nden)
+{
+    NativeFPSlow *sp = &ctx->nfp[ctx->n_nfp++];
+    TCGv_vec mag = tcg_temp_new_vec(TCG_TYPE_V128);
+    TCGv_vec t = tcg_temp_new_vec(TCG_TYPE_V128);
+    TCGv_vec u = tcg_temp_new_vec(TCG_TYPE_V128);
+    TCGv_vec abs = tcg_constant_vec(TCG_TYPE_V128, MO_32, 0x7fffffff);
+    TCGv_vec one = tcg_constant_vec(TCG_TYPE_V128, MO_32, 1);
+    TCGv_i64 lo = tcg_temp_new_i64();
+    TCGv_i64 hi = tcg_temp_new_i64();
+
+    *sp = (NativeFPSlow) {
+        .slow = gen_new_label(), .next = ctx->base.pc_next,
+        .op = NATIVE_VMX - op, .frt = rD(ctx->opcode),
+        .x = rA(ctx->opcode), .y = rB(ctx->opcode), .z = rC(ctx->opcode),
+    };
+    /* |x| - 1 is below tiny - 1 for those, and 0 becomes the maximum */
+    tcg_gen_and_vec(MO_32, mag, r, abs);
+    tcg_gen_sub_vec(MO_32, t, mag, one);
+    for (int i = 0; i < nden; i++) {
+        tcg_gen_and_vec(MO_32, u, den[i], abs);
+        tcg_gen_sub_vec(MO_32, u, u, one);
+        tcg_gen_umin_vec(MO_32, t, t, u);
+    }
+    tcg_gen_cmp_vec(TCG_COND_LEU, MO_32, t, t,
+                    tcg_constant_vec(TCG_TYPE_V128, MO_32, tiny - 2));
+    tcg_gen_cmp_vec(TCG_COND_GT, MO_32, mag, mag,
+                    tcg_constant_vec(TCG_TYPE_V128, MO_32, 0x7f800000));
+    tcg_gen_or_vec(MO_32, t, t, mag);
+    tcg_gen_st_vec(t, tcg_env, offsetof(CPUPPCState, vfp_chk));
+    tcg_gen_ld_i64(lo, tcg_env, offsetof(CPUPPCState, vfp_chk));
+    tcg_gen_ld_i64(hi, tcg_env, offsetof(CPUPPCState, vfp_chk) + 8);
+    tcg_gen_or_i64(lo, lo, hi);
+    tcg_gen_brcondi_i64(TCG_COND_NE, lo, 0, sp->slow);
+}
+
+/*
+ * vaddfp, vsubfp.  A sum that is zero or at least 2^-100 is the helper's
+ * with NJ set too: no two denormals add up to that, a denormal is less
+ * than half an ulp of the other operand, which is then the sum either
+ * way, and zero comes only from exact cancellation, +0 in both.
+ */
+static void gen_vmx_fp_addsub(DisasContext *ctx, int op)
+{
+    TCGv_vec r = tcg_temp_new_vec(TCG_TYPE_V128);
+
+    tcg_gen_fop_vec(MO_32, op == VFP_SUB, r, vmx_ld(rA(ctx->opcode)),
+                    vmx_ld(rB(ctx->opcode)));
+    vmx_fp_check(ctx, op, r, (127 - 100) << 23, NULL, 0);
+    vmx_st(rD(ctx->opcode), r);
+}
+
+#define GEN_VXFORM_FP(name, gen, op)                                    \
+static void glue(gen_, name)(DisasContext *ctx)                         \
+{                                                                       \
+    TCGv_ptr ra, rb, rd;                                                \
+    if (unlikely(!ctx->altivec_enabled)) {                              \
+        gen_exception(ctx, POWERPC_EXCP_VPU);                           \
+        return;                                                         \
+    }                                                                   \
+    if (vmx_fp_on(ctx)) {                                               \
+        gen(ctx, op);                                                   \
+        return;                                                         \
+    }                                                                   \
+    ra = gen_avr_ptr(rA(ctx->opcode));                                  \
+    rb = gen_avr_ptr(rB(ctx->opcode));                                  \
+    rd = gen_avr_ptr(rD(ctx->opcode));                                  \
+    gen_helper_##name(tcg_env, rd, ra, rb);                             \
+}
+
+GEN_VXFORM_FP(vaddfp, gen_vmx_fp_addsub, VFP_ADD)
+GEN_VXFORM_FP(vsubfp, gen_vmx_fp_addsub, VFP_SUB)
 GEN_VXFORM_ENV(vmaxfp, 5, 16);
 GEN_VXFORM_ENV(vminfp, 5, 17);
 GEN_VXFORM_HETRO(vextublx, 6, 24)

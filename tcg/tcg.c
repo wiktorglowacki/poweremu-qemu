@@ -2510,7 +2510,8 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_fop_vec:
     case INDEX_op_ffma_vec:
     case INDEX_op_fcvt_vec:
-        return type == TCG_TYPE_V64 && TCG_TARGET_HAS_v64
+        return (type == TCG_TYPE_V64 ? TCG_TARGET_HAS_v64
+                : type == TCG_TYPE_V128 && TCG_TARGET_HAS_v128)
             && TCG_TARGET_HAS_fp_vec;
 
     default:
