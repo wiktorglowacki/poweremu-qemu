@@ -1566,6 +1566,205 @@ static void fp_diff(uint32_t *seed)
 }
 
 /*
+ * Differential test for the float AltiVec instructions: each one on
+ * special values (zeros, denormals, infinities, quiet and signalling NaNs
+ * with payloads, rounding ties, conversion and underflow edges) and
+ * random ones, with VSCR[NJ] clear and set, the target distinct from and
+ * equal to each source.  Nothing is checked here: the records (a, b, c,
+ * result, id, VSCR[SAT] | CR6 << 4) go to VFD_BASE, and run.py --vfpdiff
+ * compares the runs with the float paths off and on.
+ */
+#define VFD_BASE    0x02000000u
+#define VFD_REC     18
+#define VFD_ITERS   700
+#define VFD_OPS     26
+
+static uint32_t vfd_word(uint32_t *seed)
+{
+    static const uint32_t special[] = {
+        0x00000000, 0x80000000, 0x00000001, 0x80000001, 0x007fffff,
+        0x807fffff, 0x00400000, 0x00800000, 0x80800000, 0x00800001,
+        0x80800001, 0x00ffffff, 0x01000000, 0x3f800000, 0xbf800000,
+        0x3f000000, 0xbf000000, 0x3fc00000, 0xbfc00000, 0x40200000,
+        0xc0200000, 0x3effffff, 0xbeffffff, 0x3f7fffff, 0x3f800001,
+        0x7f7fffff, 0xff7fffff, 0x7f800000, 0xff800000, 0x7fc00000,
+        0xffc00000, 0x7fc12345, 0xffd00001, 0x7f800001, 0xff800001,
+        0x7fa00000, 0xffbfffff, 0x7fbabcde, 0x4f000000, 0xcf000000,
+        0x4effffff, 0xceffffff, 0xcf000001, 0x4f800000, 0x4f7fffff,
+        0x4f800001, 0xcf800000, 0x4b000000, 0x4b000001, 0x4b800000,
+        0x4a800001, 0xca800001, 0x4affffff, 0x5f000000, 0xdf000000,
+        0x1e000000, 0x20000000, 0x1f800000, 0x1fffffff, 0x9f800000,
+        0x5f800000, 0x5f7fffff, 0x60000000, 0x42c80000, 0xc2c80000,
+    };
+    static const uint8_t exps[] = {
+        1, 1, 2, 3, 24, 25, 62, 63, 64, 65, 126, 127, 127, 128, 149, 150,
+        151, 157, 158, 159, 160, 190, 191, 192, 253, 254, 254, 100, 140,
+    };
+    uint32_t x = rnd(seed), y = rnd(seed);
+
+    switch (y & 7) {
+    case 0:
+    case 1:
+    case 2:
+        return special[(y >> 8) % (sizeof(special) / sizeof(special[0]))];
+    case 3:
+        return x;
+    case 4:
+        return x & 0x807fffff;
+    case 5:
+        return (x & 0x80700000) | (exps[(y >> 8) % sizeof(exps)] << 23)
+               | ((y >> 16) & 3 ? 0 : x & 0xfffff);
+    default:
+        return (x & 0x807fffff) | (exps[(y >> 8) % sizeof(exps)] << 23);
+    }
+}
+
+#define VFD3(n, insn)                                                       \
+    case n:                                                                 \
+        if (form == 1) {                                                    \
+            r = a;                                                          \
+            asm volatile(insn " %0,%0,%1\n\tmfcr %2"                        \
+                         : "+v"(r.v), "=r"(cr) : "v"(b.v) : "cr6");         \
+        } else if (form == 2) {                                             \
+            r = b;                                                          \
+            asm volatile(insn " %0,%1,%0\n\tmfcr %2"                        \
+                         : "+v"(r.v), "=r"(cr) : "v"(a.v) : "cr6");         \
+        } else {                                                            \
+            asm volatile(insn " %0,%1,%2\n\tmfcr %3"                        \
+                         : "=&v"(r.v), "=r"(cr) : "v"(a.v), "v"(b.v) : "cr6"); \
+        }                                                                   \
+        break;
+#define VFD4(n, insn)                                                       \
+    case n:                                                                 \
+        if (form == 1) {                                                    \
+            r = a;                                                          \
+            asm volatile(insn " %0,%0,%1,%2"                                \
+                         : "+v"(r.v) : "v"(c.v), "v"(b.v));                 \
+        } else if (form == 2) {                                             \
+            r = b;                                                          \
+            asm volatile(insn " %0,%1,%2,%0"                                \
+                         : "+v"(r.v) : "v"(a.v), "v"(c.v));                 \
+        } else {                                                            \
+            asm volatile(insn " %0,%1,%2,%3"                                \
+                         : "=&v"(r.v) : "v"(a.v), "v"(c.v), "v"(b.v));      \
+        }                                                                   \
+        break;
+#define VFD2(n, insn)                                                       \
+    case n:                                                                 \
+        if (form) {                                                         \
+            r = b;                                                          \
+            asm volatile(insn " %0,%0" : "+v"(r.v));                        \
+        } else {                                                            \
+            asm volatile(insn " %0,%1" : "=&v"(r.v) : "v"(b.v));            \
+        }                                                                   \
+        break;
+#define VFDU1(insn, u)                                                      \
+    case u:                                                                 \
+        if (form) {                                                         \
+            r = b;                                                          \
+            asm volatile(insn " %0,%0," #u : "+v"(r.v));                    \
+        } else {                                                            \
+            asm volatile(insn " %0,%1," #u : "=&v"(r.v) : "v"(b.v));        \
+        }                                                                   \
+        break;
+#define VFDU(n, insn)                                                       \
+    case n:                                                                 \
+        switch (uim) {                                                      \
+        VFDU1(insn, 0) VFDU1(insn, 1) VFDU1(insn, 7) VFDU1(insn, 16)        \
+        VFDU1(insn, 23) VFDU1(insn, 31)                                     \
+        }                                                                   \
+        break;
+
+static void vfp_diff(uint32_t *seed)
+{
+    volatile uint32_t *out = (volatile uint32_t *)VFD_BASE;
+    static const uint8_t uims[6] = { 0, 1, 7, 16, 23, 31 };
+    uint32_t n = 0;
+
+    for (int it = 0; it < VFD_ITERS; it++) {
+        V a, b, c;
+        uint32_t k = rnd(seed);
+
+        for (int i = 0; i < 4; i++) {
+            a.w[i] = vfd_word(seed);
+            b.w[i] = vfd_word(seed);
+            c.w[i] = vfd_word(seed);
+            switch ((k >> (4 * i)) & 15) {
+            case 0:
+                b.w[i] = a.w[i];
+                break;
+            case 1:
+                b.w[i] = a.w[i] ^ 0x80000000;
+                break;
+            case 2:
+                b.w[i] = a.w[i] + 1;
+                break;
+            case 3:
+                b.w[i] = (a.w[i] ^ 0x80000000) - 1;
+                break;
+            case 4:
+                /* a * c near b: cancellation in vmaddfp/vnmsubfp */
+                c.w[i] = 0x3f800000 | (k & 3);
+                b.w[i] = a.w[i] ^ (k & 0x80000000);
+                break;
+            }
+        }
+        if ((it & 7) == 0) {
+            /* every lane ordinary, as real code's are */
+            for (int i = 0; i < 4; i++) {
+                a.w[i] = (a.w[i] & 0x807fffff) | (120 + (k >> (3 * i) & 7)) << 23;
+                b.w[i] = (b.w[i] & 0x807fffff) | (121 + (k >> (5 * i) & 7)) << 23;
+                c.w[i] = (c.w[i] & 0x807fffff) | (122 + (k >> (7 * i) & 7)) << 23;
+            }
+        }
+        for (int op = 0; op < VFD_OPS; op++) {
+            for (int nj = 0; nj < 2; nj++) {
+                for (int form = 0; form < 3; form++) {
+                    int uim = uims[(it + form) % 6];
+                    uint32_t cr = 0;
+                    V r, vs;
+
+                    if (form == 2 && op >= 14) {
+                        continue;
+                    }
+                    memset(&vs, 0, sizeof(vs));
+                    vs.w[3] = nj << 16;
+                    asm volatile("mtvscr %0" : : "v"(vs.v));
+                    switch (op) {
+                    VFD3(0, "vaddfp") VFD3(1, "vsubfp")
+                    VFD3(2, "vmaxfp") VFD3(3, "vminfp")
+                    VFD4(4, "vmaddfp") VFD4(5, "vnmsubfp")
+                    VFD3(6, "vcmpeqfp") VFD3(7, "vcmpgefp")
+                    VFD3(8, "vcmpgtfp") VFD3(9, "vcmpbfp")
+                    VFD3(10, "vcmpeqfp.") VFD3(11, "vcmpgefp.")
+                    VFD3(12, "vcmpgtfp.") VFD3(13, "vcmpbfp.")
+                    VFD2(14, "vrefp") VFD2(15, "vrsqrtefp")
+                    VFD2(16, "vexptefp") VFD2(17, "vlogefp")
+                    VFD2(18, "vrfin") VFD2(19, "vrfiz")
+                    VFD2(20, "vrfip") VFD2(21, "vrfim")
+                    VFDU(22, "vcfsx") VFDU(23, "vcfux")
+                    VFDU(24, "vctsxs") VFDU(25, "vctuxs")
+                    }
+                    asm volatile("mfvscr %0" : "=v"(vs.v));
+                    for (int i = 0; i < 4; i++) {
+                        out[i] = a.w[i];
+                        out[4 + i] = b.w[i];
+                        out[8 + i] = c.w[i];
+                        out[12 + i] = r.w[i];
+                    }
+                    out[16] = op | nj << 8 | form << 12 | uim << 16;
+                    out[17] = vs.w[3] | (op >= 10 && op < 14 ? cr & 0xf0 : 0) << 24;
+                    out += VFD_REC;
+                    n++;
+                }
+            }
+        }
+    }
+    res[0x284] = n;
+    clear_sat();
+}
+
+/*
  * sraw / sraw. (translate.c gen_sraw, inline unless PPC_INLINE_SRAW=0):
  * every shift count 0-63 (and rB with garbage above bit 5), edge and
  * random rS, rA distinct from / equal to rS / equal to rB, XER in with
@@ -1766,6 +1965,7 @@ int main(void)
     scalar_ldst(&seed);
     scalar_sraw(&seed);
     fp_diff(&seed);
+    vfp_diff(&seed);
     bench();
     res[0] = 0x564d5854; /* 'VMXT' */
     return 0;

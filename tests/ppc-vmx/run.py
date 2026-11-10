@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Build vmx_test.c as a raw mac99 firmware image, run it, report results.
 
-usage: run.py [--fpdiff | --fpdiff-strict] [path/to/qemu-system-ppc]
+usage: run.py [--fpdiff | --fpdiff-strict | --vfpdiff] [path/to/qemu-system-ppc]
 
 --fpdiff runs the scalar FP cases with the inline FP ops off and on and
 compares results and FPSCR; --fpdiff-strict compares the inline results
 with softfloat's (PPC_STRICT_FP=1), whose FPSCR also has the inexact bits.
+
+--vfpdiff runs the float AltiVec cases on softfloat (PPC_INLINE_VFP=0
+PPC_NATIVE_VFP=0), with the helpers' host fast path (PPC_INLINE_VFP=0) and
+as built, and compares results, VSCR[SAT] and CR6 with softfloat's.
 
 Needs Homebrew llvm (clang with the PowerPC target) and lld.
 """
@@ -165,11 +169,74 @@ def fpdiff(img, out, strict=False):
     return bad
 
 
+VFD_BASE = 0x02000000
+VFD_REC = 18 * 4
+VFD_OPS = ['vaddfp', 'vsubfp', 'vmaxfp', 'vminfp', 'vmaddfp', 'vnmsubfp',
+           'vcmpeqfp', 'vcmpgefp', 'vcmpgtfp', 'vcmpbfp', 'vcmpeqfp.',
+           'vcmpgefp.', 'vcmpgtfp.', 'vcmpbfp.', 'vrefp', 'vrsqrtefp',
+           'vexptefp', 'vlogefp', 'vrfin', 'vrfiz', 'vrfip', 'vrfim',
+           'vcfsx', 'vcfux', 'vctsxs', 'vctuxs']
+
+
+def vfpdiff(img, out):
+    """Float AltiVec: softfloat, the helpers' fast path, the build's default."""
+    import struct
+    runs = (('softfloat', dict(PPC_INLINE_VFP='0', PPC_NATIVE_VFP='0')),
+            ('helper', dict(PPC_INLINE_VFP='0')), ('default', {}))
+    dumps = []
+    for name, extra in runs:
+        sock = os.path.join(out, f'mon-{name}.sock')
+        q = subprocess.Popen([QEMU, '-M', 'mac99', '-cpu', '7450', '-m', '64',
+                              '-bios', img, '-display', 'none',
+                              '-serial', 'none', '-monitor',
+                              f'unix:{sock},server=on,wait=off'],
+                             stdout=subprocess.DEVNULL,
+                             env=dict(os.environ, **extra))
+        try:
+            mon = Monitor(sock)
+            for _ in range(1200):
+                if mon.words(RESULTS, 1) == [0x564d5854]:
+                    break
+                time.sleep(0.25)
+            else:
+                sys.exit('test did not finish')
+            n = mon.words(RESULTS + 0x284 * 4, 1)[0]
+            path = os.path.join(out, f'vfd-{name}.bin')
+            mon.cmd(f'pmemsave {VFD_BASE:#x} {n * VFD_REC} "{path}"')
+            dumps.append(open(path, 'rb').read())
+        finally:
+            q.kill()
+    n = len(dumps[0]) // VFD_REC
+    total = 0
+    for (name, _), dump in zip(runs[1:], dumps[1:]):
+        bad = {}
+        for i in range(n):
+            r0 = struct.unpack_from('>18I', dumps[0], i * VFD_REC)
+            r1 = struct.unpack_from('>18I', dump, i * VFD_REC)
+            if r0 != r1:
+                op, nj = r0[16] & 0xff, (r0[16] >> 8) & 1
+                form, uim = (r0[16] >> 12) & 15, r0[16] >> 16
+                bad[op] = bad.get(op, 0) + 1
+                if bad[op] <= 3:
+                    vec = lambda r, k: ' '.join(f'{w:08x}' for w in r[k:k + 4])
+                    print(f'MISMATCH {name} {VFD_OPS[op]} NJ={nj} form {form} uim {uim}: '
+                          f'a={vec(r0, 0)} b={vec(r0, 4)} c={vec(r0, 8)}')
+                    print(f'   softfloat: {vec(r0, 12)} vscr/cr6 {r0[17]:08x}'
+                          f'   {name}: {vec(r1, 12)} vscr/cr6 {r1[17]:08x}')
+        for op, k in sorted(bad.items()):
+            print(f'FAIL {name} {VFD_OPS[op]}: {k} mismatches')
+        print(f'{n} float AltiVec cases compared ({name} vs softfloat), '
+              f'{sum(bad.values())} mismatches')
+        total += sum(bad.values())
+    return total
+
 def main():
     out = tempfile.mkdtemp(prefix='ppc-vmx-')
     img = build(out)
     if '--fpdiff' in sys.argv or '--fpdiff-strict' in sys.argv:
         sys.exit(1 if fpdiff(img, out, '--fpdiff-strict' in sys.argv) else 0)
+    if '--vfpdiff' in sys.argv:
+        sys.exit(1 if vfpdiff(img, out) else 0)
     sock = os.path.join(out, 'mon.sock')
     q = subprocess.Popen([QEMU, '-M', 'mac99', '-cpu', '7450', '-m', '64',
                           '-bios', img, '-display', 'none', '-serial', 'none',
