@@ -1183,6 +1183,7 @@ static int ohci_service_ed_list(OHCIState *ohci, uint32_t head)
                     break;
                 }
             } else {
+                ohci->frame_busy = true;
                 /* Handle isochronous endpoints */
                 if (ohci_service_iso_td(ohci, &ed)) {
                     break;
@@ -1197,6 +1198,23 @@ static int ohci_service_ed_list(OHCIState *ohci, uint32_t head)
     }
 
     return active;
+}
+
+#define OHCI_IDLE_FRAMES  32
+#define OHCI_IDLE_STRETCH 8
+
+static void ohci_idle_kick(OHCIState *ohci)
+{
+    if (ohci->idle_stretch) {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        int64_t next = ohci->sof_time + usb_frame_time *
+                       DIV_ROUND_UP(now - ohci->sof_time, usb_frame_time);
+
+        ohci->idle_frames = 0;
+        if (next < timer_expire_time_ns(ohci->eof_timer)) {
+            timer_mod(ohci->eof_timer, next);
+        }
+    }
 }
 
 /* set a timer for EOF */
@@ -1249,6 +1267,15 @@ static void ohci_frame_boundary(void *opaque)
 {
     OHCIState *ohci = opaque;
     struct ohci_hcca hcca;
+    static int coalesce = -1;
+    int extra = 0;
+
+    if (ohci->idle_stretch) {
+        extra = (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - ohci->sof_time) /
+                usb_frame_time - 1;
+        extra = MAX(0, MIN(extra, OHCI_IDLE_STRETCH - 1));
+        ohci->idle_stretch = false;
+    }
 
     if (ohci_read_hcca(ohci, ohci->hcca, &hcca)) {
         trace_usb_ohci_hcca_read_error(ohci->hcca);
@@ -1258,10 +1285,10 @@ static void ohci_frame_boundary(void *opaque)
 
     /* Process all the lists at the end of the frame */
     if (ohci->ctl & OHCI_CTL_PLE) {
-        int n;
-
-        n = ohci->frame_number & 0x1f;
-        ohci_service_ed_list(ohci, le32_to_cpu(hcca.intr[n]));
+        for (int i = 0; i <= extra; i++) {
+            int n = (ohci->frame_number + i) & 0x1f;
+            ohci_service_ed_list(ohci, le32_to_cpu(hcca.intr[n]));
+        }
     }
 
     /* Cancel all pending packets if either of the lists has been disabled. */
@@ -1280,7 +1307,8 @@ static void ohci_frame_boundary(void *opaque)
     ohci->frt = ohci->fit;
 
     /* Increment frame number and take care of endianness. */
-    ohci->frame_number = (ohci->frame_number + 1) & 0xffff;
+    ohci->frame_number = (ohci->frame_number + 1 + extra) & 0xffff;
+    ohci->sof_time += extra * usb_frame_time;
     hcca.frame = cpu_to_le16(ohci->frame_number);
     /* When the HC updates frame number, set pad to 0. Ref OHCI Spec 4.4.1*/
     hcca.pad = 0;
@@ -1303,6 +1331,23 @@ static void ohci_frame_boundary(void *opaque)
     }
     /* Do SOF stuff here */
     ohci_sof(ohci);
+
+    if (coalesce < 0) {
+        const char *e = getenv("OHCI_IDLE_COALESCE");
+        coalesce = !e || atoi(e);
+    }
+    if (coalesce && !ohci->frame_busy && !ohci->done && !ohci->async_td &&
+        ohci->done_count == 7 && !(ohci->intr & OHCI_INTR_SF) &&
+        !(ohci->status & (OHCI_STATUS_CLF | OHCI_STATUS_BLF))) {
+        if (++ohci->idle_frames > OHCI_IDLE_FRAMES) {
+            ohci->idle_stretch = true;
+            timer_mod(ohci->eof_timer,
+                      ohci->sof_time + OHCI_IDLE_STRETCH * usb_frame_time);
+        }
+    } else {
+        ohci->idle_frames = 0;
+    }
+    ohci->frame_busy = false;
 
     /* Writeback HCCA */
     if (ohci_put_hcca(ohci, ohci->hcca, &hcca)) {
@@ -1683,6 +1728,7 @@ static void ohci_mem_write(void *opaque,
         trace_usb_ohci_mem_write_unaligned(addr);
         return;
     }
+    ohci_idle_kick(ohci);
 
     if (addr >= 0x54 && addr < 0x54 + ohci->num_ports * 4) {
         /* HcRhPortStatus */
@@ -1896,6 +1942,7 @@ static void ohci_wakeup(USBPort *port1)
         intr = OHCI_INTR_RD;
     }
     ohci_set_interrupt(s, intr);
+    ohci_idle_kick(s);
 }
 
 static void ohci_async_complete_packet(USBPort *port, USBPacket *packet)
@@ -1905,6 +1952,7 @@ static void ohci_async_complete_packet(USBPort *port, USBPacket *packet)
     trace_usb_ohci_async_complete();
     ohci->async_complete = true;
     ohci_process_lists(ohci);
+    ohci_idle_kick(ohci);
 }
 
 static USBPortOps ohci_port_ops = {
@@ -1915,7 +1963,14 @@ static USBPortOps ohci_port_ops = {
     .complete = ohci_async_complete_packet,
 };
 
+static void ohci_wakeup_endpoint(USBBus *bus, USBEndpoint *ep,
+                                 unsigned int stream)
+{
+    ohci_idle_kick(container_of(bus, OHCIState, bus));
+}
+
 static USBBusOps ohci_bus_ops = {
+    .wakeup_endpoint = ohci_wakeup_endpoint,
 };
 
 void usb_ohci_init(OHCIState *ohci, DeviceState *dev, uint32_t num_ports,

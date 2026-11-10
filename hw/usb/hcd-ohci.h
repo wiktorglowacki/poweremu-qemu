@@ -46,6 +46,9 @@ struct OHCIState {
 
     QEMUTimer *eof_timer;
     int64_t sof_time;
+    uint32_t idle_frames;
+    bool idle_stretch;
+    bool frame_busy;
 
     /* OHCI state */
     /* Control partition */
