@@ -6005,6 +6005,33 @@ static void r200_traffic_tick(void)
     }
 }
 
+/*
+ * What ppc_mac_gpu_mmio_write does for an R300 state register that only
+ * stores: the state file and the read-back shadow.  The vector/scalar
+ * upload ports (0x2200-0x220C) and the Z-pass pair (0x4F58, 0x4F5C) do more.
+ */
+static bool r300_type0_fast(PPCMacGPUState *s, uint32_t addr, uint32_t val)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = ppc_gpu_env_on("PPCGPU_T0_FAST");
+    }
+    if (!on || !s->r3 || addr < 0x1C00 || addr >= 0x4F58 ||
+        (addr >= 0x2200 && addr <= 0x220C) || s->r3_dump ||
+        gpu_debug_enabled() || r200_traffic_on()) {
+        return false;
+    }
+    r300_state_write(s->r3, addr, val);
+    if (addr < 0x4000 && addr != 0x2140 && addr != 0x2150) {
+        s->regs.regs_3d[(addr - 0x1C00) / 4] = val;
+        trace_ppc_mac_gpu_3d_reg_write(addr, val);
+    } else {
+        s->r300_shadow[addr / 4] = val;
+    }
+    return true;
+}
+
 static void ppc_mac_gpu_pm4_process_type0(PPCMacGPUState *s,
                                            uint32_t reg_base,
                                            bool one_reg_wr,
@@ -6032,9 +6059,14 @@ static void ppc_mac_gpu_pm4_process_type0(PPCMacGPUState *s,
                                        : ((reg_base + i) * 4);
         uint32_t val = data[i];
 
-        gpu_debug_log("PM4_EXEC type0 reg=0x%04x val=0x%x%s",
-                      reg_addr, val, one_reg_wr ? " [ONE_REG]" : "");
+        if (unlikely(gpu_debug_enabled())) {
+            gpu_debug_log("PM4_EXEC type0 reg=0x%04x val=0x%x%s",
+                          reg_addr, val, one_reg_wr ? " [ONE_REG]" : "");
+        }
 
+        if (r300_type0_fast(s, reg_addr, val)) {
+            continue;
+        }
         if (unlikely(r200_traffic_on())) {
             r200_in_pm4 = true;
             ppc_mac_gpu_mmio_write(s, reg_addr, val, 4);
