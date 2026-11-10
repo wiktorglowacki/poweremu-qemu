@@ -14,6 +14,10 @@
 #include "r300_pvs.h"
 #include "r300_sb.h"
 
+#if defined(__x86_64__) && defined(__GNUC__) && !defined(__clang__)
+#pragma GCC target("prefer-vector-width=128")
+#endif
+
 /* Registers used here */
 #define SE_VPORT_XSCALE             0x1D98  /* then XOFFSET, YSCALE, ... ZOFFSET */
 #define GB_MSPOS0                   0x4010
