@@ -40,7 +40,8 @@ BENCH = ['vperm x4', 'vmrghb/vmrglh/vsldoi/vpkuhum',
          'vmaddfp x4 (float)', 'lfs/fmadds/stfs x4 (scalar)',
          'fmadd x4 dependent', 'fmadd x4 independent', 'fadd x4 dependent',
          'add x4 dependent (integer)']
-BENCH2 = ['lvsl/lvsr x2']
+BENCH2 = ['lvsl/lvsr x2', 'vperm x4 independent',
+          'vmrghb/vmrglh/vsldoi/vpkuhum indep.']
 
 
 def tool(name):

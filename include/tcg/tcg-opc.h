@@ -272,7 +272,10 @@ DEF(cmp_vec, 1, 2, 1, TCG_OPF_VECTOR)
 
 DEF(bitsel_vec, 1, 3, 0, TCG_OPF_VECTOR)
 DEF(cmpsel_vec, 1, 4, 1, TCG_OPF_VECTOR)
-/* r[i] = idx[i] < 16 ? a[idx[i]] : idx[i] < 32 ? b[idx[i] - 16] : 0 */
+/*
+ * r[i] = idx[i] < 16 ? a[idx[i]] : b[idx[i] - 16]; idx[i] must be below 32
+ * (a host gives 0 or wraps the index for others).
+ */
 DEF(tbl_vec, 1, 3, 0, TCG_OPF_VECTOR)
 /* V128 r = { lo, hi } from two i64: lo at host byte offset 0, hi at 8 */
 DEF(concat_i64_vec, 1, 2, 0, TCG_OPF_VECTOR)

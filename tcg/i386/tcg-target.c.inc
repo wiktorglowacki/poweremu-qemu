@@ -112,6 +112,8 @@ static const int tcg_target_reg_alloc_order[] = {
 
 /* tbl_vec as vptestnmb + vpermi2b; PPC_VBMI=0 keeps vpshufb (A/B tests). */
 static bool use_vbmi_tbl;
+/* tbl_vec as vpermi2b alone (indexes are below 32); PPC_TBL_MOD=0 restores. */
+static bool tbl_mod32;
 
 static const int tcg_target_call_iarg_regs[] = {
 #if TCG_TARGET_REG_BITS == 64
@@ -3737,6 +3739,11 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
          * table a0 overwrites goes first.
          */
         a3 = args[3];
+        if (tbl_mod32) {
+            tcg_out_evex_modrm_type(s, OPC_VPERMI2B, a0, a1, a2, 0, false,
+                                    type);
+            break;
+        }
         if (a1 == a2) {
             /* One table: +us 0x60 keeps 0-31 below 0x80, rest above.  */
             tcg_out_vex_pool_b16(s, OPC_PADDUB, TCG_TMP_VEC, a3, 0x60);
@@ -4084,8 +4091,12 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_x86_vpshrdv_vec:
         return C_O1_I3(x, 0, x, x);
 
-    case INDEX_op_bitsel_vec:
     case INDEX_op_tbl_vec:
+        if (tbl_mod32) {
+            return C_O1_I3(x, x, x, 0);
+        }
+        /* fall through */
+    case INDEX_op_bitsel_vec:
     case INDEX_op_ffma_vec:
         return C_O1_I3(x, x, x, x);
     case INDEX_op_cmpsel_vec:
@@ -4661,6 +4672,7 @@ static void tcg_target_init(TCGContext *s)
 
     use_vbmi_tbl = have_avx512vbmi && have_avx512bw
                    && !(vbmi_env && vbmi_env[0] == '0');
+    tbl_mod32 = use_vbmi_tbl && g_strcmp0(getenv("PPC_TBL_MOD"), "0");
     tcg_target_available_regs[TCG_TYPE_I32] = ALL_GENERAL_REGS;
     if (TCG_TARGET_REG_BITS == 64) {
         tcg_target_available_regs[TCG_TYPE_I64] = ALL_GENERAL_REGS;
