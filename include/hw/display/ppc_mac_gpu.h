@@ -924,6 +924,8 @@ struct PPCMacGPUState {
     /* Native Radeon cursors are composited into scanout, never guest VRAM. */
     bool r300_cursor_dirty;
     int32_t r300_cursor_y0, r300_cursor_y1;
+    uint8_t r300_cursor_source[64 * 64 * 4];
+    uint32_t r300_cursor_source_len; /* decoded bitmap snapshot; not migrated */
     /* A woken machine's window has never been told what the pointer looks
      * like: the guest uploaded it once, before the machine slept, and will
      * not do it again.  Set when a machine is restored, acted on at the

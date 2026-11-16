@@ -1639,6 +1639,7 @@ static void ppc_mac_gpu_update_irq(PPCMacGPUState *s)
 }
 
 static void ppc_mac_gpu_csq_ring_drain(PPCMacGPUState *s);
+static void ppc_mac_gpu_radeon_cursor(PPCMacGPUState *s, bool define);
 static bool ppc_mac_gpu_cp_pending(PPCMacGPUState *s);
 static void ppc_mac_gpu_cp_run(PPCMacGPUState *s);
 
@@ -2748,6 +2749,9 @@ static void ppc_mac_gpu_display_update_inner(void *opaque)
         return;                 /* its renderer callback has yielded the BQL */
     }
     ppc_mac_gpu_csq_ring_drain(s);
+    if (s->r300_card_bytes) {
+        ppc_mac_gpu_radeon_cursor(s, false);
+    }
     /* A machine that has just been woken: give the window the pointer the
      * sleeping one had (see ppc_mac_gpu_post_load). */
     if (s->hwc_announce && s->con && !s->r300_card_bytes) {
@@ -12816,15 +12820,35 @@ static void ppc_mac_gpu_radeon_cursor(PPCMacGPUState *s, bool define)
     s->hwc_x = (s->regs.cur_horz_vert_posn >> 16) & 0x3FFF;
     s->hwc_y = s->regs.cur_horz_vert_posn & 0xFFF;
     s->hwc_visible = (s->regs.crtc_gen_cntl & (1u << 16)) != 0;
-    if (define && s->hwc_visible) {
-        uint32_t off = s->regs.cur_offset & ~0xFu;
-        unsigned mode = (s->regs.crtc_gen_cntl >> 20) & 7;
-        unsigned rows = s->r300_card_bytes ? 64 - (s->regs.cur_horz_vert_off & 63) : 64;
+    if (s->hwc_visible) {
+        uint32_t offset = s->regs.cur_offset;
+        uint32_t control = s->regs.crtc_gen_cntl;
+        uint32_t crop = s->regs.cur_horz_vert_off;
+        uint32_t position = s->regs.cur_horz_vert_posn;
+        uint32_t off = offset & ~0xFu;
+        unsigned mode = (control >> 20) & 7;
+        unsigned rows = s->r300_card_bytes ? 64 - (crop & 63) : 64;
         uint32_t len = rows * (mode ? 256 : 16);
         if (!r300_to_vram(s, &off, len)) {
             return;
         }
+        r200_vram_access(s, off, (uint64_t)off + len, false, 0);
+        /* Synchronizing the source may yield the BQL and change its registers. */
+        if (offset != s->regs.cur_offset || control != s->regs.crtc_gen_cntl ||
+            crop != s->regs.cur_horz_vert_off ||
+            position != s->regs.cur_horz_vert_posn) {
+            return;
+        }
         const uint8_t *src = (uint8_t *)memory_region_get_ram_ptr(&s->vram) + off;
+        if (!define && s->r300_cursor_source_len == len &&
+            !memcmp(s->r300_cursor_source, src, len)) {
+            goto position_only;
+        }
+        /* Cursor memory may change without another CUR_OFFSET write. */
+        memcpy(s->r300_cursor_source, src, len);
+        s->r300_cursor_source_len = len;
+        src = s->r300_cursor_source;
+        define = true;
         QEMUCursor *c = cursor_alloc(64, 64);
         c->hot_x = s->regs.cur_horz_vert_off >> 16 & 63;
         c->hot_y = s->regs.cur_horz_vert_off & 63;
@@ -12864,6 +12888,7 @@ static void ppc_mac_gpu_radeon_cursor(PPCMacGPUState *s, bool define)
         }
         cursor_unref(c);
     }
+position_only:
     if (s->r300_card_bytes) {
         /* GTK hides its host cursor on grab. Rendering here also avoids
          * feeding guest-position warps back into relative mouse input. */
@@ -15798,6 +15823,7 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
     s->edid_read_done = false;
     s->r300_card_bytes = false;
     s->r300_cursor_dirty = false;
+    s->r300_cursor_source_len = 0;
     if (s->r3) {
         s->r3->card_bytes = false;
         memory_region_set_enabled(&s->vram_ap0, false);
@@ -16624,6 +16650,7 @@ static int ppc_mac_gpu_post_load(void *opaque, int version_id)
     s->display_invalid = true;
     s->scanout_dirty_valid = false;
     s->scanout_generation_valid = false;
+    s->r300_cursor_source_len = 0;
     /* Force the mode -- and the surface handed to the window -- to be
      * built again from the restored registers. */
     s->disp.width = 0;
