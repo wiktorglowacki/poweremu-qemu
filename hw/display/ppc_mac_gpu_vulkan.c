@@ -285,6 +285,7 @@ static struct {
     /* batches */
     VkBatch batch[VK_NBATCH];
     VkBatch *cur;               /* open batch, or NULL */
+    VkBatch *poll_batch;        /* one fence queried while the BQL is released */
     uint32_t seq;               /* last sequence number handed out */
     uint32_t done_seq;          /* every batch up to here completed (atomic) */
     uint32_t worker_seq;        /* ... and the waiter is finished with it */
@@ -1130,7 +1131,7 @@ static void vk_reap(void)
     uint32_t ws = qatomic_read(&V.worker_seq);
     for (int i = 0; i < VK_NBATCH; i++) {
         VkBatch *b = &V.batch[i];
-        if (b->state == 2 && (int32_t)(ws - b->seq) >= 0) {
+        if (b != V.poll_batch && b->state == 2 && (int32_t)(ws - b->seq) >= 0) {
             vk_recycle(b);
         }
     }
@@ -3232,12 +3233,32 @@ static bool vk_wait_busy_r200(void *opaque, uint32_t us)
     }
     if (us && bql_locked() && qemu_in_vcpu_thread()) {
         int64_t end = g_get_monotonic_time() + us;
+        bool poll = !V.poll_batch;
+        VkDevice dev = V.dev;
+        VkFence fence = newest->fence;
 
+        /* Keep one slot from being reset; other callers can still allocate. */
+        if (poll) {
+            V.poll_batch = newest;
+        }
         bql_unlock();
         while (!vk_seq_done(seq) && g_get_monotonic_time() < end) {
+            if (poll) {
+                VkResult r = vkGetFenceStatus(dev, fence);
+                if (r == VK_SUCCESS) {
+                    vk_set_done(seq);
+                    break;
+                }
+                if (r != VK_NOT_READY) {
+                    break;
+                }
+            }
             cpu_relax();
         }
         bql_lock();
+        if (poll) {
+            V.poll_batch = NULL;
+        }
         if (t0 && vk_seq_done(seq)) {
             vk_wait_note(seq, submitted, draws, wb, wbz, g_get_monotonic_time());
         }
