@@ -9022,8 +9022,8 @@ static uint64_t g_r300_tcache_clock;
 static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> dev,
                                         uint8_t *vram_ptr, const R300TexDesc *td)
 {
-    if (!r300_tex_card_swap_valid(td)) {
-        r300_metal_warn(256, "endian-swapped texture lacks complete swap words");
+    if (!r300_tex_layout_valid(td)) {
+        r300_metal_warn(256, "texture layout does not hold its texels");
         return nil;
     }
     const uint8_t *src = td->host_data ? td->host_data : vram_ptr + td->gpu_addr;
@@ -9088,6 +9088,10 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
         for (uint32_t f = 0; f < n; f++) {
             const uint8_t *fs = src + td->lvl_off[l] + f * face;
             uint8_t *bytes = r300_tex_level_bytes(td, fs, l, dxt ? mw : w, dxt ? mh : h, &bpr);
+            if (!bytes) {
+                [t release];
+                return nil;
+            }
             if (td->dim == R300_TEXDIM_3D) {
                 [t replaceRegion:MTLRegionMake3D(0, 0, f, dxt ? mw : w, dxt ? mh : h, 1)
                      mipmapLevel:l slice:0 withBytes:bytes bytesPerRow:bpr bytesPerImage:0];

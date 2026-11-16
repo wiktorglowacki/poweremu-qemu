@@ -4050,8 +4050,8 @@ static VkFormat vk_tex_format(uint32_t kind)
  */
 static VkImageView vk_texture_full(const R300TexDesc *td)
 {
-    if (!r300_tex_card_swap_valid(td)) {
-        vk_warn(1u << 8, "endian-swapped texture lacks complete swap words");
+    if (!r300_tex_layout_valid(td)) {
+        vk_warn(1u << 8, "texture layout does not hold its texels");
         return VK_NULL_HANDLE;
     }
     const uint8_t *src = td->host_data ? td->host_data : V.vram + td->gpu_addr;
@@ -4173,6 +4173,14 @@ static VkImageView vk_texture_full(const R300TexDesc *td)
         for (uint32_t f = 0; f < n; f++) {
             uint8_t *bytes = r300_tex_level_bytes(td, src + td->lvl_off[l] + f * face,
                                                   l, cw, ch, &bpr);
+            if (!bytes) {
+                vk_warn(1u << 8, "texture layout does not hold its mip level");
+                vk_trash(NULL, TRASH_VIEW, (uint64_t)(uintptr_t)t->view);
+                vk_trash(NULL, TRASH_IMAGE, (uint64_t)(uintptr_t)t->img);
+                vk_trash(NULL, TRASH_MEM, (uint64_t)(uintptr_t)t->mem);
+                t->live = false;
+                return VK_NULL_HANDLE;
+            }
             size_t len = dxt ? (size_t)bpr * ((ch + 3) / 4) : (size_t)bpr * ch;
             /* $R300_US_LOG: a look at small textures' converted texels */
             if (bytes && l == 0 && f == 0 && getenv("R300_US_LOG") && cw * ch <= 1024) {

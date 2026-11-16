@@ -819,12 +819,12 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
                 }
             }
         }
-        if (!r300_tex_card_swap_valid(t)) {
+        t->format = fmt;
+        if (!r300_tex_layout_valid(t)) {
             t->bound = false;
             pkt->warn |= R300_WARN_TEXFMT;
             continue;
         }
-        t->format = fmt;
         t->filter0 = r300_reg(st, TX_FILTER0_0 + 4 * k);
         t->filter1 = r300_reg(st, TX_FILTER1_0 + 4 * k);
         u->tex_info[k][0] = 1;
@@ -2437,6 +2437,61 @@ bool r300_tex_card_swap_valid(const R300TexDesc *td)
     return true;
 }
 
+/* An explicit pitch must hold whole texels/tiles inside the declared mip. */
+static bool r300_tex_level_valid(const R300TexDesc *td, uint32_t l,
+                                 uint32_t w, uint32_t h, bool macro)
+{
+    bool dxt = td->kind >= R300_TEXK_DXT1;
+    uint32_t bpp = td->kind == R300_TEXK_DXT1 ? 8 : dxt ? 16 :
+                   td->kind == R300_TEXK_RGBA8 ? 4 :
+                   td->kind == R300_TEXK_RG8 || td->kind == R300_TEXK_CONVERT16 ? 2 :
+                   td->kind == R300_TEXK_R8 ? 1 : r300_tex_raw_bpp(td->format);
+    uint64_t cols = dxt ? ((uint64_t)w + 3) / 4 : w;
+    uint64_t rows = dxt ? ((uint64_t)h + 3) / 4 : h;
+    uint32_t pitch = td->lvl_pitch[l], tw = 1, th = 1;
+    uint32_t lw, lh, faces;
+
+    if (!w || !h || !bpp || td->kind > R300_TEXK_DXT5) {
+        return false;
+    }
+    if (td->tiling & 2) {
+        tw = bpp <= 2 ? 8 : bpp == 4 ? 4 : 2;
+        th = bpp == 1 ? 4 : bpp <= 8 ? 2 : 1;
+    } else if (macro) {
+        tw = 256 / bpp;
+        th = 8;
+    }
+    uint64_t row_bytes = (cols + tw - 1) / tw * tw * bpp;
+    rows = (rows + th - 1) / th * th;
+    if (pitch < row_bytes || pitch % (tw * bpp) || td->lvl_rows[l] < rows) {
+        return false;
+    }
+    r300_tex_level_dims(td, l, &lw, &lh, &faces);
+    uint64_t face = (uint64_t)pitch * td->lvl_rows[l];
+    if (!faces || face > td->size_bytes) {
+        return false;
+    }
+    uint64_t end = td->lvl_off[l] + face * faces;
+    return end <= td->size_bytes &&
+           (l + 1 == td->levels || end <= td->lvl_off[l + 1]);
+}
+
+bool r300_tex_layout_valid(const R300TexDesc *td)
+{
+    if (!td->levels || td->levels > R300_TEX_MAX_LEVELS ||
+        !td->width || !td->height || !r300_tex_card_swap_valid(td)) {
+        return false;
+    }
+    for (uint32_t l = 0; l < td->levels; l++) {
+        uint32_t w, h, d;
+        r300_tex_level_dims(td, l, &w, &h, &d);
+        if (!r300_tex_level_valid(td, l, w, h, false)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /*
  * Tiled texture memory (TX_OFFSET bits 3 and 2) read into the linear
  * layout the conversions below expect.  Micro tiles are 32 bytes holding
@@ -2469,6 +2524,9 @@ static uint8_t *r300_tex_untile(const R300TexDesc *td, const uint8_t *src,
     }
     uint64_t band = (uint64_t)pitch * th;
     uint8_t *lin = malloc((size_t)pitch * rows);
+    if (!lin) {
+        return NULL;
+    }
     for (uint32_t y = 0; y < rows; y++) {
         for (uint32_t x = 0; x < cols; x++) {
             uint64_t a;
@@ -2498,13 +2556,23 @@ uint8_t *r300_tex_level_bytes(const R300TexDesc *td, const uint8_t *src,
                                  uint32_t l, uint32_t w, uint32_t h,
                                  uint32_t *bpr)
 {
+    bool macro = td->tiling == 1 && r300_macro_layout && td->levels == 1 &&
+                 !td->host_data && td->kind < R300_TEXK_DXT1;
+
+    *bpr = 0;
+    if (!src || l >= td->levels || !r300_tex_layout_valid(td) ||
+        !r300_tex_level_valid(td, l, w, h, macro)) {
+        return NULL;
+    }
     /*
      * MorphOS's driver writes textures micro tiled with its own CPU code.
      */
-    if (((td->tiling & 2) || (td->tiling == 1 && r300_macro_layout && td->levels == 1 &&
-                              !td->host_data && td->kind < R300_TEXK_DXT1)) &&
+    if (((td->tiling & 2) || macro) &&
         td->kind != R300_TEXK_RAW) {
         uint8_t *lin = r300_tex_untile(td, src, l, w, h);
+        if (!lin) {
+            return NULL;
+        }
         uint8_t *out = r300_tex_level_bytes_linear(td, lin, l, w, h, bpr);
         free(lin);
         return out;

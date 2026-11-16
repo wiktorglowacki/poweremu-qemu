@@ -125,6 +125,26 @@ static void rendering_completeness(void)
     r300_tex_layout(&t, 4, false, true);            /* TX_PITCH_EN keeps its pitch */
     CHECK(t.lvl_pitch[0] == 512 && t.size_bytes == 5120, "pitch_en %u", t.lvl_pitch[0]);
 
+    R300State tex_state = st;
+    tex_state.card_bytes = true;
+    r300_state_write(&tex_state, 0x4104, 1);
+    r300_state_write(&tex_state, 0x4540, 0x00100008);      /* micro tiled */
+    r300_state_write(&tex_state, 0x4480, 4 | (1u << 11) | (1u << 31));
+    r300_state_write(&tex_state, 0x44C0, 0x0C);          /* RGBA8, 5x2 */
+    r300_state_write(&tex_state, 0x4500, 4);             /* explicit 20-byte pitch */
+    d = immd_pkt(13, 4, quad4, &n);
+    CHECK(r300_draw_build(&tex_state, &none, 0x35, d, n, rd, NULL, &p, &err),
+          "bad-pitch draw: %s", err ? err : "");
+    CHECK(!p.tex[0].bound && !p.uniforms.tex_info[0][0] && (p.warn & R300_WARN_TEXFMT),
+          "invalid tiled pitch reached renderer");
+    r300_draw_free(&p);
+    r300_state_write(&tex_state, 0x4500, 7);             /* full 32-byte tile row */
+    CHECK(r300_draw_build(&tex_state, &none, 0x35, d, n, rd, NULL, &p, &err),
+          "aligned-pitch draw: %s", err ? err : "");
+    CHECK(p.tex[0].bound && p.tex[0].lvl_pitch[0] == 32 && p.tex[0].size_bytes == 64,
+          "valid tiled pitch rejected or changed");
+    r300_draw_free(&p);
+
     /* ---- border colours: the texel's own packing ---- */
     float bc[4];
     r300_border_color(0x0C, 0x80FF0040, bc);
@@ -419,7 +439,8 @@ static void viewport_ports(void)
 static void native_texture_bytes(void)
 {
     R300TexDesc t = { .card_bytes = true, .kind = R300_TEXK_RGBA8,
-        .width = 1, .height = 1, .levels = 1, .lvl_pitch = { 4 } };
+        .width = 1, .height = 1, .levels = 1, .lvl_pitch = { 4 },
+        .lvl_rows = { 1 }, .size_bytes = 4 };
     /* Captured Gears red (.875878,.109485,0,1), US_OUT_FMT=1b00. */
     const uint8_t bgra[4] = { 0, 28, 223, 255 };
     uint32_t bpr;
@@ -444,6 +465,102 @@ static void native_texture_bytes(void)
     t.kind = R300_TEXK_RG8; t.endian = 2; t.lvl_pitch[0] = 2;
     CHECK(!r300_tex_card_swap_valid(&t), "partial swap DWORD accepted");
     CHECK(!r300_tex_level_bytes(&t, red565, 0, 1, 1, &bpr), "partial swap texture read accepted");
+}
+
+static void texture_layout_bounds(void)
+{
+    static const struct {
+        uint32_t kind, bpp, w, h, bad_pitch;
+        bool dxt;
+    } cases[] = {
+        { R300_TEXK_R8, 1, 9, 5, 9, false },
+        { R300_TEXK_RG8, 2, 9, 3, 18, false },
+        { R300_TEXK_RGBA8, 4, 5, 2, 20, false },
+        { R300_TEXK_CONVERT16, 2, 9, 3, 18, false },
+        { R300_TEXK_DXT1, 8, 12, 4, 24, true },
+        { R300_TEXK_DXT3, 16, 4, 4, 16, true },
+        { R300_TEXK_DXT5, 16, 4, 4, 16, true },
+    };
+    const uint8_t dummy = 0;
+    uint32_t bpr;
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        R300TexDesc t = { .kind = cases[i].kind, .format = 6, .tiling = 2,
+            .width = cases[i].w, .height = cases[i].h, .depth = 1,
+            .dim = R300_TEXDIM_2D, .levels = 3, .card_bytes = true };
+        r300_tex_layout(&t, cases[i].bpp, cases[i].dxt, false);
+        CHECK(r300_tex_layout_valid(&t), "valid tiled layout kind %u", t.kind);
+        uint8_t *src = calloc(t.size_bytes, 1);
+        for (uint32_t l = 0; l < t.levels; l++) {
+            uint32_t w, h, d;
+            r300_tex_level_dims(&t, l, &w, &h, &d);
+            uint8_t *tex = r300_tex_level_bytes(&t, src + t.lvl_off[l], l, w, h, &bpr);
+            CHECK(tex && bpr, "tiled upload kind %u level %u", t.kind, l);
+            free(tex);
+        }
+        free(src);
+        t.size_bytes--;
+        bpr = 1;
+        CHECK(!r300_tex_layout_valid(&t) &&
+              !r300_tex_level_bytes(&t, &dummy, 0, t.width, t.height, &bpr) && !bpr,
+              "truncated chain accepted for kind %u", t.kind);
+
+        t.levels = 1;
+        t.pitch_bytes = cases[i].bad_pitch;
+        r300_tex_layout(&t, cases[i].bpp, cases[i].dxt, true);
+        bpr = 1;
+        CHECK(t.lvl_pitch[0] == cases[i].bad_pitch && !r300_tex_layout_valid(&t) &&
+              !r300_tex_level_bytes(&t, &dummy, 0, t.width, t.height, &bpr) && !bpr,
+              "partial-tile pitch accepted or changed for kind %u", t.kind);
+    }
+
+    R300TexDesc t = { .kind = R300_TEXK_DXT1, .tiling = 2, .width = 16,
+        .height = 4, .depth = 1, .levels = 1, .dim = R300_TEXDIM_2D };
+    r300_tex_layout(&t, 8, true, false);
+    CHECK(t.size_bytes == 64 && r300_tex_layout_valid(&t), "DXT1 tile-band padding");
+    uint8_t *src = calloc(t.size_bytes, 1);
+    uint8_t *tex = r300_tex_level_bytes(&t, src, 0, 16, 4, &bpr);
+    CHECK(tex && bpr == 32, "DXT1 16x4 source span");
+    free(tex);
+    free(src);
+
+    t = (R300TexDesc){ .kind = R300_TEXK_RGBA8, .width = 5, .height = 2,
+        .depth = 1, .levels = 1, .pitch_bytes = 16, .dim = R300_TEXDIM_2D };
+    r300_tex_layout(&t, 4, false, true);
+    CHECK(!r300_tex_layout_valid(&t) &&
+          !r300_tex_level_bytes(&t, &dummy, 0, 5, 2, &bpr), "short linear pitch accepted");
+    t.pitch_bytes = 32;
+    r300_tex_layout(&t, 4, false, true);
+    CHECK(r300_tex_layout_valid(&t), "valid explicit linear pitch");
+    CHECK(!r300_tex_level_bytes(&t, &dummy, 1, 5, 2, &bpr) && !bpr,
+          "invalid mip index accepted");
+    CHECK(!r300_tex_level_bytes(&t, &dummy, 0, UINT32_MAX, 2, &bpr) && !bpr,
+          "requested width outside its rows accepted");
+    t.lvl_rows[0] = 1;
+    CHECK(!r300_tex_layout_valid(&t), "missing source rows accepted");
+    t.levels = 2; t.width = t.height = 8; t.pitch_bytes = 0;
+    r300_tex_layout(&t, 4, false, false);
+    t.lvl_off[1] = 0;
+    CHECK(!r300_tex_layout_valid(&t), "overlapping mip levels accepted");
+    t.dim = R300_TEXDIM_CUBE; t.levels = 1;
+    r300_tex_layout(&t, 4, false, false);
+    CHECK(r300_tex_layout_valid(&t), "valid cube layout");
+    t.size_bytes -= t.lvl_pitch[0] * t.lvl_rows[0];
+    CHECK(!r300_tex_layout_valid(&t), "truncated cube face accepted");
+    t = (R300TexDesc){ .kind = R300_TEXK_RGBA8, .tiling = 1, .width = 5,
+        .height = 2, .depth = 1, .levels = 1, .pitch_bytes = 256 };
+    r300_tex_layout(&t, 4, false, true);
+    bool saved_macro = r300_macro_layout;
+    r300_macro_layout = true;
+    CHECK(!r300_tex_level_bytes(&t, &dummy, 0, 5, 2, &bpr) && !bpr,
+          "partial macro tile band accepted");
+    t.height = 8;
+    r300_tex_layout(&t, 4, false, true);
+    src = calloc(t.size_bytes, 1);
+    tex = r300_tex_level_bytes(&t, src, 0, 5, 8, &bpr);
+    CHECK(tex && bpr == 20, "valid macro tile band rejected");
+    free(tex);
+    free(src);
+    r300_macro_layout = saved_macro;
 }
 
 static void morphos_color_profile(void)
@@ -761,6 +878,7 @@ int main(void)
     draw_bounds();
     upload_ports();
     native_texture_bytes();
+    texture_layout_bounds();
     morphos_color_profile();
     printf(fails ? "test_features: %d FAILED\n" : "test_features: PASS\n", fails);
     return fails != 0;

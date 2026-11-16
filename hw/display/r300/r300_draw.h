@@ -96,6 +96,7 @@ void r300_tex_level_dims(const R300TexDesc *td, uint32_t l, uint32_t *w,
  * bpp is bytes per texel (per 4x4 block for DXT, flagged by dxt). */
 void r300_tex_layout(R300TexDesc *td, uint32_t bpp, bool dxt, bool pitch_en);
 bool r300_tex_card_swap_valid(const R300TexDesc *td);
+bool r300_tex_layout_valid(const R300TexDesc *td);
 
 /* A TX_BORDER_COLOR dword as the unit's XYZW before the swizzle: packed
  * like a texel of the unit's format (8888 for texels wider than 32 bits;
@@ -333,7 +334,8 @@ void r300_draw_bounds(const R300DrawPacket *pkt, uint32_t bounds[4]);
  * other than R300_TEXK_RAW), repacked with tight rows: 16bpp formats
  * decoded to RGBA8, DXT blocks and 8/16/32-bit texels copied as they lie.
  * src is the face's first byte; w, h the level's size (for DXT, rounded
- * up to whole blocks).  Returns malloc'd bytes and their row pitch.
+ * up to whole blocks).  Returns malloc'd bytes and their row pitch, or
+ * NULL with row pitch zero if the layout does not hold the requested texels.
  */
 uint8_t *r300_tex_level_bytes(const R300TexDesc *td, const uint8_t *src,
                               uint32_t l, uint32_t w, uint32_t h, uint32_t *bpr);
