@@ -25,17 +25,22 @@ header = r'''
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 typedef uint64_t VkDevice, VkFence, VkCommandBuffer;
 typedef int32_t VkResult;
 typedef void GArray, GPtrArray;
-enum { VK_SUCCESS = 0, VK_NOT_READY = 1, VK_ERROR_DEVICE_LOST = -4,
+enum { VK_SUCCESS = 0, VK_NOT_READY = 1, VK_TIMEOUT = 2, VK_ERROR_DEVICE_LOST = -4,
+       VK_TRUE = 1,
        VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO = 1,
        VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT = 1 };
 typedef struct { int sType; unsigned flags; } VkCommandBufferBeginInfo;
 #define qatomic_read(p) (*(p))
 #define qatomic_cmpxchg(p, old, value) __sync_val_compare_and_swap((p), (old), (value))
 #define g_assert(c) assert(c)
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define CLAMP(v, lo, hi) MIN((hi), ((v) < (lo) ? (lo) : (v)))
+#define g_ascii_strtoll strtoll
 '''
 fixture = r'''
 static struct {
@@ -54,12 +59,20 @@ static struct {
 } vkw;
 static bool held, vcpu;
 static int64_t clock_us;
-static unsigned queries, fallback_waits, resets[VK_NBATCH], queue_items;
+static unsigned queries, blocking_waits, resets[VK_NBATCH], queue_items, spin_env_reads;
+static uint64_t last_timeout_ns;
+static VkResult wait_result;
+static int64_t unlock_advance;
+static bool worker_on_unlock;
 static VkResult result;
 static void (*query_hook)(void);
 static VkBatch *allocated;
 static void bql_lock(void) { assert(!held); held = true; }
-static void bql_unlock(void) { assert(held); held = false; }
+static void bql_unlock(void) {
+    assert(held); held = false;
+    clock_us += unlock_advance;
+    if (worker_on_unlock) V.done_seq = VK_NBATCH;
+}
 static bool bql_locked(void) { return held; }
 static bool qemu_in_vcpu_thread(void) { return vcpu; }
 static int64_t g_get_monotonic_time(void) { return clock_us++; }
@@ -77,16 +90,28 @@ static void vk_recycle(VkBatch *b) {
 }
 static bool vk_wait_stats(void) { return false; }
 static uint32_t vk_commit_ex(void (*done)(void *, uint32_t), void *arg, bool z) { return 0; }
-static bool vk_fence_wait(VkBatch *b, int64_t us) {
-    assert(held);
-    fallback_waits++;
-    return result == VK_SUCCESS;
+static char *test_getenv(const char *name) {
+    assert(held && !strcmp(name, "PPCGPU_VK_SPIN_US"));
+    spin_env_reads++;
+    return NULL;
+}
+#define getenv test_getenv
+static VkResult vkWaitForFences(VkDevice dev, unsigned count, const VkFence *fence,
+                                bool all, uint64_t timeout_ns) {
+    assert(dev == 42 && count == 1 && all);
+    assert(*fence == 1000 + VK_NBATCH - 1);
+    assert(timeout_ns > 0 && timeout_ns != UINT64_MAX);
+    if (!held) assert(V.poll_batch == &V.batch[VK_NBATCH - 1]);
+    blocking_waits++;
+    last_timeout_ns = timeout_ns;
+    clock_us += timeout_ns / 1000;
+    return wait_result;
 }
 static void vk_wait_note(uint32_t seq, int64_t submitted, uint32_t draws,
                          uint32_t wb, uint32_t wbz, int64_t now) { }
 static VkResult vkGetFenceStatus(VkDevice dev, VkFence fence) {
-    assert(!held && dev == 42 && fence == 1000 + VK_NBATCH - 1);
-    assert(V.poll_batch == &V.batch[VK_NBATCH - 1]);
+    assert(dev == 42 && fence == 1000 + VK_NBATCH - 1);
+    if (!held) assert(V.poll_batch == &V.batch[VK_NBATCH - 1]);
     queries++;
     if (query_hook) {
         void (*hook)(void) = query_hook;
@@ -104,7 +129,11 @@ static void setup(void) {
     memset(resets, 0, sizeof(resets));
     held = vcpu = true;
     clock_us = 100;
-    queries = fallback_waits = 0;
+    queries = blocking_waits = 0;
+    last_timeout_ns = 0;
+    wait_result = VK_TIMEOUT;
+    unlock_advance = 0;
+    worker_on_unlock = false;
     queue_items = 1;
     query_hook = NULL;
     allocated = NULL;
@@ -115,6 +144,7 @@ static void setup(void) {
         V.batch[i].fence = 1000 + i;
     }
     V.batch[VK_NBATCH - 1].state = 2;
+    V.batch[VK_NBATCH - 1].submitted = clock_us;
 }
 static void concurrent_caller(void) {
     VkBatch *owner = V.poll_batch;
@@ -171,18 +201,55 @@ int main(void) {
     vk_reap();
     assert(resets[VK_NBATCH - 1] == 1 && allocated->state == 1);
 
+    /* A young batch spins only until its submission-age cap, then blocks. */
+    setup(); result = VK_NOT_READY;
+    assert(vk_wait_busy_r200(NULL, 250));
+    assert(queries > 100 && queries < 205 && blocking_waits == 1);
+    assert(last_timeout_ns > 0 && last_timeout_ns <= 52000);
+    assert(!V.done_seq && !V.worker_seq && !V.poll_batch && held);
+
+    /* Repeated waits on that aged batch do not renew a 250us CPU spin. */
+    unsigned previous_queries = queries;
+    assert(vk_wait_busy_r200(NULL, 250));
+    assert(queries == previous_queries + 1 && blocking_waits == 2);
+    assert(last_timeout_ns <= 250000 && !V.done_seq && held);
+
+    setup(); result = VK_NOT_READY; clock_us = 400; wait_result = VK_SUCCESS;
+    assert(!vk_wait_busy_r200(NULL, 20));
+    assert(queries == 1 && blocking_waits == 1 && V.done_seq == VK_NBATCH);
+    assert(!V.worker_seq && queue_items == 1 && !V.poll_batch && held);
+
+    setup(); result = VK_NOT_READY; clock_us = 400; wait_result = VK_ERROR_DEVICE_LOST;
+    assert(vk_wait_busy_r200(NULL, 20));
+    assert(queries == 1 && blocking_waits == 1 && !V.done_seq && held);
+
+    /* Expiry while dropping BQL must never turn into an infinite wait. */
+    setup(); result = VK_SUCCESS; unlock_advance = 30;
+    assert(vk_wait_busy_r200(NULL, 20));
+    assert(!queries && !blocking_waits && !V.done_seq && !V.poll_batch && held);
+
+    setup(); result = VK_SUCCESS; worker_on_unlock = true;
+    assert(!vk_wait_busy_r200(NULL, 20));
+    assert(!queries && !blocking_waits && V.done_seq == VK_NBATCH && held);
+
     setup(); result = VK_SUCCESS; vcpu = false;
     assert(!vk_wait_busy_r200(NULL, 20));
-    assert(held && !queries && fallback_waits == 1 && !V.poll_batch);
+    assert(held && queries == 1 && !blocking_waits && !V.poll_batch);
 
-    printf("PASS: direct completion, timeout/error, concurrent fallback, six-slot pressure and unpin\n");
+    setup(); result = VK_SUCCESS;
+    assert(!vk_wait_busy_r200(NULL, 0));
+    assert(held && queries == 1 && !blocking_waits && !V.poll_batch);
+    assert(spin_env_reads == 1);
+
+    printf("PASS: actual spin/fence helpers, young/aged cap, bounded remaining timeout, expiry, completion/error, worker/fallback, six-slot pin and zero-time poll\n");
     return 0;
 }
 '''
 functions = '\n\n'.join(function(s) for s in [
     'static bool vk_seq_done(', 'static void vk_set_done(',
     'static void vk_reap(', 'static VkBatch *vk_batch(',
-    'static VkBatch *vk_newest_pending(', 'static bool vk_wait_busy_r200(',
+    'static VkBatch *vk_newest_pending(', 'static int64_t vk_spin_us(',
+    'static bool vk_fence_wait(', 'static bool vk_wait_busy_r200(',
 ])
 with tempfile.TemporaryDirectory(prefix='r300-fence-poll-') as tmp:
     c = Path(tmp) / 'test.c'

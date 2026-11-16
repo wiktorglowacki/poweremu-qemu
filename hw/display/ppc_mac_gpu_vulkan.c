@@ -3234,26 +3234,26 @@ static bool vk_wait_busy_r200(void *opaque, uint32_t us)
     if (us && bql_locked() && qemu_in_vcpu_thread()) {
         int64_t end = g_get_monotonic_time() + us;
         bool poll = !V.poll_batch;
-        VkDevice dev = V.dev;
-        VkFence fence = newest->fence;
-
         /* Keep one slot from being reset; other callers can still allocate. */
         if (poll) {
             V.poll_batch = newest;
+            /* Initialize the lazy spin setting before releasing the BQL. */
+            vk_spin_us();
         }
         bql_unlock();
-        while (!vk_seq_done(seq) && g_get_monotonic_time() < end) {
-            if (poll) {
-                VkResult r = vkGetFenceStatus(dev, fence);
-                if (r == VK_SUCCESS) {
+        if (poll) {
+            if (!vk_seq_done(seq)) {
+                int64_t remaining = end - g_get_monotonic_time();
+
+                /* A negative timeout means forever to vk_fence_wait. */
+                if (remaining > 0 && vk_fence_wait(newest, remaining)) {
                     vk_set_done(seq);
-                    break;
-                }
-                if (r != VK_NOT_READY) {
-                    break;
                 }
             }
-            cpu_relax();
+        } else {
+            while (!vk_seq_done(seq) && g_get_monotonic_time() < end) {
+                cpu_relax();
+            }
         }
         bql_lock();
         if (poll) {
