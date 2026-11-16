@@ -2446,6 +2446,18 @@ static void gen_srawi(DisasContext *ctx)
         if (is_isa300(ctx)) {
             tcg_gen_movi_tl(cpu_ca32, 0);
         }
+    } else if (sh == 31) {
+        TCGv_i32 word = tcg_temp_new_i32();
+
+        /* CA is set for negative words other than INT32_MIN. */
+        tcg_gen_trunc_tl_i32(word, src);
+        tcg_gen_setcondi_i32(TCG_COND_GTU, word, word, 0x80000000u);
+        tcg_gen_extu_i32_tl(cpu_ca, word);
+        if (is_isa300(ctx)) {
+            tcg_gen_mov_tl(cpu_ca32, cpu_ca);
+        }
+        tcg_gen_ext32s_tl(dst, src);
+        tcg_gen_sari_tl(dst, dst, 31);
     } else {
         TCGv t0;
         tcg_gen_ext32s_tl(dst, src);
