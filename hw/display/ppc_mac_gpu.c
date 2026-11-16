@@ -2855,6 +2855,12 @@ static void ppc_mac_gpu_display_update_inner(void *opaque)
     }
     uint64_t vram_generation = 0;
     uint64_t generation_lo = s->disp.offset;
+    /* A native R300 flip selects its next source before mode tracking catches up. */
+    if (s->r300 && s->r300_card_bytes && !s->rv250 &&
+        (uint64_t)s->regs.crtc_offset +
+            (uint64_t)s->disp.stride * s->disp.height <= s->vram_size) {
+        generation_lo = s->regs.crtc_offset;
+    }
     uint64_t generation_hi = generation_lo +
                              (uint64_t)s->disp.stride * s->disp.height;
     bool use_generation = ppc_gpu_dirty_scanout && s->renderer &&
