@@ -2744,6 +2744,9 @@ static void ppc_mac_gpu_display_update_inner(void *opaque)
     PPCMacGPUState *s = opaque;
     uint32_t ov0_seq;
 
+    if (s->csq_ring_active || g_in_pm4) {
+        return;                 /* its renderer callback has yielded the BQL */
+    }
     ppc_mac_gpu_csq_ring_drain(s);
     /* A machine that has just been woken: give the window the pointer the
      * sleeping one had (see ppc_mac_gpu_post_load). */
@@ -6053,8 +6056,9 @@ static void ppc_mac_gpu_pm4_process_type0(PPCMacGPUState *s,
      * where each write pushes data into the TCL engine's internal
      * matrix/constant storage.
      */
+    unsigned epoch = s->csq_ring_epoch;
     uint32_t i;
-    for (i = 0; i < count; i++) {
+    for (i = 0; i < count && epoch == s->csq_ring_epoch; i++) {
         uint32_t reg_addr = one_reg_wr ? (reg_base * 4)
                                        : ((reg_base + i) * 4);
         uint32_t val = data[i];
@@ -10558,9 +10562,11 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                                      uint32_t *pm4_data,
                                      uint32_t size_dw)
 {
+    unsigned epoch = s->csq_ring_epoch;
+
     g_in_pm4++;
     uint32_t i = 0;
-    while (i < size_dw) {
+    while (i < size_dw && epoch == s->csq_ring_epoch) {
         /* Between two ring packets the CP thread may let others in. */
         if (unlikely(cp_in_ring) && g_in_pm4 == 1 &&
             ppc_mac_gpu_cp_yield(s, i)) {
@@ -12128,6 +12134,9 @@ static bool ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
  */
 static void ppc_mac_gpu_cp_run(PPCMacGPUState *s)
 {
+    if (s->csq_ring_active || g_in_pm4) {
+        return;                 /* a parser still owns a yielding callback */
+    }
     unsigned epoch = ++cp.epoch;    /* a yielded CP thread gives up its copy */
 
     /* This thread records GPU work too, which invalidates what the vCPU's
@@ -12260,6 +12269,12 @@ static void *ppc_mac_gpu_cp_thread(void *opaque)
             qatomic_set(&cp.running, true);
             ppc_mac_gpu_cp_handoff();
             bql_lock();
+            if (s->csq_ring_active || g_in_pm4) {
+                bql_unlock();
+                qatomic_set(&cp.running, false);
+                qemu_event_wait(&cp.kick); /* the PIO owner wakes us on exit */
+                continue;
+            }
             if (t0) {
                 int64_t t1 = get_clock(), k = cps.kick_ns;
                 if (k && t1 > k) {
@@ -12589,12 +12604,48 @@ static void ppc_mac_gpu_pm4_fifo_push(PPCMacGPUState *s, uint32_t val)
  * PPCGPU_CSQ_RING=0 keeps the old synchronous path.
  * ======================================================================== */
 
+typedef struct PPCMacGPUCSQWrite {
+    hwaddr addr;
+    uint64_t val;
+    unsigned size;
+} PPCMacGPUCSQWrite;
+
+/* BQL held. A yielded parser cannot consume a nested write synchronously. */
+static void ppc_mac_gpu_csq_enqueue(PPCMacGPUState *s, hwaddr addr,
+                                   uint64_t val, unsigned size)
+{
+    PPCMacGPUCSQWrite w = { addr, val, size };
+
+    qemu_spin_lock(&s->csq_ring_lock);
+    if (addr >= R200_PM4_FIFO_DATA_BASE && addr < R200_PM4_FIFO_DATA_END &&
+        !s->csq_ring_deferred && s->csq_ring_count < ARRAY_SIZE(s->csq_ring)) {
+        s->csq_ring[(s->csq_ring_tail + s->csq_ring_count) %
+                    ARRAY_SIZE(s->csq_ring)] = val;
+        s->csq_ring_count++;
+        qemu_spin_unlock(&s->csq_ring_lock);
+        return;
+    }
+    if (!s->csq_ring_deferred) {
+        s->csq_ring_deferred = g_array_new(false, false, sizeof(w));
+    }
+    g_array_append_val(s->csq_ring_deferred, w);
+    qemu_spin_unlock(&s->csq_ring_lock);
+}
+
 static void ppc_mac_gpu_csq_ring_drain(PPCMacGPUState *s)
 {
     uint32_t words[256];
     unsigned n, i;
 
-    while (qatomic_read(&s->csq_ring_count)) {
+    if (s->csq_ring_active || g_in_pm4 ||
+        (!qatomic_read(&s->csq_ring_count) && !s->csq_ring_deferred)) {
+        return;
+    }
+    s->csq_ring_active = true;
+    for (;;) {
+        unsigned epoch = s->csq_ring_epoch;
+        PPCMacGPUCSQWrite w;
+
         qemu_spin_lock(&s->csq_ring_lock);
         n = MIN(s->csq_ring_count, ARRAY_SIZE(words));
         for (i = 0; i < n; i++) {
@@ -12602,9 +12653,34 @@ static void ppc_mac_gpu_csq_ring_drain(PPCMacGPUState *s)
         }
         s->csq_ring_tail = (s->csq_ring_tail + n) % ARRAY_SIZE(s->csq_ring);
         s->csq_ring_count -= n;
+        if (!n) {
+            if (!s->csq_ring_deferred ||
+                s->csq_ring_deferred_tail == s->csq_ring_deferred->len) {
+                g_clear_pointer(&s->csq_ring_deferred, g_array_unref);
+                s->csq_ring_deferred_tail = 0;
+                qemu_spin_unlock(&s->csq_ring_lock);
+                break;
+            }
+            w = g_array_index(s->csq_ring_deferred, PPCMacGPUCSQWrite,
+                              s->csq_ring_deferred_tail++);
+        }
         qemu_spin_unlock(&s->csq_ring_lock);
+        if (!n) {
+            ppc_mac_gpu_mmio_write(s, w.addr, w.val, w.size);
+        }
         for (i = 0; i < n; i++) {
             ppc_mac_gpu_pm4_fifo_push(s, words[i]);
+            if (epoch != s->csq_ring_epoch) {
+                break;
+            }
+        }
+    }
+    s->csq_ring_active = false;
+    if (ppc_mac_gpu_cp_pending(s)) {
+        if (cp.started) {
+            qemu_event_set(&cp.kick);
+        } else {
+            ppc_mac_gpu_cp_run(s);
         }
     }
 }
@@ -12618,18 +12694,21 @@ static void ppc_mac_gpu_csq_ring_write(void *opaque, hwaddr addr,
     if (unlikely(bql_locked() || gpu_debug_enabled() || r200_traffic_on())) {
         /* Keep the order, and the loggers' view, of the old path. */
         BQL_LOCK_GUARD();
+        ppc_mac_gpu_csq_enqueue(s, R200_PM4_FIFO_DATA_BASE + addr, val, size);
         ppc_mac_gpu_csq_ring_drain(s);
-        ppc_mac_gpu_mmio_write(s, R200_PM4_FIFO_DATA_BASE + addr, val, size);
         return;
     }
     qemu_spin_lock(&s->csq_ring_lock);
-    if (unlikely(s->csq_ring_count == ARRAY_SIZE(s->csq_ring))) {
-        /* A driver that never looks at the card: carry the queue out here. */
+    if (unlikely(s->csq_ring_count == ARRAY_SIZE(s->csq_ring) ||
+                 s->csq_ring_deferred)) {
+        /* Spill behind older writes: an active owner may need this vCPU
+         * to return before its BQL-yielding callback can finish. */
         qemu_spin_unlock(&s->csq_ring_lock);
         bql_lock();
+        ppc_mac_gpu_csq_enqueue(s, R200_PM4_FIFO_DATA_BASE + addr, val, size);
         ppc_mac_gpu_csq_ring_drain(s);
         bql_unlock();
-        qemu_spin_lock(&s->csq_ring_lock);
+        return;
     }
     s->csq_ring[(s->csq_ring_tail + s->csq_ring_count) % ARRAY_SIZE(s->csq_ring)] = val;
     s->csq_ring_count++;
@@ -12861,8 +12940,29 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
 {
     PPCMacGPUState *s = opaque;
     uint64_t val = 0;
+    bool command_pending = s->csq_ring_active || g_in_pm4 || s->pm4_pkt_count ||
+                       qatomic_read(&s->csq_ring_count);
     bool async_status = s->r300 && s->renderer && s->renderer->busy_r200 &&
                         (addr == R200_RBBM_STATUS || addr == R200_GUI_STAT);
+
+    if (command_pending) {
+        unsigned free = s->csq_ring_deferred ? 0 :
+                        MIN(64u, ARRAY_SIZE(s->csq_ring) -
+                                 qatomic_read(&s->csq_ring_count));
+        /* A renderer callback may be suspended here: do not reenter it
+         * or report the local, not-yet-executed words as complete. */
+        switch (addr) {
+        case R200_RBBM_STATUS:
+        case R200_GUI_STAT:
+            return free | R200_RBBM_ACTIVE;
+        case R200_CP_CSQ_STAT:
+            return 0x00000100;
+        case R300_CP_CSQ_AVAIL:
+            return free | (free << 16);
+        case R200_CP_CSQ_CNTL:
+            return (s->regs.cp_csq_cntl & 0xFF000000) | free;
+        }
+    }
 
     /*
      * POWEREMU_STALL_TRACE: the last register accesses before the guest
@@ -13031,7 +13131,9 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
     }
     /* Idle/fence status reads precede CPU access to rendered VRAM; FIFO
      * space, scanline and interrupt polls do not. */
-    if (addr >= R200_SCRATCH_REG0 && addr <= R200_SCRATCH_REG5 && !(addr & 3) &&
+    if (s->csq_ring_active || g_in_pm4) {
+        /* Return the register state reached before the yielding packet. */
+    } else if (addr >= R200_SCRATCH_REG0 && addr <= R200_SCRATCH_REG5 && !(addr & 3) &&
         r200_direct_enabled() && r200_scratch_read_wait(s, (addr - R200_SCRATCH_REG0) / 4)) {
         /* fence poll: answered without flushing later work */
     } else if (!async_status && addr != R200_CP_CSQ_CNTL && addr != R200_CP_CSQ_STAT &&
@@ -15089,7 +15191,7 @@ static uint64_t ppc_mac_gpu_mmio_read_guest(void *opaque, hwaddr addr,
     PPCMacGPUState *s = opaque;
 
     cps_count(cps.rd, addr & ~3);
-    if (addr != R200_CP_RB_RPTR &&
+    if (!s->csq_ring_active && !g_in_pm4 && addr != R200_CP_RB_RPTR &&
         !(addr >= PPC_MAC_GPU_HWC_BASE && addr < PPC_MAC_GPU_HWC_END)) {
         ppc_mac_gpu_cp_sync(s, addr);
     }
@@ -15103,9 +15205,19 @@ static void ppc_mac_gpu_mmio_write_guest(void *opaque, hwaddr addr,
     PPCMacGPUState *s = opaque;
 
     cps_count(cps.wr, addr & ~3);
+    if (s->csq_ring_active || g_in_pm4) {
+        ppc_mac_gpu_csq_enqueue(s, addr, val, size);
+        ppc_mac_gpu_csq_ring_drain(s);
+        return;
+    }
     if (addr != R200_CP_RB_WPTR &&
         !(addr >= PPC_MAC_GPU_HWC_BASE && addr < PPC_MAC_GPU_HWC_END)) {
         ppc_mac_gpu_cp_sync(s, addr);
+    }
+    if (addr >= R200_PM4_FIFO_DATA_BASE && addr < R200_PM4_FIFO_DATA_END) {
+        ppc_mac_gpu_csq_enqueue(s, addr, val, size);
+        ppc_mac_gpu_csq_ring_drain(s);
+        return;
     }
     ppc_mac_gpu_csq_ring_drain(s);
     ppc_mac_gpu_mmio_write(opaque, addr, val, size);
@@ -15598,7 +15710,10 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
     cp.epoch++;                 /* a CP thread mid-ring drops what it has */
     r200_read_memo_clear(s);
     qemu_spin_lock(&s->csq_ring_lock);
+    s->csq_ring_epoch++;
     s->csq_ring_tail = s->csq_ring_count = 0;
+    g_clear_pointer(&s->csq_ring_deferred, g_array_unref);
+    s->csq_ring_deferred_tail = 0;
     qemu_spin_unlock(&s->csq_ring_lock);
     memset(&s->regs, 0, sizeof(s->regs));
     s->hwc_w = s->hwc_h = s->hwc_idx = 0;
@@ -16356,6 +16471,7 @@ static void ppc_mac_gpu_exit(PCIDevice *dev)
 
     qemu_del_vm_change_state_handler(cp.vmse);
     ppc_mac_gpu_cp_stop();
+    g_clear_pointer(&s->csq_ring_deferred, g_array_unref);
     timer_del(&s->vblank_timer);
     ppc_mac_gpu_shadow_free(s);
     ppc_mac_gpu_shadow_reap(s, true);
@@ -16483,9 +16599,14 @@ static char *ppc_mac_gpu_get_perf(Object *obj, Error **errp)
 
 static int ppc_mac_gpu_pre_save(void *opaque)
 {
+    PPCMacGPUState *s = opaque;
+
+    if (s->csq_ring_active || g_in_pm4) {
+        return -EBUSY;
+    }
     ppc_mac_gpu_cp_sync(opaque, 0xFFFFFFFF);  /* save with the ring done */
     ppc_mac_gpu_csq_ring_drain(opaque);
-    return 0;
+    return s->csq_ring_active || g_in_pm4 || s->pm4_pkt_count ? -EBUSY : 0;
 }
 
 static int ppc_mac_gpu_post_load(void *opaque, int version_id)

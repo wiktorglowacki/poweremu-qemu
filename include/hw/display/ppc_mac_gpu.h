@@ -696,6 +696,10 @@ struct PPCMacGPUState {
     uint32_t csq_ring[4096];
     unsigned csq_ring_tail;
     unsigned csq_ring_count;
+    bool csq_ring_active;       /* one parser owner, even across BQL yields */
+    unsigned csq_ring_epoch;    /* reset invalidates its copied words */
+    GArray *csq_ring_deferred;  /* writes arriving while that owner yields */
+    unsigned csq_ring_deferred_tail;
     MemoryRegion rom_mr;        /* ROM BAR: traced expansion ROM */
 
     /* ROM data */
