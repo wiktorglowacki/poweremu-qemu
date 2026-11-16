@@ -2964,10 +2964,13 @@ static uint32_t vk_commit_ex(void (*done)(void *, uint32_t), void *arg,
     uint64_t wb_all = V.stat_writebacks, wbz0 = V.stat_wb_z;
 
     if (writeback_z && vk_lazy_z()) {
-        for (int i = 0; i < VK_MAX_IMG; i++) {
-            if (V.img[i].live && V.img[i].dirty && V.img[i].z) {
-                V.stat_wb_z += V.img[i].ndr > 0;
-                vk_copy_to_vram(&V.img[i]);
+        for (int w = 0; w < VK_MAX_IMG / 64; w++) {
+            for (uint64_t bits = V.dimg[w] & V.zimg[w]; bits; bits &= bits - 1) {
+                VkImg *im = &V.img[w * 64 + ctz64(bits)];
+                if (im->live && im->dirty && im->z) {
+                    V.stat_wb_z += im->ndr > 0;
+                    vk_copy_to_vram(im);
+                }
             }
         }
     }
@@ -2984,15 +2987,18 @@ static uint32_t vk_commit_ex(void (*done)(void *, uint32_t), void *arg,
     vk_end_pass();
     uint64_t wb0 = V.stat_writebacks;
     bool wb = false;
-    for (int i = 0; i < VK_MAX_IMG; i++) {
-        if (V.img[i].live && V.img[i].dirty &&
-            (writeback_z || !V.img[i].z || !vk_lazy_z())) {
-            V.stat_wb_z += V.img[i].z && V.img[i].ndr;
-            if (!wb && V.img[i].ndr) {
-                vk_full_barrier(b->cb);
-                wb = true;
+    for (int w = 0; w < VK_MAX_IMG / 64; w++) {
+        for (uint64_t bits = V.dimg[w]; bits; bits &= bits - 1) {
+            VkImg *im = &V.img[w * 64 + ctz64(bits)];
+            if (im->live && im->dirty &&
+                (writeback_z || !im->z || !vk_lazy_z())) {
+                V.stat_wb_z += im->z && im->ndr;
+                if (!wb && im->ndr) {
+                    vk_full_barrier(b->cb);
+                    wb = true;
+                }
+                vk_copy_to_vram_nb(im);
             }
-            vk_copy_to_vram_nb(&V.img[i]);
         }
     }
     if (wb) {
