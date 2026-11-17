@@ -1,8 +1,37 @@
 /*
- * R300 3D register names, generated from Mesa src/gallium/drivers/r300/r300_reg.h
- * (MIT license, Copyright 2000 ATI Technologies Inc. and contributors).
+ * R300 3D register names, generated from Mesa r300_reg.h.
+ * The 355 upstream name/address pairs match Mesa 18.1.3:
+ * https://gitlab.freedesktop.org/mesa/mesa/-/blob/f7e89b2f48c6fbbe5b3cedb1a9fcc1b4d47e64b0/src/gallium/drivers/r300/r300_reg.h
+ * Upstream Git blob: 9c93b84ee5f4c0c068e473d402c9757864665a3c
+ * The original generator revision was not recorded.
+ * R300_VAP_PVS_UPLOAD_DATA_ALIAS (0x2204) is a local addition.
  * Only top-level register defines in 0x1C00..0x4FFF are included.
  */
+
+/**************************************************************************
+
+Copyright (C) 2004-2005 Nicolai Haehnle et al.
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation
+on the rights to use, copy, modify, merge, publish, distribute, sub
+license, and/or sell copies of the Software, and to permit persons to whom
+the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice (including the next
+paragraph) shall be included in all copies or substantial portions of the
+Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL
+THE AUTHOR(S) AND/OR THEIR SUPPLIERS BE LIABLE FOR ANY CLAIM,
+DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+**************************************************************************/
 
 static const struct { uint16_t addr; const char *name; } r300_reg_names[] = {
     { 0x1D98, "R300_SE_VPORT_XSCALE" },
