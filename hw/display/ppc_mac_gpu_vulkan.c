@@ -5028,7 +5028,10 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     }
     /* What the scissor let through, over every sample's columns. */
     for (uint32_t k = 0; k < natt; k++) {
-        vk_img_written(att[k], sx0, sy0, (ns - 1) * pkt->rt_pitch * (ns > 1) + sx1, sy1);
+        /* Keeping hardware depth bound does not mean this draw wrote it. */
+        if (k < ncb || !hz || (u.zinfo[0] & 5)) {
+            vk_img_written(att[k], sx0, sy0, (ns - 1) * pkt->rt_pitch * (ns > 1) + sx1, sy1);
+        }
     }
     V.stat_draws++;
     b->draws++;
