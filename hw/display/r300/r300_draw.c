@@ -103,16 +103,6 @@ static float bits_to_float(uint32_t v)
     return f;
 }
 
-static uint32_t vc_swap(uint32_t v, unsigned mode)
-{
-    switch (mode & 3) {
-    case 1:  return ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
-    case 2:  return __builtin_bswap32(v);
-    case 3:  return (v << 16) | (v >> 16);
-    default: return v;
-    }
-}
-
 static float half_to_float(uint16_t h)
 {
     uint32_t s = (h >> 15) & 1, e = (h >> 10) & 0x1F, m = h & 0x3FF;
@@ -218,7 +208,7 @@ static bool fetch_dwords(Fetch *f, unsigned k, uint32_t vtx, unsigned cursor,
         return false;
     }
     for (unsigned i = 0; i < count; i++) {
-        out[i] = vc_swap(out[i], f->swap);
+        out[i] = r300_swap_mode(out[i], f->swap);
     }
     return true;
 }
@@ -327,7 +317,7 @@ static bool fetch_vertex(Fetch *f, uint32_t vtx, float in[R300_PVS_NUM_INPUTS][4
             uint32_t v[4] = { 0, 0, 0, 0x3F800000 };
             for (unsigned i = 0; i <= type; i++) {
                 memcpy(&v[i], p + 4 * i, 4);
-                v[i] = vc_swap(v[i], f->swap);
+                v[i] = r300_swap_mode(v[i], f->swap);
             }
             memcpy(in[dst], v, sizeof(v));
         } else if (!n) {
@@ -590,6 +580,18 @@ void r300_tex_level_dims(const R300TexDesc *td, uint32_t l, uint32_t *w,
     }
 }
 
+/* A 32-byte micro tile, in texels (or DXT blocks). */
+static inline void r300_microtile_dims(uint32_t bpp, uint32_t *tw, uint32_t *th)
+{
+    switch (bpp) {
+    case 1: *tw = 8; *th = 4; break;
+    case 2: *tw = 8; *th = 2; break;
+    case 4: *tw = 4; *th = 2; break;
+    case 8: *tw = 2; *th = 2; break;
+    default: *tw = 2; *th = 1; break;
+    }
+}
+
 /* The hardware's addressing, as Mesa's r300_texture_desc.c lays out
  * linear (untiled) textures: 32-byte rows, power-of-two heights for
  * mipmapped, 3D and cube textures, levels one after another. */
@@ -607,13 +609,7 @@ void r300_tex_layout(R300TexDesc *td, uint32_t bpp, bool dxt, bool pitch_en)
     uint32_t tw = 1, th = 1, off = 0;
 
     if (micro) {
-        switch (bpp) {
-        case 1: tw = 8; th = 4; break;
-        case 2: tw = 8; th = 2; break;
-        case 4: tw = 4; th = 2; break;
-        case 8: tw = 2; th = 2; break;
-        default: tw = 2; th = 1; break;
-        }
+        r300_microtile_dims(bpp, &tw, &th);
     }
     for (uint32_t l = 0; l < td->levels; l++) {
         uint32_t w, h, d, pitch, rows;
@@ -2314,7 +2310,7 @@ bool r300_draw_build_indexed(const R300State *st, const R300Arrays *arr,
     }
     sw = scratch(SCR_SW, sizeof(uint32_t) * (idx->ndw ? idx->ndw : 1));
     for (uint32_t k = 0; k < idx->ndw; k++) {
-        sw[k] = vc_swap(idx->dw[k], swap);
+        sw[k] = r300_swap_mode(idx->dw[k], swap);
     }
     order = scratch(SCR_ORDER, sizeof(uint32_t) * n);
     for (uint32_t i = 0; i < n; i++) {
@@ -2455,8 +2451,7 @@ static bool r300_tex_level_valid(const R300TexDesc *td, uint32_t l,
         return false;
     }
     if (td->tiling & 2) {
-        tw = bpp <= 2 ? 8 : bpp == 4 ? 4 : 2;
-        th = bpp == 1 ? 4 : bpp <= 8 ? 2 : 1;
+        r300_microtile_dims(bpp, &tw, &th);
     } else if (macro) {
         tw = 256 / bpp;
         th = 8;
@@ -2498,8 +2493,8 @@ bool r300_tex_layout_valid(const R300TexDesc *td)
  * th rows of tw texels (8x4 at 8 bpp, 8x2 at 16, 4x2 at 32, 2x2 at 64, 2x1
  * at 128; a DXT block counts as one texel), row-major inside the tile,
  * tiles row-major across the surface with a band of th rows spanning the
- * pitch.  A macro tile is 2 KB: 8x8 micro tiles, or 256 bytes by 8 rows
- * when only macro tiling is on.  MorphOS's r300.library writes every
+ * pitch.  Macro-only tiling uses 256 bytes by 8 rows.  The combined mode
+ * follows the micro-only layout.  MorphOS's r300.library writes every
  * texture micro tiled.
  */
 static uint8_t *r300_tex_untile(const R300TexDesc *td, const uint8_t *src,
@@ -2512,16 +2507,10 @@ static uint8_t *r300_tex_untile(const R300TexDesc *td, const uint8_t *src,
                    td->kind == R300_TEXK_RG8 || td->kind == R300_TEXK_CONVERT16 ? 2 :
                    td->kind == R300_TEXK_R8 ? 1 : td->view_bpp;
     uint32_t cols = dxt ? (w + 3) / 4 : w, rows = dxt ? (h + 3) / 4 : h;
-    uint32_t tw = 32 / bpp, th = 1;
-    bool micro = td->tiling & 2, macro = false;
+    uint32_t tw, th;
+    bool micro = td->tiling & 2;
 
-    switch (bpp) {
-    case 1: tw = 8; th = 4; break;
-    case 2: tw = 8; th = 2; break;
-    case 4: tw = 4; th = 2; break;
-    case 8: tw = 2; th = 2; break;
-    default: tw = 2; th = 1; break;
-    }
+    r300_microtile_dims(bpp, &tw, &th);
     uint64_t band = (uint64_t)pitch * th;
     uint8_t *lin = malloc((size_t)pitch * rows);
     if (!lin) {
@@ -2532,11 +2521,6 @@ static uint8_t *r300_tex_untile(const R300TexDesc *td, const uint8_t *src,
             uint64_t a;
             if (!micro) {
                 a = r300_macro_offset(x * bpp, y, pitch);
-            } else if (micro && macro) {
-                uint32_t tx = x / tw, ty = y / th;
-                a = (uint64_t)(ty / 8) * band * 8 + (uint64_t)(tx / 8) * 2048 +
-                    ((ty % 8) * 8 + (tx % 8)) * 32 +
-                    ((y % th) * tw + (x % tw)) * bpp;
             } else {
                 a = (uint64_t)(y / th) * band + (uint64_t)(x / tw) * (tw * bpp * th) +
                     ((y % th) * tw + (x % tw)) * bpp;
@@ -2653,12 +2637,7 @@ static uint8_t *r300_tex_level_bytes_linear(const R300TexDesc *td,
                 l = __builtin_bswap32(l);
             }
             v = td->card_bytes ? l : __builtin_bswap32(l);                       /* the BE value */
-            switch (td->endian & 3) {
-            case 1: v = ((v & 0x00ff00ffu) << 8) | ((v >> 8) & 0x00ff00ffu); break;
-            case 2: v = __builtin_bswap32(v); break;
-            case 3: v = (v << 16) | (v >> 16); break;
-            default: break;
-            }
+            v = r300_swap_mode(v, td->endian);
             memcpy(out + i, &v, 4);
         }
         return out;

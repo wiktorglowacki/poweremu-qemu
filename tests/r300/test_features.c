@@ -438,6 +438,13 @@ static void viewport_ports(void)
 
 static void native_texture_bytes(void)
 {
+    const uint32_t swapped[4] = { 0x01234567, 0x23016745, 0x67452301, 0x45670123 };
+    for (unsigned mode = 0; mode < 8; mode++) {
+        CHECK(r300_swap_mode(0x01234567, mode) == swapped[mode & 3],
+              "dword swap mode %u", mode);
+        CHECK(r300_swap_mode(r300_swap_mode(0x89abcdef, mode), mode) == 0x89abcdef,
+              "dword swap involution %u", mode);
+    }
     R300TexDesc t = { .card_bytes = true, .kind = R300_TEXK_RGBA8,
         .width = 1, .height = 1, .levels = 1, .lvl_pitch = { 4 },
         .lvl_rows = { 1 }, .size_bytes = 4 };
@@ -465,21 +472,45 @@ static void native_texture_bytes(void)
     t.kind = R300_TEXK_RG8; t.endian = 2; t.lvl_pitch[0] = 2;
     CHECK(!r300_tex_card_swap_valid(&t), "partial swap DWORD accepted");
     CHECK(!r300_tex_level_bytes(&t, red565, 0, 1, 1, &bpr), "partial swap texture read accepted");
+
+    /* DXT's implicit CPU-view swap precedes the explicit TX_OFFSET swap. */
+    uint8_t blocks[32];
+    for (unsigned i = 0; i < sizeof(blocks); i++) blocks[i] = i * 17 + 3;
+    t = (R300TexDesc){ .kind = R300_TEXK_DXT1, .width = 4, .height = 4,
+        .levels = 1, .lvl_pitch = { 32 }, .lvl_rows = { 1 }, .size_bytes = 32 };
+    for (unsigned card = 0; card < 2; card++) {
+        for (unsigned host = 0; host < 2; host++) {
+            for (unsigned mode = 0; mode < 4; mode++) {
+                static const unsigned lanes[4] = { 0, 1, 3, 2 };
+                t.card_bytes = card;
+                t.host_data = host ? blocks : NULL;
+                t.endian = mode;
+                tex = r300_tex_level_bytes(&t, blocks, 0, 4, 4, &bpr);
+                CHECK(tex && bpr == 8, "DXT source view %u/%u/%u", card, host, mode);
+                for (unsigned i = 0; tex && i < 8; i++) {
+                    unsigned lane = lanes[mode] ^ (!card && !host ? 3 : 0);
+                    CHECK(tex[i] == blocks[i ^ lane], "DXT swap %u/%u/%u byte %u",
+                          card, host, mode, i);
+                }
+                free(tex);
+            }
+        }
+    }
 }
 
 static void texture_layout_bounds(void)
 {
     static const struct {
-        uint32_t kind, bpp, w, h, bad_pitch;
+        uint32_t kind, bpp, w, h, bad_pitch, tw, th;
         bool dxt;
     } cases[] = {
-        { R300_TEXK_R8, 1, 9, 5, 9, false },
-        { R300_TEXK_RG8, 2, 9, 3, 18, false },
-        { R300_TEXK_RGBA8, 4, 5, 2, 20, false },
-        { R300_TEXK_CONVERT16, 2, 9, 3, 18, false },
-        { R300_TEXK_DXT1, 8, 12, 4, 24, true },
-        { R300_TEXK_DXT3, 16, 4, 4, 16, true },
-        { R300_TEXK_DXT5, 16, 4, 4, 16, true },
+        { R300_TEXK_R8, 1, 9, 5, 9, 8, 4, false },
+        { R300_TEXK_RG8, 2, 9, 3, 18, 8, 2, false },
+        { R300_TEXK_RGBA8, 4, 5, 3, 20, 4, 2, false },
+        { R300_TEXK_CONVERT16, 2, 9, 3, 18, 8, 2, false },
+        { R300_TEXK_DXT1, 8, 12, 12, 24, 2, 2, true },
+        { R300_TEXK_DXT3, 16, 12, 12, 16, 2, 1, true },
+        { R300_TEXK_DXT5, 16, 12, 12, 16, 2, 1, true },
     };
     const uint8_t dummy = 0;
     uint32_t bpr;
@@ -490,12 +521,39 @@ static void texture_layout_bounds(void)
         r300_tex_layout(&t, cases[i].bpp, cases[i].dxt, false);
         CHECK(r300_tex_layout_valid(&t), "valid tiled layout kind %u", t.kind);
         uint8_t *src = calloc(t.size_bytes, 1);
+        for (unsigned j = 0; j < t.size_bytes; j++) src[j] = j * 37 + j / 17 + 5;
         for (uint32_t l = 0; l < t.levels; l++) {
             uint32_t w, h, d;
             r300_tex_level_dims(&t, l, &w, &h, &d);
-            uint8_t *tex = r300_tex_level_bytes(&t, src + t.lvl_off[l], l, w, h, &bpr);
-            CHECK(tex && bpr, "tiled upload kind %u level %u", t.kind, l);
-            free(tex);
+            uint32_t pitch = t.lvl_pitch[l], rows = t.lvl_rows[l];
+            uint32_t tw = cases[i].tw, th = cases[i].th, bpp = cases[i].bpp;
+            uint8_t *linear = calloc(pitch * rows, 1);
+            /* Independent tile-order traversal, including whole padded bands. */
+            for (unsigned ty = 0; ty < rows / th; ty++) {
+                for (unsigned tx = 0; tx < pitch / (tw * bpp); tx++) {
+                    unsigned tile = ty * (pitch / (tw * bpp)) + tx;
+                    for (unsigned y = 0; y < th; y++) {
+                        memcpy(linear + (ty * th + y) * pitch + tx * tw * bpp,
+                               src + t.lvl_off[l] + tile * 32 + y * tw * bpp,
+                               tw * bpp);
+                    }
+                }
+            }
+            R300TexDesc linear_t = t;
+            linear_t.tiling = 0;
+            uint32_t ref_bpr;
+            uint8_t *ref = r300_tex_level_bytes(&linear_t, linear, l, w, h, &ref_bpr);
+            for (unsigned mode = 2; mode <= 3; mode++) {
+                R300TexDesc tiled_t = t;
+                tiled_t.tiling = mode;
+                uint8_t *tex = r300_tex_level_bytes(&tiled_t, src + t.lvl_off[l], l, w, h, &bpr);
+                CHECK(tex && ref && bpr == ref_bpr &&
+                      !memcmp(tex, ref, bpr * (cases[i].dxt ? (h + 3) / 4 : h)),
+                      "tiled bytes kind %u level %u mode %u", t.kind, l, mode);
+                free(tex);
+            }
+            free(ref);
+            free(linear);
         }
         free(src);
         t.size_bytes--;
@@ -511,6 +569,15 @@ static void texture_layout_bounds(void)
         CHECK(t.lvl_pitch[0] == cases[i].bad_pitch && !r300_tex_layout_valid(&t) &&
               !r300_tex_level_bytes(&t, &dummy, 0, t.width, t.height, &bpr) && !bpr,
               "partial-tile pitch accepted or changed for kind %u", t.kind);
+    }
+
+    /* RAW keeps its existing upload path; layout still uses 8/16-byte texels. */
+    for (unsigned bpp = 8; bpp <= 16; bpp *= 2) {
+        R300TexDesc raw = { .kind = R300_TEXK_RAW, .format = bpp == 8 ? 0x1c : 0x1d,
+            .view_bpp = bpp, .tiling = 2, .width = 5, .height = 3, .levels = 1 };
+        r300_tex_layout(&raw, bpp, false, false);
+        CHECK(raw.lvl_pitch[0] == 6 * bpp && raw.lvl_rows[0] == (bpp == 8 ? 4 : 3) &&
+              r300_tex_layout_valid(&raw), "RAW microtile layout bpp %u", bpp);
     }
 
     R300TexDesc t = { .kind = R300_TEXK_DXT1, .tiling = 2, .width = 16,

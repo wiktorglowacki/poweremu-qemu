@@ -27,6 +27,17 @@
 
 #define R300_MAX_ARRAYS 16
 
+/* The card's endian swap modes (VC_SWAP, DEPTHENDIAN, TX_OFFSET, ...). */
+static inline uint32_t r300_swap_mode(uint32_t v, unsigned mode)
+{
+    switch (mode & 3) {
+    case 1:  return ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+    case 2:  return __builtin_bswap32(v);
+    case 3:  return (v << 16) | (v >> 16);
+    default: return v;
+    }
+}
+
 /* 3D_LOAD_VBPNTR state: one entry per vertex array. */
 typedef struct R300Arrays {
     unsigned count;

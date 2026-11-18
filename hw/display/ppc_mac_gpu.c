@@ -4195,17 +4195,6 @@ static bool r300_write_raw(PPCMacGPUState *s, uint32_t gpu_addr,
     return false;
 }
 
-/* The card's endian swap modes (VC_SWAP, DEPTHENDIAN, ...). */
-static uint32_t r300_swap_mode(uint32_t v, unsigned mode)
-{
-    switch (mode & 3) {
-    case 1:  return ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
-    case 2:  return bswap32(v);
-    case 3:  return (v << 16) | (v >> 16);
-    default: return v;
-    }
-}
-
 /*
  * ZB_ZPASS_DATA / ZB_ZPASS_ADDR (occlusion queries).  Writing DATA sets
  * the Z-pass counter; writing ADDR stores it at that GPU address, in the
