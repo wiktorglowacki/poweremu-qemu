@@ -1737,8 +1737,13 @@ static bool vk_tile_init(void)
         .pPushConstantRanges = &pcr,
     };
     VkResult r = vkCreateDescriptorSetLayout(V.dev, &dli, NULL, &V.tile_dsl);
-    if (r == VK_SUCCESS) {
-        r = vkCreatePipelineLayout(V.dev, &pli, NULL, &V.tile_pl);
+    if (r != VK_SUCCESS) {
+        goto fail;
+    }
+    r = vkCreatePipelineLayout(V.dev, &pli, NULL, &V.tile_pl);
+    if (r != VK_SUCCESS) {
+        vkDestroyDescriptorSetLayout(V.dev, V.tile_dsl, NULL);
+        goto fail;
     }
     const char *mains[2] = { vk_tile_main, vk_zconv_main };
     VkPipeline *pipes[2] = { &V.tile_pipe, &V.zconv_pipe };
@@ -1776,13 +1781,17 @@ static bool vk_tile_init(void)
             vkDestroyShaderModule(V.dev, mod, NULL);
         }
     }
-    if (r != VK_SUCCESS) {
-        qemu_log("ppc-mac-gpu vulkan: tile pass setup failed (VkResult %d)\n", (int)r);
-        V.tile_failed = true;
-        V.tile_pipe = VK_NULL_HANDLE;
-        return false;
+    if (r == VK_SUCCESS) {
+        return true;
     }
-    return true;
+    vkDestroyPipeline(V.dev, V.tile_pipe, NULL);
+    vkDestroyPipeline(V.dev, V.zconv_pipe, NULL);
+    vkDestroyPipelineLayout(V.dev, V.tile_pl, NULL);
+    vkDestroyDescriptorSetLayout(V.dev, V.tile_dsl, NULL);
+fail:
+    qemu_log("ppc-mac-gpu vulkan: tile pass setup failed (VkResult %d)\n", (int)r);
+    V.tile_failed = true;
+    return false;
 }
 
 static bool vk_zstage(void)
@@ -1801,25 +1810,20 @@ static bool vk_tile_staging(VkDeviceSize need)
     if (V.tile_buf && V.tile_size >= need) {
         return true;
     }
-    if (V.tile_buf) {
-        vk_trash(NULL, TRASH_BUF, (uint64_t)(uintptr_t)V.tile_buf);
-        vk_trash(NULL, TRASH_MEM, (uint64_t)(uintptr_t)V.tile_mem);
-        vk_trash(NULL, TRASH_BUF, (uint64_t)(uintptr_t)V.zs_buf);
-        vk_trash(NULL, TRASH_MEM, (uint64_t)(uintptr_t)V.zs_mem);
-        V.tile_buf = VK_NULL_HANDLE;
-    }
+    VkBuffer tile_buf, zs_buf;
+    VkDeviceMemory tile_mem, zs_mem;
+    VkDescriptorSet set;
     VkDeviceSize size = MAX(pow2ceil(need), (VkDeviceSize)16 << 20);
     VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     if (!vk_buffer(size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
-                   &V.tile_buf, &V.tile_mem, NULL) ||
-        !vk_buffer(size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
-                   &V.zs_buf, &V.zs_mem, NULL)) {
-        V.tile_buf = VK_NULL_HANDLE;
-        V.tile_failed = true;
+                   &tile_buf, &tile_mem, NULL)) {
         return false;
     }
-    V.tile_size = size;
+    if (!vk_buffer(size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
+                   &zs_buf, &zs_mem, NULL)) {
+        goto fail;
+    }
     VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 };
     VkDescriptorPoolCreateInfo pci = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -1833,23 +1837,22 @@ static bool vk_tile_staging(VkDeviceSize need)
         .pSetLayouts = &V.tile_dsl,
     };
     if (!V.tile_pool && vkCreateDescriptorPool(V.dev, &pci, NULL, &V.tile_pool) != VK_SUCCESS) {
-        V.tile_failed = true;
-        return false;
+        V.tile_pool = VK_NULL_HANDLE;
+        goto fail;
     }
     dai.descriptorPool = V.tile_pool;
-    if (vkAllocateDescriptorSets(V.dev, &dai, &V.tile_set) != VK_SUCCESS) {
-        V.tile_failed = true;
-        return false;
+    if (vkAllocateDescriptorSets(V.dev, &dai, &set) != VK_SUCCESS) {
+        goto fail;
     }
     VkDescriptorBufferInfo bi[2] = {
-        { vk_zstage() ? V.zs_buf : V.vram_buf, 0, VK_WHOLE_SIZE },
-        { V.tile_buf, 0, VK_WHOLE_SIZE },
+        { vk_zstage() ? zs_buf : V.vram_buf, 0, VK_WHOLE_SIZE },
+        { tile_buf, 0, VK_WHOLE_SIZE },
     };
     VkWriteDescriptorSet w[2];
     for (int i = 0; i < 2; i++) {
         w[i] = (VkWriteDescriptorSet){
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = V.tile_set,
+            .dstSet = set,
             .dstBinding = i,
             .descriptorCount = 1,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -1857,7 +1860,25 @@ static bool vk_tile_staging(VkDeviceSize need)
         };
     }
     vkUpdateDescriptorSets(V.dev, 2, w, 0, NULL);
+    /* Pending batches still reference the previous descriptor and buffers. */
+    vk_trash(NULL, TRASH_BUF, (uint64_t)(uintptr_t)V.tile_buf);
+    vk_trash(NULL, TRASH_MEM, (uint64_t)(uintptr_t)V.tile_mem);
+    vk_trash(NULL, TRASH_BUF, (uint64_t)(uintptr_t)V.zs_buf);
+    vk_trash(NULL, TRASH_MEM, (uint64_t)(uintptr_t)V.zs_mem);
+    V.tile_buf = tile_buf;
+    V.tile_mem = tile_mem;
+    V.zs_buf = zs_buf;
+    V.zs_mem = zs_mem;
+    V.tile_set = set;
+    V.tile_size = size;
     return true;
+
+fail:
+    vkDestroyBuffer(V.dev, zs_buf, NULL);
+    vkFreeMemory(V.dev, zs_mem, NULL);
+    vkDestroyBuffer(V.dev, tile_buf, NULL);
+    vkFreeMemory(V.dev, tile_mem, NULL);
+    return false;
 }
 
 static uint64_t vk_zs_copy_at(VkCommandBuffer cb, uint64_t addr, uint32_t pitch, uint32_t y,
@@ -1984,6 +2005,12 @@ static bool vk_tile_copy(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0
     return true;
 }
 
+/* Use the same stripe bound for full uploads and narrow dirty rectangles. */
+static uint32_t vk_zconv_rows(uint32_t width, uint32_t pitch)
+{
+    return MAX((16u << 20) / MAX(ROUND_UP(width, 4) * 5, pitch), 1u);
+}
+
 /* Columns [x0, x1) of rows [y0, y1) of depth image im to or from VRAM. */
 static void vk_zconv(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0,
                      uint32_t x1, uint32_t y1, bool to_vram)
@@ -1994,16 +2021,10 @@ static void vk_zconv(VkCommandBuffer cb, VkImg *im, uint32_t x0, uint32_t y0,
         return;
     }
     uint32_t w = x1 - x0, wp = ROUND_UP(w, 4);
-    uint32_t rows_max = MAX((16u << 20) / (wp * 5), 1u);
+    uint32_t rows_max = vk_zconv_rows(im->width, im->pitch);
     uint32_t mode = (im->tiling & 12) | (im->fmt == VK_FORMAT_D32_SFLOAT_S8_UINT ? 16 : 0) |
                     (vk_tiled_rt_enabled() && vk_tile_fits(im) ? im->tiling & 3 : 0);
     uint32_t band = mode & 3 ? 32 : 1;
-    if (!vk_tile_init() ||
-        !vk_tile_staging(MAX((VkDeviceSize)wp * 5 * MIN(y1 - y0, rows_max),
-                             (VkDeviceSize)(MIN(y1 - y0, rows_max) + band) * im->pitch))) {
-        vk_warn(1u << 11, "no depth buffer conversion pass: depth lost");
-        return;
-    }
     for (uint32_t y = y0; y < y1; y += rows_max) {
         uint32_t h = MIN(y1 - y, rows_max);
         uint64_t lo = vk_zs_copy(cb, im, y, h, band, false);
@@ -2675,6 +2696,19 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
              (max_h && vk_range_gen(addr + (uint64_t)h * pitch, vk_img_hi(c)) <= c->gen)))) &&
             (!im || c->height > im->height)) {
             im = c;
+        }
+    }
+    /* Reserve before publishing a depth image: a later write-back cannot fail. */
+    if (!im && vk_aspect(fmt) != VK_IMAGE_ASPECT_COLOR_BIT) {
+        uint32_t rows = MIN(h, vk_zconv_rows(w, pitch));
+        uint32_t band = (tiling & 3) && vk_tiled_rt_enabled() ? 32 : 1;
+        VkDeviceSize bytes = (VkDeviceSize)ROUND_UP(w, 4) * 5 * rows;
+        if (vk_zstage()) {
+            /* Each end of the copied stripe rounds out to a tile band. */
+            bytes = MAX(bytes, (VkDeviceSize)(rows + 2 * (band - 1)) * pitch);
+        }
+        if (!vk_tile_staging(bytes)) {
+            return NULL;
         }
     }
     if (!im && max_h) {
@@ -4627,7 +4661,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             vk_img_z(att[ncb], true);
         } else {
             vk_warn(1u << 9, "depth buffer not usable in place");
-            want_z = false;
+            return -1;
         }
     }
     /* Keep the open pass's depth buffer bound for depth-less draws. */
