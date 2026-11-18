@@ -335,7 +335,7 @@ void r300_draw_bounds(const R300DrawPacket *pkt, uint32_t bounds[4]);
  * decoded to RGBA8, DXT blocks and 8/16/32-bit texels copied as they lie.
  * src is the face's first byte; w, h the level's size (for DXT, rounded
  * up to whole blocks).  Returns malloc'd bytes and their row pitch, or
- * NULL with row pitch zero if the layout does not hold the requested texels.
+ * NULL with row pitch zero if the layout is invalid or allocation fails.
  */
 uint8_t *r300_tex_level_bytes(const R300TexDesc *td, const uint8_t *src,
                               uint32_t l, uint32_t w, uint32_t h, uint32_t *bpr);

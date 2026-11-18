@@ -4091,6 +4091,14 @@ static bool vk_dummies(void)
     return true;
 }
 
+static void vk_texfull_discard(VkTexFull *t)
+{
+    vk_trash(NULL, TRASH_VIEW, (uint64_t)(uintptr_t)t->view);
+    vk_trash(NULL, TRASH_IMAGE, (uint64_t)(uintptr_t)t->img);
+    vk_trash(NULL, TRASH_MEM, (uint64_t)(uintptr_t)t->mem);
+    t->live = false;
+}
+
 static VkFormat vk_tex_format(uint32_t kind)
 {
     switch (kind) {
@@ -4202,10 +4210,7 @@ static VkImageView vk_texture_full(const R300TexDesc *td)
     bool reuse = stale >= 0 && reuse_on;
     V.stat_tf_built++;
     if (t->live && !reuse) {
-        vk_trash(NULL, TRASH_VIEW, (uint64_t)(uintptr_t)t->view);
-        vk_trash(NULL, TRASH_IMAGE, (uint64_t)(uintptr_t)t->img);
-        vk_trash(NULL, TRASH_MEM, (uint64_t)(uintptr_t)t->mem);
-        t->live = false;
+        vk_texfull_discard(t);
     }
     uint32_t w = dxt ? (td->width + 3) & ~3u : td->width;
     uint32_t h = dxt ? (td->height + 3) & ~3u : td->height;
@@ -4235,16 +4240,13 @@ static VkImageView vk_texture_full(const R300TexDesc *td)
             uint8_t *bytes = r300_tex_level_bytes(td, src + td->lvl_off[l] + f * face,
                                                   l, cw, ch, &bpr);
             if (!bytes) {
-                vk_warn(1u << 8, "texture layout does not hold its mip level");
-                vk_trash(NULL, TRASH_VIEW, (uint64_t)(uintptr_t)t->view);
-                vk_trash(NULL, TRASH_IMAGE, (uint64_t)(uintptr_t)t->img);
-                vk_trash(NULL, TRASH_MEM, (uint64_t)(uintptr_t)t->mem);
-                t->live = false;
+                vk_warn(1u << 8, "could not convert texture mip level");
+                vk_texfull_discard(t);
                 return VK_NULL_HANDLE;
             }
             size_t len = dxt ? (size_t)bpr * ((ch + 3) / 4) : (size_t)bpr * ch;
             /* $R300_US_LOG: a look at small textures' converted texels */
-            if (bytes && l == 0 && f == 0 && getenv("R300_US_LOG") && cw * ch <= 1024) {
+            if (l == 0 && f == 0 && getenv("R300_US_LOG") && cw * ch <= 1024) {
                 GString *g = g_string_new(NULL);
                 for (uint32_t i = 0; i < MIN(len, (size_t)64); i++) {
                     g_string_append_printf(g, "%02x%s", bytes[i], (i & 3) == 3 ? " " : "");
@@ -4259,7 +4261,8 @@ static VkImageView vk_texture_full(const R300TexDesc *td)
             void *dst = vk_arena(len, &sb, &so);
             if (!dst) {
                 free(bytes);
-                continue;
+                vk_texfull_discard(t);
+                return VK_NULL_HANDLE;
             }
             memcpy(dst, bytes, len);
             free(bytes);

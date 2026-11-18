@@ -2547,6 +2547,18 @@ static uint8_t *r300_tex_untile(const R300TexDesc *td, const uint8_t *src,
     return lin;
 }
 
+static uint8_t *r300_tex_alloc_rows(uint64_t row_bytes, uint32_t rows, uint32_t *bpr)
+{
+    if (row_bytes > UINT32_MAX || row_bytes * rows > SIZE_MAX) {
+        return NULL;
+    }
+    uint8_t *out = malloc((size_t)row_bytes * rows);
+    if (out) {
+        *bpr = row_bytes;
+    }
+    return out;
+}
+
 static uint8_t *r300_tex_level_bytes_linear(const R300TexDesc *td,
                                             const uint8_t *src, uint32_t l,
                                             uint32_t w, uint32_t h,
@@ -2595,8 +2607,10 @@ static uint8_t *r300_tex_level_bytes_linear(const R300TexDesc *td,
 
     switch (td->kind) {
     case R300_TEXK_CONVERT16:
-        *bpr = w * 4;
-        out = malloc((size_t)w * h * 4);
+        out = r300_tex_alloc_rows((uint64_t)w * 4, h, bpr);
+        if (!out) {
+            return NULL;
+        }
         for (uint32_t y = 0; y < h; y++) {
             const uint8_t *row = src + (uint64_t)y * pitch;
             for (uint32_t x = 0; x < w; x++) {
@@ -2617,8 +2631,10 @@ static uint8_t *r300_tex_level_bytes_linear(const R300TexDesc *td,
     case R300_TEXK_DXT5: {
         uint32_t bs = td->kind == R300_TEXK_DXT1 ? 8 : 16;
         uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4;
-        *bpr = bw * bs;
-        out = malloc((size_t)bw * bh * bs);
+        out = r300_tex_alloc_rows((uint64_t)bw * bs, bh, bpr);
+        if (!out) {
+            return NULL;
+        }
         for (uint32_t y = 0; y < bh; y++) {
             memcpy(out + (size_t)y * bw * bs, src + (uint64_t)y * pitch, (size_t)bw * bs);
         }
@@ -2649,8 +2665,10 @@ static uint8_t *r300_tex_level_bytes_linear(const R300TexDesc *td,
     }
     default: {                          /* RGBA8, R8, RG8: bytes as they lie */
         uint32_t bpp = td->kind == R300_TEXK_RGBA8 ? 4 : td->kind == R300_TEXK_RG8 ? 2 : 1;
-        *bpr = w * bpp;
-        out = malloc((size_t)w * h * bpp);
+        out = r300_tex_alloc_rows((uint64_t)w * bpp, h, bpr);
+        if (!out) {
+            return NULL;
+        }
         for (uint32_t y = 0; y < h; y++) {
             if (td->card_bytes && td->endian) {
                 unsigned lane = td->endian == 1 ? 1 : td->endian == 2 ? 3 : 2;

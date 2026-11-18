@@ -6,6 +6,7 @@ B=${1:-${TMPDIR:-/tmp}/r300-tests}
 mkdir -p "$B"
 python3 test_csq_reentry.py
 python3 test_pageflip_generation.py
+python3 test_texture_alloc.py
 for t in test_vulkan_*.py; do python3 "$t"; done
 R=../../hw/display/r300
 SRC="$R/r300_state.c $R/r300_pvs.c $R/r300_us.c $R/r300_draw.c"
