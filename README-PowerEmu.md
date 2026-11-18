@@ -13,7 +13,7 @@ upstream revision), plus PowerEmu's work to run Mac OS X 10.4/10.5 on the
 | USB | `hw/usb/hcd-ohci.c` | No livelock when the host is overloaded |
 | CPU | `accel/tcg/*`, `target/ppc/*` | Bigger TLB floor, vCPU QoS, inline lmw/stmw, host-FPU fast path |
 | UI | `ui/cocoa.m` | Layer presentation, hardware cursor, full-panel/below-notch fullscreen |
-| Firmware | `pc-bios/openbios-ppc`, `pc-bios/ppc-ndrvloader` | OpenBIOS patched for the RV280; NDRV loader |
+| Firmware | [PowerPC firmware setup](pc-bios/README) | Download the OpenBIOS base and NDRV loader separately and apply the RV280 PCI ID patch. |
 
 The display driver the guest loads (`qemu_vga_hwc.ndrv`, the QEMU VGA NDRV
 patched for the hardware cursor and extra modes) and the launcher live in the

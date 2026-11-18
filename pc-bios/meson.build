@@ -44,7 +44,6 @@ blobs = [
   'vgabios-ati.bin',
   'openbios-sparc32',
   'openbios-sparc64',
-  'openbios-ppc',
   'QEMU,tcx.bin',
   'QEMU,cgthree.bin',
   'pxe-e1000.rom',
@@ -110,6 +109,9 @@ foreach f : [
 endforeach
 
 if get_option('install_blobs')
+  if fs.is_file('openbios-ppc')
+    blobs += 'openbios-ppc'
+  endif
   install_data(blobs, install_dir: qemu_datadir)
 endif
 

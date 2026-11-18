@@ -7,17 +7,31 @@
 - OpenBIOS (http://www.openbios.org/) is a free (GPL v2) portable
   firmware implementation. The goal is to implement a 100% IEEE
   1275-1994 (referred to as Open Firmware) compliant firmware.
-  The included images for PowerPC (for 32 and 64 bit PPC CPUs),
-  Sparc32 (including QEMU,tcx.bin and QEMU,cgthree.bin) and Sparc64 are built
-  from OpenBIOS SVN revision 1280.
+  The included Sparc32 (including QEMU,tcx.bin and QEMU,cgthree.bin) and
+  Sparc64 images are built from OpenBIOS SVN revision 1280.
 
-- ppc-ndrvloader comes from Elliot Nunn's classicvirtio project
-  (https://github.com/elliotnunn/classicvirtio, MIT license), as shipped by
-  UTM; it copies NDRV display drivers into the device tree for mac99 guests.
+- PowerPC Mac firmware is supplied separately. MorphOS uses its own 2018
+  OpenBIOS. For the inherited PowerEmu RV280 Mac OS X configuration, run
+  the following in a fresh firmware directory. The downloads match UTM 4.7.5.
+  The four bytes at 0x30678 select the emulated 1002:5960 PCI device.
 
-- PowerEmu: openbios-ppc here is the upstream image with one PCI table entry
-  patched (offset 0x30678, 1234:1111 -> 1002:5960) so OpenBIOS drives the
-  emulated ATI Radeon 9000 (RV280); the launcher applies the same patch.
+    (
+      set -e
+      curl -fL https://raw.githubusercontent.com/utmapp/qemu/39858ec7347616d5f513f72185873fa2e352d7de/pc-bios/openbios-ppc -o openbios-ppc.utm
+      curl -fL https://raw.githubusercontent.com/utmapp/UTM/048ca7498ea3a374439149d51739d94c5300bcda/patches/data/qemu-10.0.2-utm/pc-bios/ppc-ndrvloader -o ppc-ndrvloader
+      shasum -a 256 -c <<'SUMS'
+51e6d5e98985db5c7523dfea817cbacc2cdc883e6fc20e39567ba5ab101cda98  openbios-ppc.utm
+4c876b99ede7aa9c68691adfb0a98c25f9860016a7ef32a5286968acc06c68ce  ppc-ndrvloader
+SUMS
+      cp openbios-ppc.utm openbios-ppc
+      printf '\020\002\131\140' | dd of=openbios-ppc bs=1 seek=198264 conv=notrunc
+      echo 'd06bf412c583c618922de3cbcec5eb87201afa9ab836ee8723d30b9406ecaf67  openbios-ppc' | shasum -a 256 -c -
+    )
+
+  Pass the directory with -L or select the image with -bios. To install
+  the PowerPC image with the other QEMU firmware, place openbios-ppc in
+  pc-bios/ before configuring. The ppc-osx-vgpu bundle has a separate
+  patcher for its Radeon 9700 and Jaguar machine configurations.
 
 - SLOF (Slimline Open Firmware) is a free IEEE 1275 Open Firmware
   implementation for certain IBM POWER hardware.  The sources are at
